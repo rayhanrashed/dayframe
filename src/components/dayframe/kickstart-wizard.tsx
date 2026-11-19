@@ -24,6 +24,7 @@ import {
   ValenRuntimeStatus,
 } from "@/lib/valen-decision";
 import { MacBridgeConnectionState } from "@/lib/calendar-connectors";
+import { downloadMacBridgeDocumentsInstaller } from "@/lib/mac-bridge-installer";
 import {
   CalendarBlock,
   MacCalendarDescriptor,
@@ -41,6 +42,7 @@ import {
   Calendar,
   CheckCircle2,
   Cpu,
+  Download,
   Filter,
   Laptop,
   Loader2,
@@ -563,16 +565,28 @@ OLLAMA_ORIGINS="*" ollama serve`}
 
               {settings.calendarSource !== "google-api" ? (
                 <div className="mt-4 grid grid-cols-1 gap-4 text-xs md:grid-cols-2">
-                  <div className="rounded-xl border bg-muted/40 p-3">
-                    <div className="font-medium">
-                      Run on MacBook (`npm run mac` auto-pairs)
+                  <div className="space-y-2.5 rounded-xl border bg-muted/40 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-medium">
+                        Run on MacBook (<code>~/Documents</code>)
+                      </div>
+                      {!macBridgeState.reachable && (
+                        <Button
+                          size="xs"
+                          onClick={downloadMacBridgeDocumentsInstaller}
+                          className="gap-1.5"
+                        >
+                          <Download className="size-3" />
+                          Download Bridge for ~/Documents
+                        </Button>
+                      )}
                     </div>
-                    <p className="mt-1 text-[11px] text-muted-foreground">
+                    <p className="text-[11px] text-muted-foreground">
                       Connects Apple EventKit (iCloud, Google &amp; Exchange calendars in Calendar.app), Mail.app, and silent background{" "}
-                      <code>screencapture</code>:
+                      <code>screencapture</code>. Either run <code>npm run mac</code> in a local checkout, or install the zero-dependency bridge directly into <code>~/Documents/dayframe-bridge</code>:
                     </p>
-                    <pre className="mt-2 rounded-lg bg-background p-2 font-mono text-[11px]">
-                      npm run mac
+                    <pre className="overflow-x-auto rounded-lg bg-background p-2 font-mono text-[10.5px] leading-relaxed">
+{`bash ~/Downloads/install-dayframe-bridge.sh`}
                     </pre>
                   </div>
 

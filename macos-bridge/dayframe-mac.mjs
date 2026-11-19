@@ -54,7 +54,7 @@ function applyCorsHeaders(req, res) {
   if (
     origin &&
     (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin) ||
-      /^https:\/\/[a-z0-9-]+\.cursor\.app$/.test(origin) ||
+      /^https:\/\/[a-z0-9-]+\.cursor\.(app|run|sh)$/.test(origin) ||
       /^https:\/\/([a-z0-9-]+\.)?cursor\.com$/.test(origin))
   ) {
     res.setHeader("Access-Control-Allow-Origin", origin);
