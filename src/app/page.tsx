@@ -1,3 +1,5 @@
+"use client";
+
 import { DayframeApp } from "@/components/dayframe/dayframe-app";
 
 export default function HomePage() {

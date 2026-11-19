@@ -318,6 +318,48 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/valen/decisions") {
+      const body = await readJsonBody(req);
+      const allowedPorts = new Set([43823, 8080, 8000, 30000]);
+      const requestedPort = Number(body.port);
+      const targetPort = allowedPorts.has(requestedPort) ? requestedPort : 43823;
+      const payload = body.payload && typeof body.payload === "object" ? body.payload : {};
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      try {
+        const upstream = await fetch(`http://127.0.0.1:${targetPort}/v1/decisions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify(payload),
+        });
+        clearTimeout(timer);
+        const text = await upstream.text();
+        let parsed = {};
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = { raw: text.slice(0, 300) };
+        }
+        sendJson(req, res, upstream.ok ? 200 : 502, {
+          ok: upstream.ok,
+          status: upstream.status,
+          data: parsed,
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        sendJson(req, res, 200, {
+          ok: false,
+          error:
+            e instanceof Error
+              ? e.message
+              : `Valen GGUF server not reachable on 127.0.0.1:${targetPort}`,
+        });
+      }
+      return;
+    }
+
     sendJson(req, res, 404, { ok: false, error: "Route not found." });
   } catch (err) {
     sendJson(req, res, 500, {

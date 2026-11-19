@@ -154,6 +154,12 @@ export function CaptureStreamPanel({
                     No New Task
                   </Badge>
                 )}
+                {cap.syncState === "filtered-by-valen" && (
+                  <Badge variant="outline" className="text-[10px]">
+                    Skipped by Valen (p=
+                    {(cap.valenGate?.signalProbability ?? 0).toFixed(2)})
+                  </Badge>
+                )}
                 {cap.syncState === "needs-gemma" && (
                   <Badge
                     variant="outline"
@@ -181,6 +187,14 @@ export function CaptureStreamPanel({
               <p className="line-clamp-2 text-[11px] leading-relaxed text-muted-foreground">
                 {cap.summaryText}
               </p>
+
+              {cap.valenGate && cap.syncState !== "filtered-by-valen" && (
+                <div className="mt-1.5 text-[10px] font-mono text-muted-foreground">
+                  Valen p={cap.valenGate.signalProbability.toFixed(2)} •{" "}
+                  {cap.valenGate.intentChoice}
+                  {cap.valenGate.bboxCropped ? " • bbox cropped" : ""}
+                </div>
+              )}
 
               {cap.createdBlockId && cap.extractedSignal && (
                 <div className="mt-2 flex items-center justify-between gap-2 border-t pt-2">

@@ -81,14 +81,29 @@ export interface ScreenshotCapture {
   imageDataUrl: string;
   modelUsed: string;
   inferenceMs?: number;
+  valenGate?: {
+    signalProbability: number;
+    intentChoice: string;
+    urgencyScore: number;
+    latencyMs: number;
+    bboxCropped?: boolean;
+  };
   syncState:
     | "scheduled"
     | "queued-for-tonight"
     | "deduplicated"
     | "no-action"
+    | "filtered-by-valen"
     | "needs-gemma";
   extractedSignal?: ExtractedCaptureSignal;
   createdBlockId?: string;
+}
+
+export interface GatekeeperStats {
+  totalScreened: number;
+  filteredNoiseCount: number;
+  privacyDroppedCount: number;
+  routedToGemmaCount: number;
 }
 
 export interface MacCalendarDescriptor {
@@ -111,7 +126,14 @@ export interface ScannedEmailItem {
 export interface PipelineLogEntry {
   id: string;
   timestampIso: string;
-  stage: "setup" | "scan" | "capture" | "gemma4" | "calendar-write" | "feedback";
+  stage:
+    | "setup"
+    | "scan"
+    | "capture"
+    | "valen-gate"
+    | "gemma4"
+    | "calendar-write"
+    | "feedback";
   title: string;
   detail: string;
   modelUsed?: string;
@@ -139,6 +161,10 @@ export interface OrganizerSettings {
   setupCompleted: boolean;
   lastInitialScanIso?: string;
   gemmaModel: string;
+  valenEnabled: boolean;
+  valenModelId: string;
+  valenPort: number;
+  valenSignalThreshold: number;
   calendarSource: CalendarSourceMode;
   captureEngine: CaptureEngineMode;
   writableCalendarId: string;

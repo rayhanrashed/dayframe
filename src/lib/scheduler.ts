@@ -11,6 +11,10 @@ import { toLocalDateKey } from "./calendar-connectors";
 export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   setupCompleted: false,
   gemmaModel: "gemma4:e4b",
+  valenEnabled: true,
+  valenModelId: "valen-9b",
+  valenPort: 43823,
+  valenSignalThreshold: 0.45,
   calendarSource: "none",
   captureEngine: "macos-native",
   writableCalendarId: "",

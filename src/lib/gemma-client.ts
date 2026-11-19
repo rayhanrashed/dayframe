@@ -211,6 +211,12 @@ export async function analyzeScreenshotWithGemma4(params: {
   todayDateKey: string;
   rules: StandingRule[];
   device: "macbook" | "android";
+  valenHint?: {
+    intentChoice: string;
+    urgencyScore: number;
+    signalProbability: number;
+    bboxCropped: boolean;
+  };
 }): Promise<{
   ok: boolean;
   signal?: ExtractedCaptureSignal;
@@ -226,6 +232,7 @@ export async function analyzeScreenshotWithGemma4(params: {
     todayDateKey,
     rules,
     device,
+    valenHint,
   } = params;
   const t0 = performance.now();
 
@@ -246,9 +253,21 @@ export async function analyzeScreenshotWithGemma4(params: {
     .map((r) => `- ${r.title}: ${r.description}`)
     .join("\n");
 
-  const prompt = `You are Dayframe's local Gemma 4 multimodal calendar organizer running on the user's MacBook.
+  const stage1Context = valenHint
+    ? `\nStage-1 Valen-Decision Gatekeeper pre-screening: p(actionable)=${valenHint.signalProbability.toFixed(
+        2
+      )}, intent="${valenHint.intentChoice}", urgency=${valenHint.urgencyScore.toFixed(
+        1
+      )}/3${
+        valenHint.bboxCropped
+          ? " (image cropped to Valen's grounded bbox region)"
+          : ""
+      }.`
+    : "";
+
+  const prompt = `You are Dayframe's Stage-2 Gemma 4 multimodal calendar planner running on the user's MacBook.
 Today's local date is ${todayDateKey}.
-Captured device: ${device} | Active app: "${appName}" | Window title: "${windowTitle}".
+Captured device: ${device} | Active app: "${appName}" | Window title: "${windowTitle}".${stage1Context}
 
 Inspect the screenshot image carefully (especially emails in Mail/Gmail, Slack threads, or meeting mentions).
 Decide if there is a concrete item that should be placed on the user's calendar:

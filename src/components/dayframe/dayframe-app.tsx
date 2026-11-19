@@ -11,6 +11,7 @@ import { useScreenCapture } from "@/hooks/use-screen-capture";
 import {
   CalendarBlock,
   DiscussionMessage,
+  GatekeeperStats,
   MacCalendarDescriptor,
   OrganizerSettings,
   PipelineLogEntry,
@@ -38,6 +39,14 @@ import {
   probeLocalGemma,
 } from "@/lib/gemma-client";
 import {
+  cropImageToValenBbox,
+  evaluateMeetingPrepNeedWithValen,
+  filterInboxEmailsWithValen,
+  probeValenRuntime,
+  runValenScreenshotGate,
+  ValenRuntimeStatus,
+} from "@/lib/valen-decision";
+import {
   fetchMacAndroidFolderQueue,
   MacBridgeConnectionState,
   probeMacBridge,
@@ -59,6 +68,7 @@ interface PersistedWorkspaceV2 {
   rules: StandingRule[];
   messages: DiscussionMessage[];
   suggestedPrompts: SuggestedPreferencePrompt[];
+  gateStats: GatekeeperStats;
   macPairingToken: string;
 }
 
@@ -76,13 +86,19 @@ export function DayframeApp() {
     {
       id: "welcome-msg",
       role: "assistant",
-      text: "Tell me any recurring meeting prep rules, duration adjustments, or workday boundaries — I keep them in your Standing Rules context for every Gemma 4 scan.",
+      text: "Tell me any recurring meeting prep rules, duration adjustments, or workday boundaries — I keep them in your Standing Rules context for both Valen-Decision and Gemma 4.",
       timestampIso: "",
     },
   ]);
   const [suggestedPrompts, setSuggestedPrompts] = useState<
     SuggestedPreferencePrompt[]
   >(DEFAULT_SUGGESTED_QUESTIONS);
+  const [gateStats, setGateStats] = useState<GatekeeperStats>({
+    totalScreened: 0,
+    filteredNoiseCount: 0,
+    privacyDroppedCount: 0,
+    routedToGemmaCount: 0,
+  });
   const [pipelineLogs, setPipelineLogs] = useState<PipelineLogEntry[]>([]);
 
   const [macPairingToken, setMacPairingToken] = useState("");
@@ -95,6 +111,10 @@ export function DayframeApp() {
     installedModels: [],
     installedGemma4Models: [],
     selectedModelInstalled: false,
+  });
+  const [valenStatus, setValenStatus] = useState<ValenRuntimeStatus>({
+    reachable: false,
+    port: DEFAULT_ORGANIZER_SETTINGS.valenPort,
   });
   const [macBridgeState, setMacBridgeState] =
     useState<MacBridgeConnectionState>({
@@ -132,24 +152,38 @@ export function DayframeApp() {
     []
   );
 
-  // Hydrate v2 state, purge legacy v1 toy data, and support #pair=<token> from npm run mac
+  // Hydrate v2 state, purge legacy v1 toy data, and auto-pair from #pair=<token>
   useEffect(() => {
     let cancelled = false;
     Promise.resolve().then(async () => {
       if (cancelled) return;
       let loadedToken = "";
+      let loadedValenPort = DEFAULT_ORGANIZER_SETTINGS.valenPort;
+      let loadedValenModel = DEFAULT_ORGANIZER_SETTINGS.valenModelId;
+      let loadedGemmaModel = DEFAULT_ORGANIZER_SETTINGS.gemmaModel;
+
       try {
         localStorage.removeItem(LEGACY_TOY_KEY);
         const raw = localStorage.getItem(STORAGE_KEY_V2);
         if (raw) {
           const parsed = JSON.parse(raw) as Partial<PersistedWorkspaceV2>;
-          if (parsed.settings) setSettings(parsed.settings);
+          if (parsed.settings) {
+            const merged = {
+              ...DEFAULT_ORGANIZER_SETTINGS,
+              ...parsed.settings,
+            };
+            setSettings(merged);
+            loadedValenPort = merged.valenPort;
+            loadedValenModel = merged.valenModelId;
+            loadedGemmaModel = merged.gemmaModel;
+          }
           if (parsed.blocks) setBlocks(parsed.blocks);
           if (parsed.captures) setCaptures(parsed.captures);
           if (parsed.rules) setRules(parsed.rules);
           if (parsed.messages) setMessages(parsed.messages);
           if (parsed.suggestedPrompts)
             setSuggestedPrompts(parsed.suggestedPrompts);
+          if (parsed.gateStats) setGateStats(parsed.gateStats);
           if (parsed.macPairingToken) {
             loadedToken = parsed.macPairingToken;
             setMacPairingToken(parsed.macPairingToken);
@@ -159,7 +193,10 @@ export function DayframeApp() {
         // Ignore storage errors
       }
 
-      if (typeof window !== "undefined" && window.location.hash.startsWith("#pair=")) {
+      if (
+        typeof window !== "undefined" &&
+        window.location.hash.startsWith("#pair=")
+      ) {
         const hashToken = decodeURIComponent(
           window.location.hash.replace("#pair=", "").trim()
         );
@@ -175,13 +212,19 @@ export function DayframeApp() {
       setAnchorDateKey(currentTodayKey);
       setHydrated(true);
 
-      const [gStat, mStat] = await Promise.all([
-        probeLocalGemma(DEFAULT_ORGANIZER_SETTINGS.gemmaModel),
+      const [gStat, mStat, vStat] = await Promise.all([
+        probeLocalGemma(loadedGemmaModel),
         probeMacBridge(loadedToken),
+        probeValenRuntime({
+          port: loadedValenPort,
+          modelId: loadedValenModel,
+          macPairingToken: loadedToken,
+        }),
       ]);
       if (cancelled) return;
       setGemmaStatus(gStat);
       setMacBridgeState(mStat);
+      setValenStatus(vStat);
       if (mStat.paired) {
         setSettings((prev) => ({
           ...prev,
@@ -196,7 +239,6 @@ export function DayframeApp() {
     };
   }, []);
 
-  // Persist user's real state locally (never storing OAuth access tokens in plain storage)
   useEffect(() => {
     if (!hydrated) return;
     try {
@@ -207,6 +249,7 @@ export function DayframeApp() {
         rules,
         messages,
         suggestedPrompts,
+        gateStats,
         macPairingToken,
       };
       localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(payload));
@@ -216,6 +259,7 @@ export function DayframeApp() {
   }, [
     blocks,
     captures,
+    gateStats,
     hydrated,
     macPairingToken,
     messages,
@@ -228,6 +272,16 @@ export function DayframeApp() {
     const res = await probeLocalGemma(settings.gemmaModel);
     setGemmaStatus(res);
   }, [settings.gemmaModel]);
+
+  const refreshValenStatus = useCallback(async () => {
+    const res = await probeValenRuntime({
+      port: settings.valenPort,
+      modelId: settings.valenModelId,
+      macPairingToken,
+    });
+    setValenStatus(res);
+    return res;
+  }, [macPairingToken, settings.valenModelId, settings.valenPort]);
 
   const verifyAndLoadMacBridge = useCallback(async () => {
     const state = await probeMacBridge(macPairingToken);
@@ -263,7 +317,6 @@ export function DayframeApp() {
     }
   }, [macPairingToken, settings.writableCalendarId, showToast]);
 
-  // Write a single block to the connected real calendar (macOS EventKit or Google Calendar API)
   const pushBlockToExternalCalendar = useCallback(
     async (block: CalendarBlock): Promise<CalendarBlock> => {
       if (block.syncedToExternalCalendar) return block;
@@ -326,7 +379,7 @@ export function DayframeApp() {
     ]
   );
 
-  // One-Off Initial Baseline Scan (or Re-Scan from Workspace)
+  // One-Off Baseline Scan (Calendar + Valen Triage + Gemma 4 Extraction)
   const runBaselineCalendarAndMailScan = useCallback(async (): Promise<{
     ok: boolean;
     existingCount: number;
@@ -377,7 +430,7 @@ export function DayframeApp() {
 
         const [calRes, mailRes] = await Promise.all([
           scanMacCalendarEvents({ pairingToken: macPairingToken, daysAhead: 7 }),
-          scanMacMailMessages({ pairingToken: macPairingToken, limit: 10 }),
+          scanMacMailMessages({ pairingToken: macPairingToken, limit: 12 }),
         ]);
 
         if (!calRes.ok) {
@@ -397,13 +450,33 @@ export function DayframeApp() {
       }
 
       setScannedEmails(fetchedEmails);
-      appendLog({
-        stage: "scan",
-        title: "Completed Calendar & Mail Scan",
-        detail: `Read ${fetchedCalendarBlocks.length} calendar events and ${fetchedEmails.length} inbox messages.`,
-      });
 
-      // 1. Reconcile recurring meeting prep blocks (e.g. >=2h before recurring meetings)
+      // Optional Stage-1 Valen Prep-Need Scoring for one-off high-stakes meetings
+      if (settings.valenEnabled) {
+        for (let i = 0; i < fetchedCalendarBlocks.length; i++) {
+          const ev = fetchedCalendarBlocks[i];
+          if (!ev.isRecurring && ev.durationMinutes >= 30) {
+            const prepEval = await evaluateMeetingPrepNeedWithValen({
+              meetingTitle: ev.title,
+              durationMinutes: ev.durationMinutes,
+              modelId: settings.valenModelId,
+              port: settings.valenPort,
+              macPairingToken,
+            });
+            if (!prepEval) break; // Valen offline; skip remaining meetings cleanly
+            if (prepEval.needsPrep) {
+              fetchedCalendarBlocks[i] = {
+                ...ev,
+                isRecurring: true,
+                rationale: `Valen-Decision scored prep necessity p=${prepEval.probability.toFixed(
+                  2
+                )} (${prepEval.recommendedPrepMinutes}m recommended).`,
+              };
+            }
+          }
+        }
+      }
+
       let workingBlocks = reconcilePrepBlocks(
         fetchedCalendarBlocks,
         rules,
@@ -412,22 +485,43 @@ export function DayframeApp() {
         "proposed"
       );
 
-      // 2. If local Gemma 4 is online and emails were scanned, extract solo holds & focus blocks
+      // Stage-1 Valen Email Triage -> Stage-2 Gemma 4 Extraction
+      let candidateEmails = fetchedEmails;
+      if (settings.valenEnabled && fetchedEmails.length > 0) {
+        const emailGate = await filterInboxEmailsWithValen({
+          emails: fetchedEmails,
+          modelId: settings.valenModelId,
+          port: settings.valenPort,
+          threshold: settings.valenSignalThreshold,
+          macPairingToken,
+        });
+        if (emailGate.usedValen) {
+          candidateEmails = emailGate.keptEmails;
+          appendLog({
+            stage: "valen-gate",
+            title: `Valen screened ${fetchedEmails.length} inbox emails`,
+            detail: `Filtered ${emailGate.droppedCount} newsletters/FYI alerts (0 output tokens); forwarded ${candidateEmails.length} to Gemma 4.`,
+            modelUsed: settings.valenModelId,
+            latencyMs: emailGate.totalLatencyMs,
+          });
+        }
+      }
+
       const gStatus = await probeLocalGemma(settings.gemmaModel);
       setGemmaStatus(gStatus);
 
-      if (gStatus.reachable && fetchedEmails.length > 0) {
+      if (gStatus.reachable && candidateEmails.length > 0) {
         const inboxAnalysis = await analyzeInboxEmailsWithGemma4({
-          emails: fetchedEmails,
+          emails: candidateEmails,
           model: settings.gemmaModel,
           todayDateKey: todayKey,
           rules,
         });
         appendLog({
           stage: "gemma4",
-          title: `Gemma 4 analyzed ${fetchedEmails.length} inbox emails`,
+          title: `Gemma 4 analyzed ${candidateEmails.length} actionable emails`,
           detail: inboxAnalysis.ok
-            ? `Extracted ${inboxAnalysis.signals.length} actionable calendar blocks.`
+            ? `Extracted ${inboxAnalysis.signals.length} calendar blocks.`
             : inboxAnalysis.error || "Inbox extraction failed.",
           modelUsed: settings.gemmaModel,
           latencyMs: inboxAnalysis.latencyMs,
@@ -451,15 +545,12 @@ export function DayframeApp() {
       setBlocks(workingBlocks);
       setIsSyncingCalendar(false);
 
-      const proposedCount = workingBlocks.filter(
-        (b) => b.status !== "confirmed"
-      ).length;
-
       return {
         ok: true,
         existingCount: fetchedCalendarBlocks.length,
         emailCount: fetchedEmails.length,
-        proposedCount,
+        proposedCount: workingBlocks.filter((b) => b.status !== "confirmed")
+          .length,
       };
     } catch (err) {
       setIsSyncingCalendar(false);
@@ -481,7 +572,6 @@ export function DayframeApp() {
     todayKey,
   ]);
 
-  // Finalize Kickstart Setup
   const handleFinalizeKickstart = async (writeApprovedToCalendar: boolean) => {
     if (writeApprovedToCalendar) {
       const updated: CalendarBlock[] = [];
@@ -503,7 +593,7 @@ export function DayframeApp() {
     showToast("Dayframe workspace ready");
   };
 
-  // Process incoming screenshot through local Gemma 4
+  // Two-Stage Screenshot Pipeline: Stage-1 Valen Gate -> Stage-2 Gemma 4
   const processCapturedImage = useCallback(
     async (payload: {
       imageDataUrl: string;
@@ -513,25 +603,157 @@ export function DayframeApp() {
     }) => {
       const { imageDataUrl, appName, windowTitle, device } = payload;
 
+      let imageForGemma = imageDataUrl;
+      let valenMeta: ScreenshotCapture["valenGate"] | undefined;
+
+      // Stage 1: Valen-Decision-1.5 Gatekeeper (when enabled & reachable)
+      if (settings.valenEnabled) {
+        const decision = await runValenScreenshotGate({
+          imageDataUrl,
+          appName,
+          windowTitle,
+          modelId: settings.valenModelId,
+          port: settings.valenPort,
+          signalThreshold: settings.valenSignalThreshold,
+          macPairingToken,
+        });
+
+        if (decision) {
+          setValenStatus({
+            reachable: true,
+            port: settings.valenPort,
+            pingMs: decision.latencyMs,
+          });
+
+          // 1A. Sensitive screen privacy guard -> drop immediately in memory!
+          if (decision.isSensitiveScreen) {
+            setGateStats((prev) => ({
+              ...prev,
+              totalScreened: prev.totalScreened + 1,
+              privacyDroppedCount: prev.privacyDroppedCount + 1,
+            }));
+            appendLog({
+              stage: "valen-gate",
+              title: `Privacy Gate dropped sensitive screen (${appName})`,
+              detail: `p(sensitive)=${decision.sensitiveProbability.toFixed(
+                2
+              )} — discarded in memory without storing or calling Gemma 4.`,
+              modelUsed: settings.valenModelId,
+              latencyMs: decision.latencyMs,
+            });
+            showToast(
+              `Valen Privacy Gate skipped sensitive ${appName} screenshot`
+            );
+            return;
+          }
+
+          // 1B. Non-actionable noise screen -> skip Gemma 4 completely (0 output tokens!)
+          if (!decision.hasCalendarSignal) {
+            setGateStats((prev) => ({
+              ...prev,
+              totalScreened: prev.totalScreened + 1,
+              filteredNoiseCount: prev.filteredNoiseCount + 1,
+            }));
+            appendLog({
+              stage: "valen-gate",
+              title: `Skipped non-actionable frame (${appName})`,
+              detail: `p(actionable)=${decision.signalProbability.toFixed(
+                2
+              )} < ${settings.valenSignalThreshold.toFixed(
+                2
+              )} (${decision.intentChoice}) — saved a Gemma 4 run.`,
+              modelUsed: settings.valenModelId,
+              latencyMs: decision.latencyMs,
+            });
+
+            const skippedCap: ScreenshotCapture = {
+              id: `cap-valen-${Date.now()}`,
+              timestampIso: new Date().toISOString(),
+              device,
+              appName,
+              windowTitle,
+              summaryText: `Filtered by Valen-Decision-1.5 in 1 forward pass (p=${decision.signalProbability.toFixed(
+                2
+              )}) — no calendar action needed.`,
+              imageDataUrl,
+              modelUsed: settings.valenModelId,
+              inferenceMs: decision.latencyMs,
+              valenGate: {
+                signalProbability: decision.signalProbability,
+                intentChoice: decision.intentChoice,
+                urgencyScore: decision.urgencyScore,
+                latencyMs: decision.latencyMs,
+              },
+              syncState: "filtered-by-valen",
+            };
+            setCaptures((prev) => [skippedCap, ...prev]);
+            return;
+          }
+
+          // 1C. Actionable! Crop screenshot to Valen's grounded bbox before sending to Gemma 4
+          const cropped = await cropImageToValenBbox(
+            imageDataUrl,
+            decision.bbox,
+            0.45,
+            decision.bboxConfidence
+          );
+          const wasCropped = cropped !== imageDataUrl;
+          imageForGemma = cropped;
+          valenMeta = {
+            signalProbability: decision.signalProbability,
+            intentChoice: decision.intentChoice,
+            urgencyScore: decision.urgencyScore,
+            latencyMs: decision.latencyMs,
+            bboxCropped: wasCropped,
+          };
+
+          setGateStats((prev) => ({
+            ...prev,
+            totalScreened: prev.totalScreened + 1,
+            routedToGemmaCount: prev.routedToGemmaCount + 1,
+          }));
+          appendLog({
+            stage: "valen-gate",
+            title: `Actionable frame passed to Gemma 4 (${appName})`,
+            detail: `p=${decision.signalProbability.toFixed(2)}, intent=${
+              decision.intentChoice
+            }, urgency=${decision.urgencyScore.toFixed(1)}/3${
+              wasCropped ? " • cropped to grounded bbox" : ""
+            }`,
+            modelUsed: settings.valenModelId,
+            latencyMs: decision.latencyMs,
+          });
+        }
+      }
+
+      // Stage 2: Gemma 4 Multimodal Extraction & Scheduling
       const analysis = await analyzeScreenshotWithGemma4({
-        imageDataUrl,
+        imageDataUrl: imageForGemma,
         model: settings.gemmaModel,
         appName,
         windowTitle,
         todayDateKey: todayKey,
         rules,
         device,
+        valenHint: valenMeta
+          ? {
+              intentChoice: valenMeta.intentChoice,
+              urgencyScore: valenMeta.urgencyScore,
+              signalProbability: valenMeta.signalProbability,
+              bboxCropped: Boolean(valenMeta.bboxCropped),
+            }
+          : undefined,
       });
 
       appendLog({
         stage: "gemma4",
         title: analysis.ok
-          ? `Analyzed screenshot (${appName})`
-          : `Gemma 4 unreachable for screenshot (${appName})`,
+          ? `Gemma 4 extracted signal (${appName})`
+          : `Gemma 4 unreachable (${appName})`,
         detail: analysis.ok
           ? analysis.signal?.hasActionableItem
             ? `Scheduled: ${analysis.signal.title}`
-            : "No new calendar action needed."
+            : "No new calendar block needed."
           : analysis.error || "Start local Ollama on 127.0.0.1:11434.",
         modelUsed: analysis.modelUsed,
         latencyMs: analysis.latencyMs,
@@ -549,6 +771,7 @@ export function DayframeApp() {
             `Start local ${settings.gemmaModel} in Ollama to analyze screenshots.`,
           imageDataUrl,
           modelUsed: settings.gemmaModel,
+          valenGate: valenMeta,
           syncState: "needs-gemma",
         };
         setCaptures((prev) => [offlineCap, ...prev]);
@@ -590,9 +813,10 @@ export function DayframeApp() {
         appName,
         windowTitle,
         summaryText: analysis.signal.summary,
-        imageDataUrl,
+        imageDataUrl: imageForGemma,
         modelUsed: analysis.modelUsed,
         inferenceMs: analysis.latencyMs,
+        valenGate: valenMeta,
         syncState: !analysis.signal.hasActionableItem
           ? "no-action"
           : placement.deduplicated
@@ -617,6 +841,7 @@ export function DayframeApp() {
       appendLog,
       blocks,
       captures,
+      macPairingToken,
       pushBlockToExternalCalendar,
       rules,
       settings,
@@ -659,7 +884,6 @@ export function DayframeApp() {
     reader.readAsDataURL(file);
   };
 
-  // Calendar Block Actions
   const handleConfirmAndSyncBlock = async (id: string) => {
     const target = blocks.find((b) => b.id === id);
     if (!target) return;
@@ -799,7 +1023,6 @@ export function DayframeApp() {
     );
   };
 
-  // Feedback & Rules Handlers
   const handleSendFeedback = (text: string) => {
     const res = applyUserRuleFeedback({ text, blocks, rules, settings });
     setBlocks(res.blocks);
@@ -853,7 +1076,6 @@ export function DayframeApp() {
     setBlocks((prev) => reconcilePrepBlocks(prev, nextRules, settings, todayKey));
   };
 
-  // Android Folder Sync & Nightly Batch Processing
   const handleRefreshMacAndroidFolder = async () => {
     if (!macBridgeState.paired || !macPairingToken) return;
     const res = await fetchMacAndroidFolderQueue(macPairingToken);
@@ -870,7 +1092,8 @@ export function DayframeApp() {
         device: "android",
         appName: "Android Synced Folder",
         windowTitle: s.filename,
-        summaryText: "Queued raw phone screenshot for nightly Gemma 4 batch run.",
+        summaryText:
+          "Queued raw phone screenshot for nightly Valen + Gemma 4 batch run.",
         imageDataUrl: s.imageDataUrl,
         modelUsed: settings.gemmaModel,
         syncState: "queued-for-tonight",
@@ -893,7 +1116,8 @@ export function DayframeApp() {
         device: "android",
         appName: "Android Companion",
         windowTitle: file.name,
-        summaryText: "Queued raw phone screenshot (waiting for Mac Gemma 4 batch).",
+        summaryText:
+          "Queued raw phone screenshot (waiting for Mac Valen + Gemma 4 batch).",
         imageDataUrl: String(reader.result ?? ""),
         modelUsed: settings.gemmaModel,
         syncState: "queued-for-tonight",
@@ -913,11 +1137,44 @@ export function DayframeApp() {
     let workingBlocks = [...blocks];
     let added = 0;
     let deduped = 0;
+    let skippedNoise = 0;
     const updatedMap = new Map<string, ScreenshotCapture>();
 
     for (const cap of queued) {
+      let imageForGemma = cap.imageDataUrl;
+      if (settings.valenEnabled) {
+        const decision = await runValenScreenshotGate({
+          imageDataUrl: cap.imageDataUrl,
+          appName: cap.appName,
+          windowTitle: cap.windowTitle,
+          modelId: settings.valenModelId,
+          port: settings.valenPort,
+          signalThreshold: settings.valenSignalThreshold,
+          macPairingToken,
+        });
+        if (decision && (decision.isSensitiveScreen || !decision.hasCalendarSignal)) {
+          skippedNoise++;
+          updatedMap.set(cap.id, {
+            ...cap,
+            summaryText: `Skipped by Valen Gate (p=${decision.signalProbability.toFixed(
+              2
+            )}) — no Gemma 4 run needed.`,
+            syncState: "filtered-by-valen",
+          });
+          continue;
+        }
+        if (decision?.bbox) {
+          imageForGemma = await cropImageToValenBbox(
+            cap.imageDataUrl,
+            decision.bbox,
+            0.45,
+            decision.bboxConfidence
+          );
+        }
+      }
+
       const analysis = await analyzeScreenshotWithGemma4({
-        imageDataUrl: cap.imageDataUrl,
+        imageDataUrl: imageForGemma,
         model: settings.gemmaModel,
         appName: cap.appName,
         windowTitle: cap.windowTitle,
@@ -967,7 +1224,7 @@ export function DayframeApp() {
     setBlocks(workingBlocks);
     setCaptures((prev) => prev.map((c) => updatedMap.get(c.id) ?? c));
     setIsRunningNightlyBatch(false);
-    const msg = `Processed ${queued.length} phone screenshot(s): ${added} scheduled onto Tomorrow, ${deduped} duplicates skipped.`;
+    const msg = `Processed ${queued.length} phone shot(s): ${added} scheduled Tomorrow, ${deduped} Mac duplicates skipped, ${skippedNoise} noise frames filtered by Valen.`;
     setLastBatchSummary(msg);
     showToast(msg);
   };
@@ -980,7 +1237,6 @@ export function DayframeApp() {
     );
   }
 
-  // First-Run Kickstart Setup Phase (Zero fake data!)
   if (!settings.setupCompleted) {
     return (
       <KickstartWizard
@@ -994,6 +1250,8 @@ export function DayframeApp() {
         onAddPlainEnglishRule={(text) => handleSendFeedback(text)}
         gemmaStatus={gemmaStatus}
         onRecheckGemma={refreshGemmaStatus}
+        valenStatus={valenStatus}
+        onRecheckValen={refreshValenStatus}
         macBridgeState={macBridgeState}
         macPairingToken={macPairingToken}
         onChangeMacPairingToken={setMacPairingToken}
@@ -1027,6 +1285,9 @@ export function DayframeApp() {
         }
         gemmaStatus={gemmaStatus}
         onRecheckGemma={refreshGemmaStatus}
+        valenStatus={valenStatus}
+        onRecheckValen={refreshValenStatus}
+        gateStats={gateStats}
         macBridgeState={macBridgeState}
         isCapturing={isCapturing}
         isCapturePaused={isCapturePaused}

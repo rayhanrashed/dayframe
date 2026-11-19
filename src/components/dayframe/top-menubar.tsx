@@ -23,12 +23,21 @@ import {
   GEMMA4_MODEL_CATALOG,
   LocalGemmaStatus,
 } from "@/lib/gemma-client";
+import {
+  VALEN_MODEL_CATALOG,
+  ValenRuntimeStatus,
+} from "@/lib/valen-decision";
 import { MacBridgeConnectionState } from "@/lib/calendar-connectors";
-import { OrganizerSettings, PipelineLogEntry } from "@/lib/types";
+import {
+  GatekeeperStats,
+  OrganizerSettings,
+  PipelineLogEntry,
+} from "@/lib/types";
 import {
   Activity,
   Camera,
   Cpu,
+  Filter,
   Laptop,
   Loader2,
   Pause,
@@ -45,6 +54,9 @@ interface TopMenubarProps {
   onUpdateSettings: (patch: Partial<OrganizerSettings>) => void;
   gemmaStatus: LocalGemmaStatus;
   onRecheckGemma: () => Promise<void>;
+  valenStatus: ValenRuntimeStatus;
+  onRecheckValen: () => Promise<ValenRuntimeStatus>;
+  gateStats: GatekeeperStats;
   macBridgeState: MacBridgeConnectionState;
   isCapturing: boolean;
   isCapturePaused: boolean;
@@ -73,6 +85,9 @@ export function TopMenubar({
   onUpdateSettings,
   gemmaStatus,
   onRecheckGemma,
+  valenStatus,
+  onRecheckValen,
+  gateStats,
   macBridgeState,
   isCapturing,
   isCapturePaused,
@@ -103,7 +118,7 @@ export function TopMenubar({
   return (
     <header className="sticky top-0 z-30 border-b border-border/80 bg-background/90 backdrop-blur-md">
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center justify-between gap-3 px-4 py-2.5 lg:px-6">
-        {/* Left: App Title & Connection Truth */}
+        {/* Left: App Identity & Calendar Status */}
         <div className="flex items-center gap-3">
           <div className="flex size-8 items-center justify-center rounded-xl bg-foreground text-background">
             <Camera className="size-4" />
@@ -126,12 +141,12 @@ export function TopMenubar({
               </Badge>
             </div>
             <p className="hidden text-[11px] text-muted-foreground xl:block">
-              Local {settings.gemmaModel} organizer • Seamless Calendar, Mail &amp; periodic screenshots
+              Stage 1: {settings.valenModelId} Gate • Stage 2: {settings.gemmaModel} Planner
             </p>
           </div>
         </div>
 
-        {/* Center: Capture Loop Controls */}
+        {/* Center: Capture Loop */}
         <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/40 p-1.5">
           {isCapturing ? (
             <div className="flex items-center gap-2 px-2">
@@ -149,7 +164,7 @@ export function TopMenubar({
               </span>
               {skippedStaticCount > 0 && (
                 <span className="hidden text-[11px] text-muted-foreground md:inline">
-                  ({skippedStaticCount} unchanged skipped)
+                  ({skippedStaticCount} static skipped)
                 </span>
               )}
             </div>
@@ -187,7 +202,7 @@ export function TopMenubar({
             variant="ghost"
             size="icon-sm"
             onClick={() => setCadenceDialogOpen(true)}
-            title="Capture & workday preferences"
+            title="Capture & gatekeeper preferences"
           >
             <SlidersHorizontal className="size-3.5" />
           </Button>
@@ -229,7 +244,7 @@ export function TopMenubar({
           )}
         </div>
 
-        {/* Right: Sync Calendar & Mail, Gemma 4 Status, Android Sync & Setup */}
+        {/* Right: Calendar Sync, Two-Stage AI Status, Android Nightly & Setup */}
         <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="secondary"
@@ -251,9 +266,13 @@ export function TopMenubar({
             size="sm"
             onClick={() => setTelemetryOpen(true)}
             className="gap-1.5 text-xs"
+            title="Inspect Valen-Decision-1.5 Gatekeeper + Gemma 4 Pipeline"
           >
-            <Cpu className="size-3.5" />
-            <span className="font-mono">{settings.gemmaModel}</span>
+            <Filter className="size-3.5" />
+            <span className="hidden font-mono sm:inline">
+              {settings.valenEnabled ? `${settings.valenModelId} → ` : ""}
+              {settings.gemmaModel}
+            </span>
             <span
               className={`size-2 rounded-full ${
                 gemmaStatus.reachable ? "bg-emerald-500" : "bg-amber-500"
@@ -288,13 +307,13 @@ export function TopMenubar({
         </div>
       </div>
 
-      {/* Cadence & Capture Engine Preferences Dialog */}
+      {/* Capture & Gatekeeper Settings Dialog */}
       <Dialog open={cadenceDialogOpen} onOpenChange={setCadenceDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Capture Cadence &amp; Workday Settings</DialogTitle>
+            <DialogTitle>Capture &amp; Valen Gate Settings</DialogTitle>
             <DialogDescription>
-              Configure screenshot frequency, capture engine, and calendar auto-write.
+              Tune screenshot frequency, Valen probability threshold, and calendar sync.
             </DialogDescription>
           </DialogHeader>
 
@@ -319,35 +338,51 @@ export function TopMenubar({
               />
             </div>
 
-            <div className="space-y-1.5">
-              <label className="font-medium">Screenshot Source</label>
-              <Select
-                value={settings.captureEngine}
+            <div className="space-y-2">
+              <div className="flex justify-between font-medium">
+                <span>Valen Gate Cutoff (Wake Gemma 4)</span>
+                <span className="font-mono">
+                  p ≥ {settings.valenSignalThreshold.toFixed(2)}
+                </span>
+              </div>
+              <Slider
+                min={20}
+                max={80}
+                value={[Math.round(settings.valenSignalThreshold * 100)]}
                 onValueChange={(v) => {
-                  if (v === "macos-native" || v === "browser-screen") {
-                    onUpdateSettings({ captureEngine: v });
+                  const next = Array.isArray(v) ? v[0] : v;
+                  if (typeof next === "number") {
+                    onUpdateSettings({ valenSignalThreshold: next / 100 });
                   }
                 }}
-              >
-                <SelectTrigger className="w-full text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="macos-native">
-                    macOS Silent screencapture (via npm run mac)
-                  </SelectItem>
-                  <SelectItem value="browser-screen">
-                    Browser Window / Screen Share
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              />
             </div>
 
             <div className="flex items-center justify-between rounded-lg border p-3">
               <div className="pr-3">
-                <div className="font-medium">Auto-write new blocks to Calendar</div>
+                <div className="font-medium">
+                  Enable Valen-Decision-1.5 Gatekeeper
+                </div>
                 <div className="text-[11px] text-muted-foreground">
-                  Writes Gemma 4 scheduled blocks straight into your connected Calendar.
+                  Screens captures in 1 forward pass (0 output tokens) &amp; crops{" "}
+                  <code>bbox</code> before Gemma 4.
+                </div>
+              </div>
+              <Switch
+                checked={settings.valenEnabled}
+                onCheckedChange={(checked) =>
+                  onUpdateSettings({ valenEnabled: checked })
+                }
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border p-3">
+              <div className="pr-3">
+                <div className="font-medium">
+                  Auto-write new blocks to Calendar
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  Writes Gemma 4 scheduled blocks directly into your Calendar.
                 </div>
               </div>
               <Switch
@@ -361,71 +396,139 @@ export function TopMenubar({
         </DialogContent>
       </Dialog>
 
-      {/* Gemma 4 Model & Live Pipeline Telemetry Dialog */}
+      {/* Two-Stage AI Telemetry & Gatekeeper Savings Dialog */}
       <Dialog open={telemetryOpen} onOpenChange={setTelemetryOpen}>
         <DialogContent className="sm:max-w-xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Activity className="size-4" />
-              Gemma 4 Engine &amp; Live Activity Pipeline
+              System-1 (Valen-Decision-1.5) → System-2 (Gemma 4) Pipeline
             </DialogTitle>
             <DialogDescription>
-              Exact local model status on <code>127.0.0.1:11434</code> and step-by-step activity log.
+              Live status and token-free gatekeeper savings on your MacBook.
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-1 text-xs">
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/40 p-3">
+            {/* Gatekeeper Compute Savings Strip */}
+            <div className="grid grid-cols-4 gap-2 rounded-xl border bg-muted/30 p-3 text-center">
               <div>
-                <div className="font-semibold">
-                  {gemmaStatus.reachable
-                    ? `Ollama Connected (${gemmaStatus.pingMs ?? 0}ms)`
-                    : "Ollama Offline on 127.0.0.1:11434"}
+                <div className="font-mono text-base font-semibold">
+                  {gateStats.totalScreened}
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  Valen Screened
+                </div>
+              </div>
+              <div>
+                <div className="font-mono text-base font-semibold text-emerald-600 dark:text-emerald-400">
+                  {gateStats.filteredNoiseCount}
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  Noise Skipped
+                </div>
+              </div>
+              <div>
+                <div className="font-mono text-base font-semibold text-amber-600 dark:text-amber-400">
+                  {gateStats.privacyDroppedCount}
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  Privacy Dropped
+                </div>
+              </div>
+              <div>
+                <div className="font-mono text-base font-semibold">
+                  {gateStats.routedToGemmaCount}
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  Sent to Gemma 4
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-2 rounded-xl border p-3">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1.5 font-semibold">
+                    <Filter className="size-3.5" />
+                    Stage 1: Valen Gate
+                  </span>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => void onRecheckValen()}
+                  >
+                    Re-check
+                  </Button>
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  {valenStatus.reachable
+                    ? `Online on 127.0.0.1:${valenStatus.port} (${valenStatus.pingMs ?? 0}ms)`
+                    : `Standby on port ${settings.valenPort} (direct Gemma 4 fallback)`}
+                </div>
+                <Select
+                  value={settings.valenModelId}
+                  onValueChange={(v) => {
+                    if (v) onUpdateSettings({ valenModelId: v });
+                  }}
+                >
+                  <SelectTrigger className="w-full text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {VALEN_MODEL_CATALOG.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        {m.id} ({m.ggufFile})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2 rounded-xl border p-3">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1.5 font-semibold">
+                    <Cpu className="size-3.5" />
+                    Stage 2: Gemma 4
+                  </span>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => void onRecheckGemma()}
+                  >
+                    Re-check
+                  </Button>
                 </div>
                 <div className="text-[11px] text-muted-foreground">
                   {gemmaStatus.reachable
-                    ? `Installed models: ${
-                        gemmaStatus.installedModels.join(", ") || "none yet"
-                      }`
-                    : `Start local Gemma 4: ollama pull ${settings.gemmaModel} && OLLAMA_ORIGINS="*" ollama serve`}
+                    ? `Ollama Online (${gemmaStatus.pingMs ?? 0}ms)`
+                    : "Ollama Offline on 127.0.0.1:11434"}
                 </div>
+                <Select
+                  value={settings.gemmaModel}
+                  onValueChange={(v) => {
+                    if (v) onUpdateSettings({ gemmaModel: v });
+                  }}
+                >
+                  <SelectTrigger className="w-full text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {GEMMA4_MODEL_CATALOG.map((m) => (
+                      <SelectItem key={m.tag} value={m.tag}>
+                        {m.tag}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
-
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={() => void onRecheckGemma()}
-              >
-                Re-check
-              </Button>
             </div>
 
             <div className="space-y-1.5">
-              <label className="font-medium">Active Gemma 4 Model</label>
-              <Select
-                value={settings.gemmaModel}
-                onValueChange={(v) => {
-                  if (v) onUpdateSettings({ gemmaModel: v });
-                }}
-              >
-                <SelectTrigger className="w-full text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {GEMMA4_MODEL_CATALOG.map((m) => (
-                    <SelectItem key={m.tag} value={m.tag}>
-                      {m.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="space-y-1.5">
-              <div className="font-medium">Recent Pipeline Execution Log</div>
-              <div className="max-h-56 space-y-1.5 overflow-y-auto rounded-xl border bg-background p-2.5">
+              <div className="font-medium">Live Pipeline Log</div>
+              <div className="max-h-52 space-y-1.5 overflow-y-auto rounded-xl border bg-background p-2.5">
                 {pipelineLogs.length === 0 ? (
-                  <p className="py-6 text-center text-[11px] text-muted-foreground">
+                  <p className="py-5 text-center text-[11px] text-muted-foreground">
                     No captures or scans processed yet in this session.
                   </p>
                 ) : (
