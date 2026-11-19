@@ -1,43 +1,39 @@
-export type CaptureSource =
-  | "mac-mail"
-  | "mac-slack"
-  | "mac-screen"
-  | "mac-calendar"
-  | "android-queue"
-  | "uploaded";
+export type CalendarSourceMode = "none" | "macos-bridge" | "google-api";
+
+export type CaptureEngineMode = "macos-native" | "browser-screen";
 
 export type CalendarBlockKind =
   | "meeting"
   | "prep"
   | "deep-work"
-  | "follow-up"
-  | "buffer";
+  | "follow-up";
 
-export type BlockStatus = "confirmed" | "auto-scheduled" | "needs-slot";
+export type BlockStatus = "confirmed" | "proposed" | "auto-scheduled";
 
 export interface CalendarBlock {
   id: string;
   title: string;
   kind: CalendarBlockKind;
   status: BlockStatus;
-  /** 0 = Today, 1 = Tomorrow */
-  dayOffset: number;
-  /** Minutes from 00:00 (e.g. 540 = 9:00 AM) */
+  /** Local date string YYYY-MM-DD */
+  dateKey: string;
+  /** Minutes from 00:00 local time (e.g. 540 = 9:00 AM) */
   startMinutes: number;
   /** Duration in minutes (15-min increments) */
   durationMinutes: number;
-  sourceCaptureId?: string;
-  linkedMeetingId?: string;
-  ruleId?: string;
   isRecurring?: boolean;
-  /** True when created from an email/Slack mention as a personal calendar hold ("just for me") */
+  /** Personal hold created just for you from an email or Slack mention */
   isSoloHold?: boolean;
   locationOrUrl?: string;
-  sourceLabel?: string;
+  calendarTitle?: string;
+  externalEventId?: string;
+  syncedToExternalCalendar?: boolean;
+  linkedMeetingId?: string;
+  sourceCaptureId?: string;
+  ruleId?: string;
+  sourceLabel: string;
   rationale: string;
   confidence: number;
-  userFeedbackNote?: string;
-  isSample?: boolean;
 }
 
 export type RuleCategory =
@@ -52,51 +48,74 @@ export interface StandingRule {
   description: string;
   category: RuleCategory;
   enabled: boolean;
-  /** Regex or keyword list matched against meeting/task titles */
   triggerPattern?: string;
-  /** Applies to all recurring meetings when true */
   appliesToRecurring?: boolean;
-  /** Minutes of prep work to schedule */
   prepDurationMinutes?: number;
-  /** Minimum minutes before the meeting that prep must start/finish (e.g. 120 = 2 hours before) */
   minLeadMinutesBeforeMeeting?: number;
-  /** Duration adjustment factor or fixed override for matching tasks */
-  durationMultiplier?: number;
   fixedMinutesOverride?: number;
-  /** Protected window in minutes from midnight (for availability rules) */
   protectedWindow?: { startMinutes: number; endMinutes: number; label: string };
   createdFromFeedback?: boolean;
 }
 
 export interface ExtractedCaptureSignal {
   hasActionableItem: boolean;
-  summary: string;
   title: string;
+  summary: string;
   detectedKind: CalendarBlockKind;
   estimatedMinutes: number;
-  /** Specific time if mentioned in an email/Slack invite (minutes from midnight) */
+  proposedDateKey?: string;
   proposedStartMinutes?: number;
-  proposedDayOffset?: number;
   isRecurringMention?: boolean;
   isSoloInvite?: boolean;
   locationOrUrl?: string;
-  deduplicatedWithCaptureId?: string;
   fingerprintKey?: string;
 }
 
 export interface ScreenshotCapture {
   id: string;
   timestampIso: string;
-  source: CaptureSource;
   device: "macbook" | "android";
   appName: string;
   windowTitle: string;
-  ocrPreview: string;
+  summaryText: string;
   imageDataUrl: string;
-  syncState: "scheduled" | "queued-for-tonight" | "deduplicated" | "no-action";
+  modelUsed: string;
+  inferenceMs?: number;
+  syncState:
+    | "scheduled"
+    | "queued-for-tonight"
+    | "deduplicated"
+    | "no-action"
+    | "needs-gemma";
   extractedSignal?: ExtractedCaptureSignal;
   createdBlockId?: string;
-  isSample?: boolean;
+}
+
+export interface MacCalendarDescriptor {
+  id: string;
+  title: string;
+  sourceTitle: string;
+  allowsModify: boolean;
+  isDefault: boolean;
+}
+
+export interface ScannedEmailItem {
+  id: string;
+  subject: string;
+  sender: string;
+  dateIso: string;
+  snippet: string;
+  source: "apple-mail" | "gmail";
+}
+
+export interface PipelineLogEntry {
+  id: string;
+  timestampIso: string;
+  stage: "setup" | "scan" | "capture" | "gemma4" | "calendar-write" | "feedback";
+  title: string;
+  detail: string;
+  modelUsed?: string;
+  latencyMs?: number;
 }
 
 export interface DiscussionMessage {
@@ -116,14 +135,19 @@ export interface SuggestedPreferencePrompt {
   answered?: "accepted" | "dismissed";
 }
 
-export interface CaptureSettings {
+export interface OrganizerSettings {
+  setupCompleted: boolean;
+  lastInitialScanIso?: string;
+  gemmaModel: string;
+  calendarSource: CalendarSourceMode;
+  captureEngine: CaptureEngineMode;
+  writableCalendarId: string;
+  writableCalendarTitle: string;
+  autoWriteToCalendar: boolean;
   intervalMinutes: number;
   skipDuplicateFrames: boolean;
-  pauseOnPrivateApps: boolean;
-  autoScheduleHighConfidence: boolean;
   workdayStartMinutes: number;
   workdayEndMinutes: number;
   minGapBetweenBlocksMinutes: number;
-  nightlyAndroidSyncHour: number; // e.g. 23 = 11:00 PM
-  ollamaModel: string;
+  nightlyAndroidSyncHour: number;
 }

@@ -1,0 +1,52 @@
+ObjC.import("Foundation");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const limit = Math.min(20, Math.max(1, Number(input.limit) || 10));
+
+  try {
+    const Mail = Application("Mail");
+    const inbox = Mail.inbox;
+    const msgs = inbox.messages();
+    const count = Math.min(limit, msgs.length);
+    const results = [];
+
+    for (let i = 0; i < count; i++) {
+      const m = msgs[i];
+      let snippet = "";
+      try {
+        snippet = String(m.content() || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 600);
+      } catch (_e) {
+        snippet = "";
+      }
+      results.push({
+        id: "mail-" + m.id(),
+        subject: String(m.subject() || "(No subject)"),
+        sender: String(m.sender() || ""),
+        dateIso: m.dateReceived()
+          ? new Date(m.dateReceived()).toISOString()
+          : new Date().toISOString(),
+        isRead: Boolean(m.readStatus()),
+        snippet,
+      });
+    }
+
+    return JSON.stringify({ ok: true, messages: results });
+  } catch (err) {
+    return JSON.stringify({
+      ok: false,
+      error:
+        "Could not read Apple Mail (ensure Mail.app is configured and Automation permission is allowed in System Settings). You can still capture screenshots of Gmail/Outlook/Slack directly.",
+      messages: [],
+    });
+  }
+}

@@ -4,36 +4,103 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   computeCanvasLuminanceSignature,
   signatureSimilarity,
-} from "@/lib/ollama-vlm";
+} from "@/lib/gemma-client";
+import { captureSilentMacScreenshot } from "@/lib/calendar-connectors";
+import { CaptureEngineMode } from "@/lib/types";
 
 interface UseScreenCaptureOptions {
+  mode: CaptureEngineMode;
+  macPairingToken: string;
+  macBridgeReady: boolean;
   intervalMinutes: number;
   skipDuplicateFrames: boolean;
   isPaused: boolean;
-  onFrameCaptured: (imageDataUrl: string) => void;
-  onStaticFrameSkipped?: () => void;
+  onFrameCaptured: (payload: {
+    imageDataUrl: string;
+    appName: string;
+    windowTitle: string;
+  }) => void;
 }
 
 export function useScreenCapture({
+  mode,
+  macPairingToken,
+  macBridgeReady,
   intervalMinutes,
   skipDuplicateFrames,
   isPaused,
   onFrameCaptured,
-  onStaticFrameSkipped,
 }: UseScreenCaptureOptions) {
   const [isCapturing, setIsCapturing] = useState(false);
   const [secondsUntilNext, setSecondsUntilNext] = useState(
-    Math.round(intervalMinutes * 60)
+    Math.max(15, Math.round(intervalMinutes * 60))
   );
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [skippedStaticCount, setSkippedStaticCount] = useState(0);
 
   const streamRef = useRef<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const lastSignatureRef = useRef<number[]>([]);
+  const lastSigRef = useRef<number[]>([]);
+
+  const checkImageDataUrlDuplicate = useCallback(
+    (dataUrl: string, force: boolean): Promise<boolean> => {
+      if (force || !skipDuplicateFrames) return Promise.resolve(false);
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = 64;
+          canvas.height = 64;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return resolve(false);
+          ctx.drawImage(img, 0, 0, 64, 64);
+          const sig = computeCanvasLuminanceSignature(ctx, 64, 64);
+          if (
+            lastSigRef.current.length > 0 &&
+            signatureSimilarity(sig, lastSigRef.current) >= 0.975
+          ) {
+            setSkippedStaticCount((c) => c + 1);
+            resolve(true);
+            return;
+          }
+          lastSigRef.current = sig;
+          resolve(false);
+        };
+        img.onerror = () => resolve(false);
+        img.src = dataUrl;
+      });
+    },
+    [skipDuplicateFrames]
+  );
 
   const grabFrameNow = useCallback(
-    (forceEvenIfDuplicate = false) => {
+    async (forceEvenIfDuplicate = false): Promise<boolean> => {
+      if (mode === "macos-native" && macBridgeReady && macPairingToken) {
+        const res = await captureSilentMacScreenshot(macPairingToken);
+        if (!res.ok) {
+          setCaptureError(
+            res.error || "Native macOS screencapture failed — check Screen Recording permission."
+          );
+          return false;
+        }
+        if (res.skippedPrivateApp || !res.imageDataUrl) {
+          return false;
+        }
+        const isDup = await checkImageDataUrlDuplicate(
+          res.imageDataUrl,
+          forceEvenIfDuplicate
+        );
+        if (isDup) return false;
+
+        onFrameCaptured({
+          imageDataUrl: res.imageDataUrl,
+          appName: res.appName || "macOS",
+          windowTitle: res.windowTitle || "Active Mac Window",
+        });
+        return true;
+      }
+
+      // Browser DisplayMedia fallback
       const video = videoRef.current;
       if (!video || video.readyState < 2) return false;
 
@@ -48,29 +115,36 @@ export function useScreenCapture({
       canvas.height = h;
       const ctx = canvas.getContext("2d");
       if (!ctx) return false;
-
       ctx.drawImage(video, 0, 0, w, h);
 
       const sig = computeCanvasLuminanceSignature(ctx, w, h);
       if (
         !forceEvenIfDuplicate &&
         skipDuplicateFrames &&
-        lastSignatureRef.current.length > 0
+        lastSigRef.current.length > 0 &&
+        signatureSimilarity(sig, lastSigRef.current) >= 0.975
       ) {
-        const sim = signatureSimilarity(sig, lastSignatureRef.current);
-        if (sim >= 0.975) {
-          setSkippedStaticCount((c) => c + 1);
-          onStaticFrameSkipped?.();
-          return false;
-        }
+        setSkippedStaticCount((c) => c + 1);
+        return false;
       }
+      lastSigRef.current = sig;
 
-      lastSignatureRef.current = sig;
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
-      onFrameCaptured(dataUrl);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+      onFrameCaptured({
+        imageDataUrl: dataUrl,
+        appName: "Shared Window / Screen",
+        windowTitle: "Browser Screen Capture",
+      });
       return true;
     },
-    [onFrameCaptured, onStaticFrameSkipped, skipDuplicateFrames]
+    [
+      checkImageDataUrlDuplicate,
+      macBridgeReady,
+      macPairingToken,
+      mode,
+      onFrameCaptured,
+      skipDuplicateFrames,
+    ]
   );
 
   const stopCapture = useCallback(() => {
@@ -87,12 +161,26 @@ export function useScreenCapture({
 
   const startCapture = useCallback(async () => {
     setCaptureError(null);
+
+    if (mode === "macos-native") {
+      if (!macBridgeReady || !macPairingToken) {
+        setCaptureError(
+          "Mac Bridge is not paired yet. Start `npm run mac` on your MacBook or switch capture engine to Browser Window Share."
+        );
+        return;
+      }
+      setIsCapturing(true);
+      setSecondsUntilNext(Math.max(15, Math.round(intervalMinutes * 60)));
+      await grabFrameNow(true);
+      return;
+    }
+
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices?.getDisplayMedia
     ) {
       setCaptureError(
-        "Live screen capture requires a desktop browser (Safari, Chrome, or Arc on macOS). You can still upload/paste screenshots or simulate captures below."
+        "Screen capture is unavailable in this browser context. Run `npm run mac` on your MacBook for native background screencapture."
       );
       return;
     }
@@ -102,43 +190,44 @@ export function useScreenCapture({
         video: { frameRate: 1 },
         audio: false,
       });
-
       const video = document.createElement("video");
       video.muted = true;
       video.playsInline = true;
       video.srcObject = stream;
       await video.play();
 
-      const [videoTrack] = stream.getVideoTracks();
-      if (videoTrack) {
-        videoTrack.addEventListener("ended", () => {
-          stopCapture();
-        });
-      }
+      stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        stopCapture();
+      });
 
       streamRef.current = stream;
       videoRef.current = video;
-      lastSignatureRef.current = [];
+      lastSigRef.current = [];
       setIsCapturing(true);
       setSecondsUntilNext(Math.max(15, Math.round(intervalMinutes * 60)));
 
-      // Take the initial screenshot immediately once stream stabilizes
       setTimeout(() => {
-        grabFrameNow(true);
+        void grabFrameNow(true);
       }, 450);
     } catch (err) {
-      const msg =
+      setCaptureError(
         err instanceof Error && err.name === "NotAllowedError"
-          ? "Screen sharing permission was dismissed — click Start Live Capture anytime to pick your Mac screen, Mail, or Slack window."
-          : "Could not start live screen capture in this window.";
-      setCaptureError(msg);
+          ? "Screen sharing permission was cancelled."
+          : "Could not start browser screen capture."
+      );
       stopCapture();
     }
-  }, [grabFrameNow, intervalMinutes, stopCapture]);
+  }, [
+    grabFrameNow,
+    intervalMinutes,
+    macBridgeReady,
+    macPairingToken,
+    mode,
+    stopCapture,
+  ]);
 
   const maxCountdownSeconds = Math.max(15, Math.round(intervalMinutes * 60));
 
-  // Countdown tick for periodic capture
   useEffect(() => {
     if (!isCapturing || isPaused) return;
 
@@ -146,7 +235,7 @@ export function useScreenCapture({
       setSecondsUntilNext((prev) => {
         const bounded = Math.min(prev, maxCountdownSeconds);
         if (bounded <= 1) {
-          grabFrameNow(false);
+          void grabFrameNow(false);
           return maxCountdownSeconds;
         }
         return bounded - 1;
@@ -156,11 +245,8 @@ export function useScreenCapture({
     return () => clearInterval(timer);
   }, [grabFrameNow, isCapturing, isPaused, maxCountdownSeconds]);
 
-  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      stopCapture();
-    };
+    return () => stopCapture();
   }, [stopCapture]);
 
   return {

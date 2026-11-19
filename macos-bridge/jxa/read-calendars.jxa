@@ -1,0 +1,101 @@
+ObjC.import("Foundation");
+ObjC.import("EventKit");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const store = $.EKEventStore.alloc.init;
+
+  let granted = false;
+  let done = false;
+
+  if (store.respondsToSelector("requestFullAccessToEventsWithCompletion:")) {
+    store.requestFullAccessToEventsWithCompletion((ok, _err) => {
+      granted = Boolean(ok);
+      done = true;
+    });
+  } else {
+    store.requestAccessToEntityTypeCompletion(0, (ok, _err) => {
+      granted = Boolean(ok);
+      done = true;
+    });
+  }
+
+  const startWait = Date.now();
+  while (!done && Date.now() - startWait < 15000) {
+    $.NSRunLoop.currentRunLoop.runUntilDate(
+      $.NSDate.dateWithTimeIntervalSinceNow(0.05)
+    );
+  }
+
+  if (!granted) {
+    return JSON.stringify({
+      ok: false,
+      error:
+        "Calendar permission not granted yet. Enable Calendar access for Terminal / Node in macOS System Settings → Privacy & Security → Calendars.",
+      calendars: [],
+      events: [],
+    });
+  }
+
+  const cals = store.calendarsForEntityType(0);
+  const calendars = [];
+  const defaultCal = store.defaultCalendarForNewEvents;
+  const defaultCalId = defaultCal ? defaultCal.calendarIdentifier.js : "";
+
+  for (let i = 0; i < cals.count; i++) {
+    const c = cals.objectAtIndex(i);
+    calendars.push({
+      id: c.calendarIdentifier.js,
+      title: c.title.js,
+      sourceTitle: c.source ? c.source.title.js : "Mac",
+      allowsModify: Boolean(c.allowsContentModifications),
+      isDefault: c.calendarIdentifier.js === defaultCalId,
+    });
+  }
+
+  const startMs = input.startMs || Date.now();
+  const endMs = input.endMs || startMs + 7 * 24 * 60 * 60 * 1000;
+  const nsStart = $.NSDate.dateWithTimeIntervalSince1970(startMs / 1000);
+  const nsEnd = $.NSDate.dateWithTimeIntervalSince1970(endMs / 1000);
+
+  const predicate = store.predicateForEventsWithStartDateEndDateCalendars(
+    nsStart,
+    nsEnd,
+    null
+  );
+  const ekEvents = store.eventsMatchingPredicate(predicate);
+  const events = [];
+
+  if (ekEvents) {
+    for (let i = 0; i < ekEvents.count; i++) {
+      const ev = ekEvents.objectAtIndex(i);
+      if (ev.isAllDay) continue;
+      const sMs = Math.round(ev.startDate.timeIntervalSince1970 * 1000);
+      const eMs = Math.round(ev.endDate.timeIntervalSince1970 * 1000);
+      events.push({
+        id: ev.eventIdentifier ? ev.eventIdentifier.js : "ek-" + i,
+        title: ev.title ? ev.title.js : "Untitled Event",
+        startIso: new Date(sMs).toISOString(),
+        endIso: new Date(eMs).toISOString(),
+        isRecurring: Boolean(ev.hasRecurrenceRules),
+        location: ev.location ? ev.location.js : "",
+        notes: ev.notes ? ev.notes.js.slice(0, 300) : "",
+        calendarId: ev.calendar ? ev.calendar.calendarIdentifier.js : "",
+        calendarTitle: ev.calendar ? ev.calendar.title.js : "Calendar",
+      });
+    }
+  }
+
+  return JSON.stringify({
+    ok: true,
+    defaultCalendarId: defaultCalId,
+    calendars,
+    events,
+  });
+}

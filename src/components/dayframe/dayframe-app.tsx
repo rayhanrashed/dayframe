@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { KickstartWizard } from "./kickstart-wizard";
 import { TopMenubar } from "./top-menubar";
 import { CaptureStreamPanel } from "./capture-stream-panel";
 import { CalendarTimeline } from "./calendar-timeline";
@@ -9,107 +10,139 @@ import { NightlyAndroidSheet } from "./nightly-android-sheet";
 import { useScreenCapture } from "@/hooks/use-screen-capture";
 import {
   CalendarBlock,
-  CaptureSettings,
   DiscussionMessage,
+  MacCalendarDescriptor,
+  OrganizerSettings,
+  PipelineLogEntry,
+  ScannedEmailItem,
   ScreenshotCapture,
   StandingRule,
   SuggestedPreferencePrompt,
 } from "@/lib/types";
 import {
-  DEFAULT_CAPTURE_SETTINGS,
-  INITIAL_CALENDAR_BLOCKS,
-  INITIAL_CAPTURES,
-  INITIAL_DISCUSSION_MESSAGES,
-  INITIAL_STANDING_RULES,
-  INITIAL_SUGGESTED_PROMPTS,
-  renderMacScreenshotSvg,
-  SIMULATED_INCOMING_MAC_CAPTURES,
-} from "@/lib/sample-data";
-import {
-  analyzeScreenshotWithLocalOllama,
-  extractHeuristicSignalFromText,
-  LocalOllamaStatus,
-  probeLocalOllama,
-} from "@/lib/ollama-vlm";
-import {
-  applyNaturalLanguageFeedback,
+  addDaysToDateKey,
+  applyUserRuleFeedback,
+  DEFAULT_ORGANIZER_SETTINGS,
+  DEFAULT_STANDING_RULES,
+  DEFAULT_SUGGESTED_QUESTIONS,
   findOpenSlot,
   formatDuration,
   formatMinutesToTime,
+  placeSignalOnCalendar,
   reconcilePrepBlocks,
-  scheduleSignalIntoCalendar,
 } from "@/lib/scheduler";
 import {
-  buildIcsForBlocks,
-  parseImportedIcs,
-  triggerIcsDownload,
-} from "@/lib/ics";
+  analyzeInboxEmailsWithGemma4,
+  analyzeScreenshotWithGemma4,
+  LocalGemmaStatus,
+  probeLocalGemma,
+} from "@/lib/gemma-client";
+import {
+  fetchMacAndroidFolderQueue,
+  MacBridgeConnectionState,
+  probeMacBridge,
+  scanGoogleCalendarAndGmail,
+  scanMacCalendarEvents,
+  scanMacMailMessages,
+  toLocalDateKey,
+  writeBlockToGoogleCalendar,
+  writeBlockToMacCalendar,
+} from "@/lib/calendar-connectors";
 
-const STORAGE_KEY = "dayframe.workspace.v1";
+const STORAGE_KEY_V2 = "dayframe.real.v2";
+const LEGACY_TOY_KEY = "dayframe.workspace.v1";
 
-interface PersistedState {
-  settings: CaptureSettings;
+interface PersistedWorkspaceV2 {
+  settings: OrganizerSettings;
   blocks: CalendarBlock[];
   captures: ScreenshotCapture[];
   rules: StandingRule[];
   messages: DiscussionMessage[];
   suggestedPrompts: SuggestedPreferencePrompt[];
-  simCursor: number;
+  macPairingToken: string;
 }
 
 export function DayframeApp() {
+  const [todayKey, setTodayKey] = useState("");
   const [hydrated, setHydrated] = useState(false);
-  const [settings, setSettings] = useState<CaptureSettings>(
-    DEFAULT_CAPTURE_SETTINGS
+
+  const [settings, setSettings] = useState<OrganizerSettings>(
+    DEFAULT_ORGANIZER_SETTINGS
   );
-  const [blocks, setBlocks] = useState<CalendarBlock[]>(INITIAL_CALENDAR_BLOCKS);
-  const [captures, setCaptures] =
-    useState<ScreenshotCapture[]>(INITIAL_CAPTURES);
-  const [rules, setRules] = useState<StandingRule[]>(INITIAL_STANDING_RULES);
-  const [messages, setMessages] = useState<DiscussionMessage[]>(
-    INITIAL_DISCUSSION_MESSAGES
-  );
+  const [blocks, setBlocks] = useState<CalendarBlock[]>([]);
+  const [captures, setCaptures] = useState<ScreenshotCapture[]>([]);
+  const [rules, setRules] = useState<StandingRule[]>(DEFAULT_STANDING_RULES);
+  const [messages, setMessages] = useState<DiscussionMessage[]>([
+    {
+      id: "welcome-msg",
+      role: "assistant",
+      text: "Tell me any recurring meeting prep rules, duration adjustments, or workday boundaries — I keep them in your Standing Rules context for every Gemma 4 scan.",
+      timestampIso: "",
+    },
+  ]);
   const [suggestedPrompts, setSuggestedPrompts] = useState<
     SuggestedPreferencePrompt[]
-  >(INITIAL_SUGGESTED_PROMPTS);
-  const [simCursor, setSimCursor] = useState(0);
+  >(DEFAULT_SUGGESTED_QUESTIONS);
+  const [pipelineLogs, setPipelineLogs] = useState<PipelineLogEntry[]>([]);
 
-  const [viewMode, setViewMode] = useState<"split" | "today" | "tomorrow">(
-    "split"
-  );
+  const [macPairingToken, setMacPairingToken] = useState("");
+  const [googleAccessToken, setGoogleAccessToken] = useState("");
+  const [macCalendars, setMacCalendars] = useState<MacCalendarDescriptor[]>([]);
+  const [scannedEmails, setScannedEmails] = useState<ScannedEmailItem[]>([]);
+
+  const [gemmaStatus, setGemmaStatus] = useState<LocalGemmaStatus>({
+    reachable: false,
+    installedModels: [],
+    installedGemma4Models: [],
+    selectedModelInstalled: false,
+  });
+  const [macBridgeState, setMacBridgeState] =
+    useState<MacBridgeConnectionState>({
+      reachable: false,
+      paired: false,
+    });
+
+  const [anchorDateKey, setAnchorDateKey] = useState("");
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [androidSheetOpen, setAndroidSheetOpen] = useState(false);
   const [isCapturePaused, setIsCapturePaused] = useState(false);
-  const [isProcessingCapture, setIsProcessingCapture] = useState(false);
+  const [isSyncingCalendar, setIsSyncingCalendar] = useState(false);
   const [isRunningNightlyBatch, setIsRunningNightlyBatch] = useState(false);
   const [lastBatchSummary, setLastBatchSummary] = useState<string | null>(null);
   const [toastBanner, setToastBanner] = useState<string | null>(null);
-
-  const [ollamaStatus, setOllamaStatus] = useState<LocalOllamaStatus>({
-    connected: false,
-    models: [],
-    visionModels: [],
-    recommendedModel: "llama3.2-vision",
-  });
 
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showToast = useCallback((msg: string) => {
     setToastBanner(msg);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => {
-      setToastBanner(null);
-    }, 5200);
+    toastTimerRef.current = setTimeout(() => setToastBanner(null), 5000);
   }, []);
 
-  // Hydrate saved local state on mount asynchronously to avoid synchronous cascading renders
+  const appendLog = useCallback(
+    (entry: Omit<PipelineLogEntry, "id" | "timestampIso">) => {
+      setPipelineLogs((prev) => [
+        {
+          ...entry,
+          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          timestampIso: new Date().toISOString(),
+        },
+        ...prev.slice(0, 39),
+      ]);
+    },
+    []
+  );
+
+  // Hydrate v2 state, purge legacy v1 toy data, and support #pair=<token> from npm run mac
   useEffect(() => {
     let cancelled = false;
-    Promise.resolve().then(() => {
+    Promise.resolve().then(async () => {
       if (cancelled) return;
+      let loadedToken = "";
       try {
-        const raw = localStorage.getItem(STORAGE_KEY);
+        localStorage.removeItem(LEGACY_TOY_KEY);
+        const raw = localStorage.getItem(STORAGE_KEY_V2);
         if (raw) {
-          const parsed = JSON.parse(raw) as Partial<PersistedState>;
+          const parsed = JSON.parse(raw) as Partial<PersistedWorkspaceV2>;
           if (parsed.settings) setSettings(parsed.settings);
           if (parsed.blocks) setBlocks(parsed.blocks);
           if (parsed.captures) setCaptures(parsed.captures);
@@ -117,128 +150,479 @@ export function DayframeApp() {
           if (parsed.messages) setMessages(parsed.messages);
           if (parsed.suggestedPrompts)
             setSuggestedPrompts(parsed.suggestedPrompts);
-          if (typeof parsed.simCursor === "number")
-            setSimCursor(parsed.simCursor);
+          if (parsed.macPairingToken) {
+            loadedToken = parsed.macPairingToken;
+            setMacPairingToken(parsed.macPairingToken);
+          }
         }
       } catch {
-        // Ignore malformed localStorage
+        // Ignore storage errors
       }
+
+      if (typeof window !== "undefined" && window.location.hash.startsWith("#pair=")) {
+        const hashToken = decodeURIComponent(
+          window.location.hash.replace("#pair=", "").trim()
+        );
+        if (hashToken) {
+          loadedToken = hashToken;
+          setMacPairingToken(hashToken);
+          window.history.replaceState(null, "", window.location.pathname);
+        }
+      }
+
+      const currentTodayKey = toLocalDateKey(new Date());
+      setTodayKey(currentTodayKey);
+      setAnchorDateKey(currentTodayKey);
       setHydrated(true);
+
+      const [gStat, mStat] = await Promise.all([
+        probeLocalGemma(DEFAULT_ORGANIZER_SETTINGS.gemmaModel),
+        probeMacBridge(loadedToken),
+      ]);
+      if (cancelled) return;
+      setGemmaStatus(gStat);
+      setMacBridgeState(mStat);
+      if (mStat.paired) {
+        setSettings((prev) => ({
+          ...prev,
+          calendarSource: "macos-bridge",
+          captureEngine: "macos-native",
+        }));
+      }
     });
+
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Persist changes locally on MacBook
+  // Persist user's real state locally (never storing OAuth access tokens in plain storage)
   useEffect(() => {
     if (!hydrated) return;
     try {
-      const stateToSave: PersistedState = {
+      const payload: PersistedWorkspaceV2 = {
         settings,
         blocks,
         captures,
         rules,
         messages,
         suggestedPrompts,
-        simCursor,
+        macPairingToken,
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+      localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(payload));
     } catch {
-      // Ignore quota errors if user uploads many large screenshots
+      // Ignore quota exceeded
     }
   }, [
     blocks,
     captures,
     hydrated,
+    macPairingToken,
     messages,
     rules,
     settings,
-    simCursor,
     suggestedPrompts,
   ]);
 
-  // Probe local Ollama on mount & manual re-check
-  const refreshOllamaStatus = useCallback(async () => {
-    const status = await probeLocalOllama();
-    setOllamaStatus(status);
-    if (status.connected && status.recommendedModel) {
+  const refreshGemmaStatus = useCallback(async () => {
+    const res = await probeLocalGemma(settings.gemmaModel);
+    setGemmaStatus(res);
+  }, [settings.gemmaModel]);
+
+  const verifyAndLoadMacBridge = useCallback(async () => {
+    const state = await probeMacBridge(macPairingToken);
+    setMacBridgeState(state);
+    if (state.paired) {
       setSettings((prev) => ({
         ...prev,
-        ollamaModel: prev.ollamaModel || status.recommendedModel,
+        calendarSource: "macos-bridge",
+        captureEngine: "macos-native",
       }));
-    }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    probeLocalOllama().then((status) => {
-      if (cancelled) return;
-      setOllamaStatus(status);
-      if (status.connected && status.recommendedModel) {
-        setSettings((prev) => ({
-          ...prev,
-          ollamaModel: prev.ollamaModel || status.recommendedModel,
-        }));
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Handle a real live frame from MacBook DisplayMedia
-  const handleLiveFrameCaptured = useCallback(
-    async (imageDataUrl: string) => {
-      setIsProcessingCapture(true);
-      const tempCapture: ScreenshotCapture = {
-        id: `cap-live-${Date.now()}`,
-        timestampIso: new Date().toISOString(),
-        source: "mac-screen",
-        device: "macbook",
-        appName: "Live MacBook Display",
-        windowTitle: "Periodic Mac Screen Capture",
-        ocrPreview: "Analyzing live MacBook screenshot with local model...",
-        imageDataUrl,
-        syncState: "no-action",
-      };
-
-      const { signal, usedLocalVlm } = await analyzeScreenshotWithLocalOllama({
-        imageDataUrl,
-        model: settings.ollamaModel,
-        rules,
-        device: "macbook",
+      const scan = await scanMacCalendarEvents({
+        pairingToken: macPairingToken,
+        daysAhead: 7,
       });
-
-      const enrichedCapture: ScreenshotCapture = {
-        ...tempCapture,
-        ocrPreview: usedLocalVlm
-          ? signal.summary
-          : "Live screen frame captured (connect local Ollama on 127.0.0.1:11434 for live OCR, or paste text/screenshots directly).",
-      };
-
-      setBlocks((prevBlocks) => {
-        const res = scheduleSignalIntoCalendar({
-          capture: enrichedCapture,
-          signal,
-          currentBlocks: prevBlocks,
-          existingCaptures: captures,
-          rules,
-          settings,
-        });
-        setCaptures((prevCaps) => [res.updatedCapture, ...prevCaps]);
-        if (res.createdBlock) {
-          showToast(
-            `Scheduled "${res.createdBlock.title}" at ${formatMinutesToTime(
-              res.createdBlock.startMinutes
-            )}`
+      if (scan.ok) {
+        setMacCalendars(scan.calendars);
+        if (!settings.writableCalendarId && scan.defaultCalendarId) {
+          const def = scan.calendars.find(
+            (c) => c.id === scan.defaultCalendarId
           );
+          setSettings((prev) => ({
+            ...prev,
+            writableCalendarId: scan.defaultCalendarId,
+            writableCalendarTitle: def?.title || "Default Calendar",
+          }));
         }
-        return res.updatedBlocks;
-      });
-      setIsProcessingCapture(false);
+        showToast(
+          `Paired with macOS Calendar (${scan.calendars.length} calendars available)`
+        );
+      }
+    } else if (state.error) {
+      showToast(state.error);
+    }
+  }, [macPairingToken, settings.writableCalendarId, showToast]);
+
+  // Write a single block to the connected real calendar (macOS EventKit or Google Calendar API)
+  const pushBlockToExternalCalendar = useCallback(
+    async (block: CalendarBlock): Promise<CalendarBlock> => {
+      if (block.syncedToExternalCalendar) return block;
+
+      if (macBridgeState.paired && macPairingToken) {
+        const res = await writeBlockToMacCalendar({
+          pairingToken: macPairingToken,
+          block,
+          calendarId: settings.writableCalendarId,
+        });
+        if (res.ok) {
+          appendLog({
+            stage: "calendar-write",
+            title: `Wrote "${block.title}" to macOS Calendar`,
+            detail: `${block.dateKey} at ${formatMinutesToTime(
+              block.startMinutes
+            )} (${formatDuration(block.durationMinutes)})`,
+          });
+          return {
+            ...block,
+            status: "confirmed",
+            syncedToExternalCalendar: true,
+            externalEventId: res.externalEventId,
+          };
+        }
+      } else if (
+        settings.calendarSource === "google-api" &&
+        googleAccessToken.trim()
+      ) {
+        const res = await writeBlockToGoogleCalendar({
+          googleAccessToken,
+          block,
+        });
+        if (res.ok) {
+          appendLog({
+            stage: "calendar-write",
+            title: `Wrote "${block.title}" to Google Calendar`,
+            detail: `${block.dateKey} at ${formatMinutesToTime(
+              block.startMinutes
+            )}`,
+          });
+          return {
+            ...block,
+            status: "confirmed",
+            syncedToExternalCalendar: true,
+            externalEventId: res.externalEventId,
+          };
+        }
+      }
+
+      return { ...block, status: "confirmed" };
     },
-    [captures, rules, settings, showToast]
+    [
+      appendLog,
+      googleAccessToken,
+      macBridgeState.paired,
+      macPairingToken,
+      settings.calendarSource,
+      settings.writableCalendarId,
+    ]
+  );
+
+  // One-Off Initial Baseline Scan (or Re-Scan from Workspace)
+  const runBaselineCalendarAndMailScan = useCallback(async (): Promise<{
+    ok: boolean;
+    existingCount: number;
+    emailCount: number;
+    proposedCount: number;
+    error?: string;
+  }> => {
+    setIsSyncingCalendar(true);
+    try {
+      let fetchedCalendarBlocks: CalendarBlock[] = [];
+      let fetchedEmails: ScannedEmailItem[] = [];
+
+      if (
+        settings.calendarSource === "google-api" &&
+        googleAccessToken.trim()
+      ) {
+        const gRes = await scanGoogleCalendarAndGmail({
+          googleAccessToken,
+          daysAhead: 7,
+        });
+        if (!gRes.ok) {
+          setIsSyncingCalendar(false);
+          return {
+            ok: false,
+            existingCount: 0,
+            emailCount: 0,
+            proposedCount: 0,
+            error: gRes.error,
+          };
+        }
+        fetchedCalendarBlocks = gRes.blocks;
+        fetchedEmails = gRes.emails;
+      } else {
+        const bridge = await probeMacBridge(macPairingToken);
+        setMacBridgeState(bridge);
+        if (!bridge.paired) {
+          setIsSyncingCalendar(false);
+          return {
+            ok: false,
+            existingCount: 0,
+            emailCount: 0,
+            proposedCount: 0,
+            error:
+              bridge.error ||
+              "Mac Bridge is not paired yet. Run `npm run mac` on your MacBook or connect Google Calendar in Step 1.",
+          };
+        }
+
+        const [calRes, mailRes] = await Promise.all([
+          scanMacCalendarEvents({ pairingToken: macPairingToken, daysAhead: 7 }),
+          scanMacMailMessages({ pairingToken: macPairingToken, limit: 10 }),
+        ]);
+
+        if (!calRes.ok) {
+          setIsSyncingCalendar(false);
+          return {
+            ok: false,
+            existingCount: 0,
+            emailCount: 0,
+            proposedCount: 0,
+            error: calRes.error,
+          };
+        }
+
+        setMacCalendars(calRes.calendars);
+        fetchedCalendarBlocks = calRes.blocks;
+        fetchedEmails = mailRes.messages;
+      }
+
+      setScannedEmails(fetchedEmails);
+      appendLog({
+        stage: "scan",
+        title: "Completed Calendar & Mail Scan",
+        detail: `Read ${fetchedCalendarBlocks.length} calendar events and ${fetchedEmails.length} inbox messages.`,
+      });
+
+      // 1. Reconcile recurring meeting prep blocks (e.g. >=2h before recurring meetings)
+      let workingBlocks = reconcilePrepBlocks(
+        fetchedCalendarBlocks,
+        rules,
+        settings,
+        todayKey,
+        "proposed"
+      );
+
+      // 2. If local Gemma 4 is online and emails were scanned, extract solo holds & focus blocks
+      const gStatus = await probeLocalGemma(settings.gemmaModel);
+      setGemmaStatus(gStatus);
+
+      if (gStatus.reachable && fetchedEmails.length > 0) {
+        const inboxAnalysis = await analyzeInboxEmailsWithGemma4({
+          emails: fetchedEmails,
+          model: settings.gemmaModel,
+          todayDateKey: todayKey,
+          rules,
+        });
+        appendLog({
+          stage: "gemma4",
+          title: `Gemma 4 analyzed ${fetchedEmails.length} inbox emails`,
+          detail: inboxAnalysis.ok
+            ? `Extracted ${inboxAnalysis.signals.length} actionable calendar blocks.`
+            : inboxAnalysis.error || "Inbox extraction failed.",
+          modelUsed: settings.gemmaModel,
+          latencyMs: inboxAnalysis.latencyMs,
+        });
+
+        for (const sig of inboxAnalysis.signals) {
+          const placed = placeSignalOnCalendar({
+            signal: sig,
+            sourceLabel: sig.sourceLabel,
+            defaultDateKey: todayKey,
+            blocks: workingBlocks,
+            captures,
+            rules,
+            settings,
+            status: "proposed",
+          });
+          workingBlocks = placed.updatedBlocks;
+        }
+      }
+
+      setBlocks(workingBlocks);
+      setIsSyncingCalendar(false);
+
+      const proposedCount = workingBlocks.filter(
+        (b) => b.status !== "confirmed"
+      ).length;
+
+      return {
+        ok: true,
+        existingCount: fetchedCalendarBlocks.length,
+        emailCount: fetchedEmails.length,
+        proposedCount,
+      };
+    } catch (err) {
+      setIsSyncingCalendar(false);
+      return {
+        ok: false,
+        existingCount: 0,
+        emailCount: 0,
+        proposedCount: 0,
+        error: err instanceof Error ? err.message : "Baseline scan failed.",
+      };
+    }
+  }, [
+    appendLog,
+    captures,
+    googleAccessToken,
+    macPairingToken,
+    rules,
+    settings,
+    todayKey,
+  ]);
+
+  // Finalize Kickstart Setup
+  const handleFinalizeKickstart = async (writeApprovedToCalendar: boolean) => {
+    if (writeApprovedToCalendar) {
+      const updated: CalendarBlock[] = [];
+      for (const blk of blocks) {
+        if (blk.status !== "confirmed") {
+          updated.push(await pushBlockToExternalCalendar(blk));
+        } else {
+          updated.push(blk);
+        }
+      }
+      setBlocks(updated);
+    }
+
+    setSettings((prev) => ({
+      ...prev,
+      setupCompleted: true,
+      lastInitialScanIso: new Date().toISOString(),
+    }));
+    showToast("Dayframe workspace ready");
+  };
+
+  // Process incoming screenshot through local Gemma 4
+  const processCapturedImage = useCallback(
+    async (payload: {
+      imageDataUrl: string;
+      appName: string;
+      windowTitle: string;
+      device: "macbook" | "android";
+    }) => {
+      const { imageDataUrl, appName, windowTitle, device } = payload;
+
+      const analysis = await analyzeScreenshotWithGemma4({
+        imageDataUrl,
+        model: settings.gemmaModel,
+        appName,
+        windowTitle,
+        todayDateKey: todayKey,
+        rules,
+        device,
+      });
+
+      appendLog({
+        stage: "gemma4",
+        title: analysis.ok
+          ? `Analyzed screenshot (${appName})`
+          : `Gemma 4 unreachable for screenshot (${appName})`,
+        detail: analysis.ok
+          ? analysis.signal?.hasActionableItem
+            ? `Scheduled: ${analysis.signal.title}`
+            : "No new calendar action needed."
+          : analysis.error || "Start local Ollama on 127.0.0.1:11434.",
+        modelUsed: analysis.modelUsed,
+        latencyMs: analysis.latencyMs,
+      });
+
+      if (!analysis.ok || !analysis.signal) {
+        const offlineCap: ScreenshotCapture = {
+          id: `cap-${Date.now()}`,
+          timestampIso: new Date().toISOString(),
+          device,
+          appName,
+          windowTitle,
+          summaryText:
+            analysis.error ||
+            `Start local ${settings.gemmaModel} in Ollama to analyze screenshots.`,
+          imageDataUrl,
+          modelUsed: settings.gemmaModel,
+          syncState: "needs-gemma",
+        };
+        setCaptures((prev) => [offlineCap, ...prev]);
+        showToast(
+          `Captured frame, but ${settings.gemmaModel} is offline on 127.0.0.1:11434`
+        );
+        return;
+      }
+
+      const targetDefaultDate =
+        device === "android" ? addDaysToDateKey(todayKey, 1) : todayKey;
+
+      const placement = placeSignalOnCalendar({
+        signal: analysis.signal,
+        sourceLabel: `${appName} screenshot`,
+        defaultDateKey: targetDefaultDate,
+        blocks,
+        captures,
+        rules,
+        settings,
+        status: settings.autoWriteToCalendar ? "confirmed" : "auto-scheduled",
+      });
+
+      let finalBlocks = placement.updatedBlocks;
+      let createdBlock = placement.createdBlock;
+
+      if (createdBlock && settings.autoWriteToCalendar) {
+        const syncedBlock = await pushBlockToExternalCalendar(createdBlock);
+        createdBlock = syncedBlock;
+        finalBlocks = finalBlocks.map((b) =>
+          b.id === syncedBlock.id ? syncedBlock : b
+        );
+      }
+
+      const newCap: ScreenshotCapture = {
+        id: `cap-${Date.now()}`,
+        timestampIso: new Date().toISOString(),
+        device,
+        appName,
+        windowTitle,
+        summaryText: analysis.signal.summary,
+        imageDataUrl,
+        modelUsed: analysis.modelUsed,
+        inferenceMs: analysis.latencyMs,
+        syncState: !analysis.signal.hasActionableItem
+          ? "no-action"
+          : placement.deduplicated
+            ? "deduplicated"
+            : "scheduled",
+        extractedSignal: analysis.signal,
+        createdBlockId: createdBlock?.id,
+      };
+
+      setBlocks(finalBlocks);
+      setCaptures((prev) => [newCap, ...prev]);
+
+      if (createdBlock) {
+        showToast(
+          `Scheduled "${createdBlock.title}" on ${createdBlock.dateKey} at ${formatMinutesToTime(
+            createdBlock.startMinutes
+          )}`
+        );
+      }
+    },
+    [
+      appendLog,
+      blocks,
+      captures,
+      pushBlockToExternalCalendar,
+      rules,
+      settings,
+      showToast,
+      todayKey,
+    ]
   );
 
   const {
@@ -251,198 +635,62 @@ export function DayframeApp() {
     grabFrameNow,
     clearCaptureError,
   } = useScreenCapture({
+    mode: settings.captureEngine,
+    macPairingToken,
+    macBridgeReady: macBridgeState.paired,
     intervalMinutes: settings.intervalMinutes,
     skipDuplicateFrames: settings.skipDuplicateFrames,
     isPaused: isCapturePaused,
-    onFrameCaptured: handleLiveFrameCaptured,
+    onFrameCaptured: (frame) =>
+      void processCapturedImage({ ...frame, device: "macbook" }),
   });
 
-  const handleUpdateSettings = (patch: Partial<CaptureSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      if (patch.minGapBetweenBlocksMinutes !== undefined) {
-        setBlocks((b) => reconcilePrepBlocks(b, rules, next));
-      }
-      return next;
-    });
-  };
-
-  // Simulate next realistic Mail / Slack screenshot capture
-  const handleSimulateNextMacCapture = () => {
-    setIsProcessingCapture(true);
-    const template =
-      SIMULATED_INCOMING_MAC_CAPTURES[
-        simCursor % SIMULATED_INCOMING_MAC_CAPTURES.length
-      ];
-    setSimCursor((c) => c + 1);
-
-    setTimeout(() => {
-      const newCap: ScreenshotCapture = {
-        id: `cap-sim-${Date.now()}`,
-        timestampIso: new Date().toISOString(),
-        source: template.source,
-        device: "macbook",
-        appName: template.appName,
-        windowTitle: template.windowTitle,
-        ocrPreview: template.ocrPreview,
-        imageDataUrl: template.imageDataUrl,
-        syncState: "scheduled",
-      };
-
-      const res = scheduleSignalIntoCalendar({
-        capture: newCap,
-        signal: template.signal,
-        currentBlocks: blocks,
-        existingCaptures: captures,
-        rules,
-        settings,
-      });
-
-      setBlocks(res.updatedBlocks);
-      setCaptures((prev) => [res.updatedCapture, ...prev]);
-      setIsProcessingCapture(false);
-
-      if (res.updatedCapture.syncState === "deduplicated") {
-        showToast(
-          `Skipped duplicate "${template.signal.title}" (already on your calendar)`
-        );
-      } else if (res.createdBlock) {
-        if (res.createdBlock.dayOffset === 1 && viewMode === "today") {
-          setViewMode("split");
-        }
-        showToast(
-          `${
-            res.createdBlock.isSoloHold ? "Solo invite" : "Time-block"
-          } added: "${res.createdBlock.title}" (${
-            res.createdBlock.dayOffset === 0 ? "Today" : "Tomorrow"
-          } ${formatMinutesToTime(res.createdBlock.startMinutes)})`
-        );
-      }
-    }, 320);
-  };
-
-  // Upload or paste a real PNG/JPEG screenshot
-  const handleUploadScreenshotFile = async (file: File, noteHint?: string) => {
-    setIsProcessingCapture(true);
+  const handleUploadMacScreenshot = (file: File) => {
     const reader = new FileReader();
-    reader.onload = async () => {
+    reader.onload = () => {
       const dataUrl = String(reader.result ?? "");
-      const { signal } = await analyzeScreenshotWithLocalOllama({
+      void processCapturedImage({
         imageDataUrl: dataUrl,
-        model: settings.ollamaModel,
-        rules,
-        hintText: noteHint || file.name.replace(/\.[^.]+$/, ""),
-        device: "macbook",
-      });
-
-      const newCap: ScreenshotCapture = {
-        id: `cap-upload-${Date.now()}`,
-        timestampIso: new Date().toISOString(),
-        source: "uploaded",
-        device: "macbook",
         appName: "Uploaded Screenshot",
         windowTitle: file.name,
-        ocrPreview: noteHint || signal.summary,
-        imageDataUrl: dataUrl,
-        syncState: "scheduled",
-      };
-
-      const res = scheduleSignalIntoCalendar({
-        capture: newCap,
-        signal,
-        currentBlocks: blocks,
-        existingCaptures: captures,
-        rules,
-        settings,
+        device: "macbook",
       });
-
-      setBlocks(res.updatedBlocks);
-      setCaptures((prev) => [res.updatedCapture, ...prev]);
-      setIsProcessingCapture(false);
-      if (res.createdBlock) {
-        showToast(
-          `Extracted "${res.createdBlock.title}" → ${
-            res.createdBlock.dayOffset === 0 ? "Today" : "Tomorrow"
-          } ${formatMinutesToTime(res.createdBlock.startMinutes)}`
-        );
-      }
     };
     reader.readAsDataURL(file);
   };
 
-  // Quick Mail / Slack snippet extractor
-  const handleQuickTextSimulate = (
-    source: "mac-mail" | "mac-slack",
-    text: string
-  ) => {
-    const signal = extractHeuristicSignalFromText(text, "macbook");
-    const svgUrl = renderMacScreenshotSvg({
-      app: source === "mac-mail" ? "mail" : "slack",
-      headerTitle:
-        source === "mac-mail" ? "Apple Mail — Captured Thread" : "Slack — Captured Thread",
-      sender: source === "mac-mail" ? "Captured Email" : "Captured Slack Message",
-      senderMeta: "Just now • Local Extractor",
-      line1: text.slice(0, 62),
-      line2: text.length > 62 ? text.slice(62, 124) : "",
-      highlightPill: signal.isSoloInvite
-        ? `Solo Calendar Invite (${signal.estimatedMinutes}m)`
-        : `Time-Block (${signal.estimatedMinutes}m)`,
-    });
+  // Calendar Block Actions
+  const handleConfirmAndSyncBlock = async (id: string) => {
+    const target = blocks.find((b) => b.id === id);
+    if (!target) return;
+    const synced = await pushBlockToExternalCalendar(target);
+    setBlocks((prev) => prev.map((b) => (b.id === id ? synced : b)));
+    showToast(
+      synced.syncedToExternalCalendar
+        ? `Written "${synced.title}" to your Calendar`
+        : `Confirmed "${synced.title}"`
+    );
+  };
 
-    const newCap: ScreenshotCapture = {
-      id: `cap-text-${Date.now()}`,
-      timestampIso: new Date().toISOString(),
-      source,
-      device: "macbook",
-      appName: source === "mac-mail" ? "Apple Mail" : "Slack",
-      windowTitle: signal.title,
-      ocrPreview: text,
-      imageDataUrl: svgUrl,
-      syncState: "scheduled",
-    };
-
-    const res = scheduleSignalIntoCalendar({
-      capture: newCap,
-      signal,
-      currentBlocks: blocks,
-      existingCaptures: captures,
-      rules,
-      settings,
-    });
-
-    setBlocks(res.updatedBlocks);
-    setCaptures((prev) => [res.updatedCapture, ...prev]);
-    if (res.createdBlock) {
-      showToast(
-        `Added "${res.createdBlock.title}" (${
-          res.createdBlock.dayOffset === 0 ? "Today" : "Tomorrow"
-        } ${formatMinutesToTime(res.createdBlock.startMinutes)})`
-      );
+  const handleConfirmAndSyncAllAutoBlocks = async () => {
+    const updated: CalendarBlock[] = [];
+    let count = 0;
+    for (const b of blocks) {
+      if (b.status !== "confirmed") {
+        count++;
+        updated.push(await pushBlockToExternalCalendar(b));
+      } else {
+        updated.push(b);
+      }
     }
-  };
-
-  // Calendar Block Feedback Actions
-  const handleConfirmBlock = (id: string) => {
-    setBlocks((prev) =>
-      prev.map((b) => (b.id === id ? { ...b, status: "confirmed" } : b))
-    );
-    showToast("Confirmed slot on your calendar");
-  };
-
-  const handleConfirmAllAutoBlocks = () => {
-    const count = blocks.filter((b) => b.status === "auto-scheduled").length;
-    setBlocks((prev) =>
-      prev.map((b) =>
-        b.status === "auto-scheduled" ? { ...b, status: "confirmed" } : b
-      )
-    );
-    showToast(`Locked ${count} auto-scheduled blocks onto your calendar`);
+    setBlocks(updated);
+    showToast(`Approved ${count} block${count === 1 ? "" : "s"}`);
   };
 
   const handleAdjustBlockDuration = (
     id: string,
     deltaMinutes: number,
-    saveCalibrationRule: boolean
+    saveRule: boolean
   ) => {
     const target = blocks.find((b) => b.id === id);
     if (!target) return;
@@ -450,125 +698,83 @@ export function DayframeApp() {
       15,
       Math.min(240, target.durationMinutes + deltaMinutes)
     );
-
     setBlocks((prev) =>
       prev.map((b) =>
-        b.id === id
-          ? {
-              ...b,
-              durationMinutes: nextDuration,
-              rationale: `${b.rationale} (Adjusted to ${formatDuration(
-                nextDuration
-              )} from your feedback.)`,
-            }
-          : b
+        b.id === id ? { ...b, durationMinutes: nextDuration } : b
       )
     );
 
-    if (saveCalibrationRule) {
-      const cleanWords = target.title
+    if (saveRule) {
+      const kw = target.title
         .replace(/^Prep:\s*/i, "")
         .split(/\s+/)
         .filter((w) => w.length > 3)
         .slice(0, 2)
         .join("|");
-
-      if (cleanWords) {
+      if (kw) {
         const calRule: StandingRule = {
           id: `rule-cal-${Date.now()}`,
-          title: `Budget ${formatDuration(nextDuration)} for "${cleanWords.replace(
+          title: `Budget ${formatDuration(nextDuration)} for "${kw.replace(
             "|",
             " "
           )}"`,
-          description: `Learned from your direct block feedback on "${target.title}".`,
+          description: `Calibrated from your adjustment on "${target.title}".`,
           category: "duration-calibration",
           enabled: true,
-          triggerPattern: cleanWords,
+          triggerPattern: kw,
           fixedMinutesOverride: nextDuration,
           createdFromFeedback: true,
         };
         setRules((prev) => [calRule, ...prev]);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `msg-${Date.now()}`,
-            role: "assistant",
-            text: `Updated "${target.title}" to ${formatDuration(
-              nextDuration
-            )} and saved a duration calibration rule so similar tasks get ${formatDuration(
-              nextDuration
-            )} automatically.`,
-            timestampIso: new Date().toISOString(),
-            appliedActionSummary: `Learned duration: ${formatDuration(
-              nextDuration
-            )}`,
-          },
-        ]);
       }
     }
-    showToast(`Updated block to ${formatDuration(nextDuration)}`);
+    showToast(`Resized to ${formatDuration(nextDuration)}`);
   };
 
   const handleMoveBlockToNextSlot = (id: string) => {
     const target = blocks.find((b) => b.id === id);
     if (!target) return;
     const others = blocks.filter((b) => b.id !== id);
-    const laterBlocks = [
-      ...others,
-      {
-        ...target,
-        id: "__cursor_blocker__",
-        startMinutes: settings.workdayStartMinutes,
-        durationMinutes: Math.max(
-          15,
-          target.startMinutes + 15 - settings.workdayStartMinutes
-        ),
-      },
-    ];
-    let nextStart = findOpenSlot({
-      dayOffset: target.dayOffset,
+    const blocker: CalendarBlock = {
+      ...target,
+      id: "__cursor__",
+      startMinutes: settings.workdayStartMinutes,
+      durationMinutes: Math.max(
+        15,
+        target.startMinutes + 15 - settings.workdayStartMinutes
+      ),
+    };
+    const nextSlot = findOpenSlot({
+      dateKey: target.dateKey,
       durationMinutes: target.durationMinutes,
-      blocks: laterBlocks,
+      blocks: [...others, blocker],
       rules,
       settings,
     });
-    let nextDay = target.dayOffset;
-
-    if (nextStart === null) {
-      nextDay = target.dayOffset === 0 ? 1 : 0;
-      nextStart = findOpenSlot({
-        dayOffset: nextDay,
-        durationMinutes: target.durationMinutes,
-        blocks: others,
-        rules,
-        settings,
-      });
-    }
-
-    if (nextStart !== null) {
+    if (nextSlot !== null) {
       setBlocks(
         others
-          .concat({ ...target, dayOffset: nextDay, startMinutes: nextStart })
-          .sort((a, b) => a.dayOffset - b.dayOffset || a.startMinutes - b.startMinutes)
+          .concat({ ...target, startMinutes: nextSlot })
+          .sort(
+            (a, b) =>
+              a.dateKey.localeCompare(b.dateKey) ||
+              a.startMinutes - b.startMinutes
+          )
       );
-      showToast(
-        `Moved to ${nextDay === 0 ? "Today" : "Tomorrow"} ${formatMinutesToTime(
-          nextStart
-        )}`
-      );
+      showToast(`Moved to ${formatMinutesToTime(nextSlot)}`);
     } else {
-      showToast("No other open slot found with that duration");
+      showToast("No later open slot today — try Push +1 Day");
     }
   };
 
-  const handleToggleBlockDay = (id: string) => {
+  const handleShiftBlockDate = (id: string, deltaDays: number) => {
     const target = blocks.find((b) => b.id === id);
     if (!target) return;
-    const destDay = target.dayOffset === 0 ? 1 : 0;
+    const destDate = addDaysToDateKey(target.dateKey, deltaDays);
     const others = blocks.filter((b) => b.id !== id);
     const slot =
       findOpenSlot({
-        dayOffset: destDay,
+        dateKey: destDate,
         durationMinutes: target.durationMinutes,
         blocks: others,
         rules,
@@ -577,366 +783,415 @@ export function DayframeApp() {
 
     setBlocks(
       others
-        .concat({ ...target, dayOffset: destDay, startMinutes: slot })
-        .sort((a, b) => a.dayOffset - b.dayOffset || a.startMinutes - b.startMinutes)
+        .concat({ ...target, dateKey: destDate, startMinutes: slot })
+        .sort(
+          (a, b) =>
+            a.dateKey.localeCompare(b.dateKey) ||
+            a.startMinutes - b.startMinutes
+        )
     );
-    setViewMode("split");
-    showToast(
-      `Moved "${target.title}" to ${
-        destDay === 0 ? "Today" : "Tomorrow"
-      } at ${formatMinutesToTime(slot)}`
-    );
+    showToast(`Moved to ${destDate} at ${formatMinutesToTime(slot)}`);
   };
 
   const handleDeleteBlock = (id: string) => {
     setBlocks((prev) =>
       prev.filter((b) => b.id !== id && b.linkedMeetingId !== id)
     );
-    showToast("Removed block from schedule");
   };
 
-  // Conversational Feedback & Standing Rules
+  // Feedback & Rules Handlers
   const handleSendFeedback = (text: string) => {
-    const userMsg: DiscussionMessage = {
-      id: `msg-u-${Date.now()}`,
-      role: "user",
-      text,
-      timestampIso: new Date().toISOString(),
-    };
-
-    const result = applyNaturalLanguageFeedback({
-      text,
-      blocks,
-      rules,
-      settings,
-    });
-
-    const assistantMsg: DiscussionMessage = {
-      id: `msg-a-${Date.now() + 1}`,
-      role: "assistant",
-      text: result.assistantReply,
-      timestampIso: new Date().toISOString(),
-      appliedActionSummary: result.actionSummary,
-    };
-
-    setBlocks(result.blocks);
-    setRules(result.rules);
-    setSettings(result.settings);
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
-    showToast(result.actionSummary);
-  };
-
-  const handleAcceptSuggestion = (promptId: string) => {
-    const prompt = suggestedPrompts.find((p) => p.id === promptId);
-    if (!prompt) return;
-
-    const newRule: StandingRule = {
-      ...prompt.ruleToCreate,
-      id: `rule-sug-${Date.now()}`,
-      createdFromFeedback: true,
-    };
-    const nextRules = [newRule, ...rules];
-    const nextBlocks = reconcilePrepBlocks(blocks, nextRules, settings);
-
-    setRules(nextRules);
-    setBlocks(nextBlocks);
-    setSuggestedPrompts((prev) =>
-      prev.map((p) => (p.id === promptId ? { ...p, answered: "accepted" } : p))
-    );
+    const res = applyUserRuleFeedback({ text, blocks, rules, settings });
+    setBlocks(res.blocks);
+    setRules(res.rules);
+    setSettings(res.settings);
     setMessages((prev) => [
       ...prev,
       {
-        id: `msg-sug-${Date.now()}`,
-        role: "assistant",
-        text: `Enabled "${newRule.title}" and re-checked your calendar so matching meetings and focus slots follow this rule automatically.`,
+        id: `u-${Date.now()}`,
+        role: "user",
+        text,
         timestampIso: new Date().toISOString(),
-        appliedActionSummary: `Added rule: ${newRule.title}`,
+      },
+      {
+        id: `a-${Date.now() + 1}`,
+        role: "assistant",
+        text: res.assistantReply,
+        timestampIso: new Date().toISOString(),
+        appliedActionSummary: res.actionSummary,
       },
     ]);
-    showToast(`Enabled rule: ${newRule.title}`);
+    appendLog({
+      stage: "feedback",
+      title: "Applied user feedback rule",
+      detail: res.actionSummary,
+    });
+    showToast(res.actionSummary);
   };
 
-  const handleDismissSuggestion = (promptId: string) => {
-    setSuggestedPrompts((prev) =>
-      prev.map((p) =>
-        p.id === promptId ? { ...p, answered: "dismissed" } : p
-      )
-    );
-  };
-
-  const handleToggleRule = (ruleId: string, enabled: boolean) => {
+  const handleUpdateRecurringPrepRule = (
+    prepMinutes: number,
+    leadHours: number
+  ) => {
+    const leadMins = Math.round(leadHours * 60);
     const nextRules = rules.map((r) =>
-      r.id === ruleId ? { ...r, enabled } : r
+      r.category === "prep-time" && r.appliesToRecurring
+        ? {
+            ...r,
+            prepDurationMinutes: prepMinutes,
+            minLeadMinutesBeforeMeeting: leadMins,
+            title: `≥${formatDuration(leadMins)} runway before recurring meetings`,
+            description: `Reserve ${formatDuration(
+              prepMinutes
+            )} finishing at least ${formatDuration(
+              leadMins
+            )} before recurring meetings.`,
+          }
+        : r
     );
     setRules(nextRules);
-    setBlocks(reconcilePrepBlocks(blocks, nextRules, settings));
+    setBlocks((prev) => reconcilePrepBlocks(prev, nextRules, settings, todayKey));
   };
 
-  const handleDeleteRule = (ruleId: string) => {
-    const nextRules = rules.filter((r) => r.id !== ruleId);
-    setRules(nextRules);
-    setBlocks(reconcilePrepBlocks(blocks, nextRules, settings));
-  };
+  // Android Folder Sync & Nightly Batch Processing
+  const handleRefreshMacAndroidFolder = async () => {
+    if (!macBridgeState.paired || !macPairingToken) return;
+    const res = await fetchMacAndroidFolderQueue(macPairingToken);
+    if (!res.ok) return;
 
-  const handleAddManualPrepRule = (opts: {
-    keyword: string;
-    prepMinutes: number;
-    leadHours: number;
-  }) => {
-    const leadMins = Math.round(opts.leadHours * 60);
-    const newRule: StandingRule = {
-      id: `rule-manual-${Date.now()}`,
-      title: `${formatDuration(opts.prepMinutes)} prep (≥${formatDuration(
-        leadMins
-      )} ahead) for "${opts.keyword}"`,
-      description: `Reserve ${formatDuration(
-        opts.prepMinutes
-      )} finishing at least ${formatDuration(
-        leadMins
-      )} before meetings matching "${opts.keyword}".`,
-      category: "prep-time",
-      enabled: true,
-      triggerPattern: opts.keyword,
-      prepDurationMinutes: opts.prepMinutes,
-      minLeadMinutesBeforeMeeting: leadMins,
-      createdFromFeedback: true,
-    };
-    const nextRules = [newRule, ...rules];
-    setRules(nextRules);
-    setBlocks(reconcilePrepBlocks(blocks, nextRules, settings));
-    showToast(`Saved prep rule for "${opts.keyword}"`);
-  };
+    const existingTitles = new Set(
+      captures.filter((c) => c.device === "android").map((c) => c.windowTitle)
+    );
+    const incoming: ScreenshotCapture[] = res.screenshots
+      .filter((s) => !existingTitles.has(s.filename))
+      .map((s) => ({
+        id: `cap-and-${Date.now()}-${s.filename}`,
+        timestampIso: s.capturedAtIso,
+        device: "android",
+        appName: "Android Synced Folder",
+        windowTitle: s.filename,
+        summaryText: "Queued raw phone screenshot for nightly Gemma 4 batch run.",
+        imageDataUrl: s.imageDataUrl,
+        modelUsed: settings.gemmaModel,
+        syncState: "queued-for-tonight",
+      }));
 
-  // Nightly Android Batch Sync & Cross-Device Deduplication
-  const handleRunNightlyBatchNow = () => {
-    setIsRunningNightlyBatch(true);
-    setTimeout(() => {
-      let workingBlocks = [...blocks];
-      const processedCaptures = captures.filter(
-        (c) => c.syncState !== "queued-for-tonight"
-      );
-      const nextCaptures: ScreenshotCapture[] = [];
-
-      let scheduledNew = 0;
-      let dedupedCount = 0;
-
-      for (const cap of captures) {
-        if (cap.device === "android" && cap.syncState === "queued-for-tonight") {
-          const signal =
-            cap.extractedSignal ??
-            extractHeuristicSignalFromText(cap.ocrPreview, "android");
-          const res = scheduleSignalIntoCalendar({
-            capture: cap,
-            signal,
-            currentBlocks: workingBlocks,
-            existingCaptures: [...processedCaptures, ...nextCaptures],
-            rules,
-            settings,
-            defaultTargetDayOffset: 1,
-          });
-          workingBlocks = res.updatedBlocks;
-          nextCaptures.push(res.updatedCapture);
-          if (res.updatedCapture.syncState === "deduplicated") {
-            dedupedCount++;
-          } else if (res.createdBlock) {
-            scheduledNew++;
-          }
-        } else {
-          nextCaptures.push(cap);
-        }
-      }
-
-      setBlocks(workingBlocks);
-      setCaptures(nextCaptures);
-      setIsRunningNightlyBatch(false);
-      setViewMode("split");
-
-      const summary = `Added ${scheduledNew} new block${
-        scheduledNew === 1 ? "" : "s"
-      } onto Tomorrow's calendar and skipped ${dedupedCount} duplicate phone screenshot${
-        dedupedCount === 1 ? "" : "s"
-      } already captured on your MacBook.`;
-      setLastBatchSummary(summary);
-      showToast(summary);
-    }, 550);
+    if (incoming.length > 0) {
+      setCaptures((prev) => [...incoming, ...prev]);
+      showToast(`Loaded ${incoming.length} new screenshot(s) from Android folder`);
+    } else {
+      showToast("No new unqueued files in ~/Pictures/Dayframe-Android");
+    }
   };
 
   const handleUploadAndroidScreenshot = (file: File) => {
     const reader = new FileReader();
     reader.onload = () => {
-      const dataUrl = String(reader.result ?? "");
-      const baseName = file.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ");
-      const signal = extractHeuristicSignalFromText(baseName, "android");
-
-      const queuedShot: ScreenshotCapture = {
-        id: `cap-android-up-${Date.now()}`,
+      const queued: ScreenshotCapture = {
+        id: `cap-and-up-${Date.now()}`,
         timestampIso: new Date().toISOString(),
-        source: "android-queue",
         device: "android",
-        appName: "Android Companion Upload",
+        appName: "Android Companion",
         windowTitle: file.name,
-        ocrPreview: `Queued mobile screenshot: "${baseName}"`,
-        imageDataUrl: dataUrl,
+        summaryText: "Queued raw phone screenshot (waiting for Mac Gemma 4 batch).",
+        imageDataUrl: String(reader.result ?? ""),
+        modelUsed: settings.gemmaModel,
         syncState: "queued-for-tonight",
-        extractedSignal: signal,
       };
-      setCaptures((prev) => [queuedShot, ...prev]);
-      showToast("Added raw phone screenshot to tonight's Mac sync queue");
+      setCaptures((prev) => [queued, ...prev]);
+      showToast("Queued phone screenshot for nightly batch run");
     };
     reader.readAsDataURL(file);
   };
 
-  // .ics Calendar Export & Import
-  const handleExportAllIcs = () => {
-    const ics = buildIcsForBlocks(blocks);
-    triggerIcsDownload("dayframe-schedule.ics", ics);
-    showToast("Downloaded dayframe-schedule.ics — open in Apple Calendar");
-  };
+  const handleRunNightlyBatchNow = async () => {
+    setIsRunningNightlyBatch(true);
+    const queued = captures.filter(
+      (c) => c.device === "android" && c.syncState === "queued-for-tonight"
+    );
 
-  const handleDownloadSingleIcs = (block: CalendarBlock) => {
-    const ics = buildIcsForBlocks([block]);
-    const slug = block.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .slice(0, 32);
-    triggerIcsDownload(`${slug || "solo-invite"}.ics`, ics);
-    showToast(`Downloaded solo invite .ics for "${block.title}"`);
-  };
+    let workingBlocks = [...blocks];
+    let added = 0;
+    let deduped = 0;
+    const updatedMap = new Map<string, ScreenshotCapture>();
 
-  const handleImportIcsFile = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const raw = String(reader.result ?? "");
-      const imported = parseImportedIcs(raw);
-      if (imported.length === 0) {
-        showToast(
-          "No Today/Tomorrow events found in .ics file — kept current calendar"
-        );
-        return;
-      }
-      const nonSample = blocks.filter((b) => !b.isSample);
-      const merged = reconcilePrepBlocks(
-        [...nonSample, ...imported],
+    for (const cap of queued) {
+      const analysis = await analyzeScreenshotWithGemma4({
+        imageDataUrl: cap.imageDataUrl,
+        model: settings.gemmaModel,
+        appName: cap.appName,
+        windowTitle: cap.windowTitle,
+        todayDateKey: todayKey,
         rules,
-        settings
-      );
-      setBlocks(merged);
-      showToast(
-        `Imported ${imported.length} calendar event${
-          imported.length === 1 ? "" : "s"
-        } & auto-attached recurring prep rules`
-      );
-    };
-    reader.readAsText(file);
+        device: "android",
+      });
+
+      if (!analysis.ok || !analysis.signal) {
+        updatedMap.set(cap.id, {
+          ...cap,
+          summaryText:
+            analysis.error || "Local Gemma 4 offline — kept in queue.",
+        });
+        continue;
+      }
+
+      const placement = placeSignalOnCalendar({
+        signal: analysis.signal,
+        sourceLabel: `Android (${cap.windowTitle})`,
+        sourceCaptureId: cap.id,
+        defaultDateKey: addDaysToDateKey(todayKey, 1),
+        blocks: workingBlocks,
+        captures,
+        rules,
+        settings,
+      });
+
+      workingBlocks = placement.updatedBlocks;
+      if (placement.deduplicated) deduped++;
+      if (placement.createdBlock) added++;
+
+      updatedMap.set(cap.id, {
+        ...cap,
+        summaryText: analysis.signal.summary,
+        inferenceMs: analysis.latencyMs,
+        extractedSignal: analysis.signal,
+        createdBlockId: placement.createdBlock?.id,
+        syncState: !analysis.signal.hasActionableItem
+          ? "no-action"
+          : placement.deduplicated
+            ? "deduplicated"
+            : "scheduled",
+      });
+    }
+
+    setBlocks(workingBlocks);
+    setCaptures((prev) => prev.map((c) => updatedMap.get(c.id) ?? c));
+    setIsRunningNightlyBatch(false);
+    const msg = `Processed ${queued.length} phone screenshot(s): ${added} scheduled onto Tomorrow, ${deduped} duplicates skipped.`;
+    setLastBatchSummary(msg);
+    showToast(msg);
   };
 
-  const handleResetSampleWorkspace = () => {
-    localStorage.removeItem(STORAGE_KEY);
-    setSettings(DEFAULT_CAPTURE_SETTINGS);
-    setBlocks(INITIAL_CALENDAR_BLOCKS);
-    setCaptures(INITIAL_CAPTURES);
-    setRules(INITIAL_STANDING_RULES);
-    setMessages(INITIAL_DISCUSSION_MESSAGES);
-    setSuggestedPrompts(INITIAL_SUGGESTED_PROMPTS);
-    setSimCursor(0);
-    setLastBatchSummary(null);
-    showToast("Reset workspace to default sample day");
-  };
+  if (!hydrated) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-muted/20 text-xs text-muted-foreground">
+        Loading Dayframe...
+      </div>
+    );
+  }
+
+  // First-Run Kickstart Setup Phase (Zero fake data!)
+  if (!settings.setupCompleted) {
+    return (
+      <KickstartWizard
+        todayKey={todayKey}
+        settings={settings}
+        onUpdateSettings={(patch) =>
+          setSettings((prev) => ({ ...prev, ...patch }))
+        }
+        rules={rules}
+        onUpdateRecurringPrepRule={handleUpdateRecurringPrepRule}
+        onAddPlainEnglishRule={(text) => handleSendFeedback(text)}
+        gemmaStatus={gemmaStatus}
+        onRecheckGemma={refreshGemmaStatus}
+        macBridgeState={macBridgeState}
+        macPairingToken={macPairingToken}
+        onChangeMacPairingToken={setMacPairingToken}
+        onVerifyMacBridge={verifyAndLoadMacBridge}
+        macCalendars={macCalendars}
+        googleAccessToken={googleAccessToken}
+        onChangeGoogleAccessToken={setGoogleAccessToken}
+        onRunOneOffInitialScan={runBaselineCalendarAndMailScan}
+        scannedBlocks={blocks}
+        scannedEmails={scannedEmails}
+        onAdjustScannedBlockDuration={(id, delta) =>
+          handleAdjustBlockDuration(id, delta, false)
+        }
+        onRemoveScannedBlock={handleDeleteBlock}
+        onFinalizeKickstart={handleFinalizeKickstart}
+      />
+    );
+  }
 
   const androidCaptures = captures.filter((c) => c.device === "android");
   const queuedAndroidCount = androidCaptures.filter(
     (c) => c.syncState === "queued-for-tonight"
   ).length;
-  const hasSampleData = blocks.some((b) => b.isSample);
 
   return (
     <div className="min-h-screen bg-muted/20 text-foreground">
       <TopMenubar
         settings={settings}
-        onUpdateSettings={handleUpdateSettings}
+        onUpdateSettings={(patch) =>
+          setSettings((prev) => ({ ...prev, ...patch }))
+        }
+        gemmaStatus={gemmaStatus}
+        onRecheckGemma={refreshGemmaStatus}
+        macBridgeState={macBridgeState}
         isCapturing={isCapturing}
         isCapturePaused={isCapturePaused}
         onTogglePauseCapture={() => setIsCapturePaused((p) => !p)}
         secondsUntilNext={secondsUntilNext}
         skippedStaticCount={skippedStaticCount}
-        onStartLiveCapture={startCapture}
-        onStopLiveCapture={stopCapture}
-        onSnapNow={() => grabFrameNow(true)}
-        onSimulateNextMacCapture={handleSimulateNextMacCapture}
-        isProcessingCapture={isProcessingCapture}
-        ollamaStatus={ollamaStatus}
-        onRecheckOllama={refreshOllamaStatus}
+        onStartCapture={() => void startCapture()}
+        onStopCapture={stopCapture}
+        onSnapNow={() => void grabFrameNow(true)}
+        isSyncingCalendar={isSyncingCalendar}
+        onRescanCalendarAndMail={() => {
+          void runBaselineCalendarAndMailScan().then((res) => {
+            if (res.ok) {
+              showToast(
+                `Synced ${res.existingCount} calendar events & ${res.emailCount} emails`
+              );
+            } else if (res.error) {
+              showToast(res.error);
+            }
+          });
+        }}
         queuedAndroidCount={queuedAndroidCount}
         onOpenAndroidSync={() => setAndroidSheetOpen(true)}
-        onExportIcs={handleExportAllIcs}
-        onImportIcsFile={handleImportIcsFile}
-        hasSampleData={hasSampleData}
-        onResetSampleWorkspace={handleResetSampleWorkspace}
+        onReopenSetupWizard={() =>
+          setSettings((prev) => ({ ...prev, setupCompleted: false }))
+        }
+        pipelineLogs={pipelineLogs}
       />
 
       <main className="mx-auto grid max-w-[1600px] grid-cols-1 gap-4 p-4 lg:grid-cols-12 lg:p-6">
-        {/* Left Column: MacBook Screenshot Stream (Mail, Slack, Live Frames) */}
         <div className="order-2 lg:order-1 lg:col-span-3">
           <CaptureStreamPanel
             captures={captures}
             captureError={captureError}
             onDismissCaptureError={clearCaptureError}
-            onUploadScreenshotFile={handleUploadScreenshotFile}
-            onQuickTextSimulate={handleQuickTextSimulate}
+            onUploadScreenshotFile={handleUploadMacScreenshot}
             onSelectBlockId={(id) => setSelectedBlockId(id)}
+            gemmaModel={settings.gemmaModel}
           />
         </div>
 
-        {/* Center Column: Time-Blocked Calendar (Today + Tomorrow) */}
         <div className="order-1 lg:order-2 lg:col-span-6">
           <CalendarTimeline
+            todayKey={todayKey}
+            anchorDateKey={anchorDateKey}
+            onChangeAnchorDateKey={setAnchorDateKey}
             blocks={blocks}
             captures={captures}
             rules={rules}
             settings={settings}
-            viewMode={viewMode}
-            onChangeViewMode={setViewMode}
             selectedBlockId={selectedBlockId}
             onSelectBlockId={setSelectedBlockId}
-            onConfirmBlock={handleConfirmBlock}
-            onConfirmAllAutoBlocks={handleConfirmAllAutoBlocks}
+            onConfirmAndSyncBlock={(id) => void handleConfirmAndSyncBlock(id)}
+            onConfirmAndSyncAllAutoBlocks={() =>
+              void handleConfirmAndSyncAllAutoBlocks()
+            }
             onAdjustBlockDuration={handleAdjustBlockDuration}
             onMoveBlockToNextSlot={handleMoveBlockToNextSlot}
-            onToggleBlockDay={handleToggleBlockDay}
+            onShiftBlockDate={handleShiftBlockDate}
             onDeleteBlock={handleDeleteBlock}
-            onDownloadSingleIcs={handleDownloadSingleIcs}
+            onRunCalendarScanNow={() => {
+              void runBaselineCalendarAndMailScan().then((r) => {
+                if (!r.ok && r.error) showToast(r.error);
+              });
+            }}
+            onOpenSetupWizard={() =>
+              setSettings((prev) => ({ ...prev, setupCompleted: false }))
+            }
           />
         </div>
 
-        {/* Right Column: Feedback Discussion, Standing Rules & Proactive Suggestions */}
         <div className="order-3 lg:col-span-3">
           <OrganizerFeedbackPanel
             messages={messages}
             rules={rules}
             suggestedPrompts={suggestedPrompts}
             onSendFeedback={handleSendFeedback}
-            onAcceptSuggestion={handleAcceptSuggestion}
-            onDismissSuggestion={handleDismissSuggestion}
-            onToggleRule={handleToggleRule}
-            onDeleteRule={handleDeleteRule}
-            onAddManualPrepRule={handleAddManualPrepRule}
+            onAcceptSuggestion={(promptId) => {
+              const prompt = suggestedPrompts.find((p) => p.id === promptId);
+              if (!prompt) return;
+              const newRule: StandingRule = {
+                ...prompt.ruleToCreate,
+                id: `rule-sug-${Date.now()}`,
+                createdFromFeedback: true,
+              };
+              const nextRules = [newRule, ...rules];
+              setRules(nextRules);
+              setBlocks((prev) =>
+                reconcilePrepBlocks(prev, nextRules, settings, todayKey)
+              );
+              setSuggestedPrompts((prev) =>
+                prev.map((p) =>
+                  p.id === promptId ? { ...p, answered: "accepted" } : p
+                )
+              );
+              showToast(`Enabled rule: ${newRule.title}`);
+            }}
+            onDismissSuggestion={(promptId) =>
+              setSuggestedPrompts((prev) =>
+                prev.map((p) =>
+                  p.id === promptId ? { ...p, answered: "dismissed" } : p
+                )
+              )
+            }
+            onToggleRule={(ruleId, enabled) => {
+              const nextRules = rules.map((r) =>
+                r.id === ruleId ? { ...r, enabled } : r
+              );
+              setRules(nextRules);
+              setBlocks((prev) =>
+                reconcilePrepBlocks(prev, nextRules, settings, todayKey)
+              );
+            }}
+            onDeleteRule={(ruleId) => {
+              const nextRules = rules.filter((r) => r.id !== ruleId);
+              setRules(nextRules);
+              setBlocks((prev) =>
+                reconcilePrepBlocks(prev, nextRules, settings, todayKey)
+              );
+            }}
+            onAddManualPrepRule={(opts) => {
+              const leadMins = Math.round(opts.leadHours * 60);
+              const newRule: StandingRule = {
+                id: `rule-man-${Date.now()}`,
+                title: `${formatDuration(opts.prepMinutes)} prep (≥${formatDuration(
+                  leadMins
+                )} ahead) for "${opts.keyword}"`,
+                description: `Reserve ${formatDuration(
+                  opts.prepMinutes
+                )} finishing ≥${formatDuration(leadMins)} before "${opts.keyword}".`,
+                category: "prep-time",
+                enabled: true,
+                triggerPattern: opts.keyword,
+                prepDurationMinutes: opts.prepMinutes,
+                minLeadMinutesBeforeMeeting: leadMins,
+                createdFromFeedback: true,
+              };
+              const nextRules = [newRule, ...rules];
+              setRules(nextRules);
+              setBlocks((prev) =>
+                reconcilePrepBlocks(prev, nextRules, settings, todayKey)
+              );
+              showToast(`Added prep rule for "${opts.keyword}"`);
+            }}
           />
         </div>
       </main>
 
-      {/* Secondary Android Nightly Batch Sync Drawer */}
       <NightlyAndroidSheet
         open={androidSheetOpen}
         onOpenChange={setAndroidSheetOpen}
         androidCaptures={androidCaptures}
+        androidFolderPath={
+          macBridgeState.androidSyncFolder || "~/Pictures/Dayframe-Android"
+        }
+        macBridgePaired={macBridgeState.paired}
         nightlySyncHour={settings.nightlyAndroidSyncHour}
+        gemmaModel={settings.gemmaModel}
         isRunningBatch={isRunningNightlyBatch}
         lastBatchSummary={lastBatchSummary}
-        onRunNightlyBatchNow={handleRunNightlyBatchNow}
+        onRefreshMacAndroidFolder={() => void handleRefreshMacAndroidFolder()}
+        onRunNightlyBatchNow={() => void handleRunNightlyBatchNow()}
         onUploadAndroidScreenshot={handleUploadAndroidScreenshot}
       />
 
-      {/* Non-intrusive Action Feedback Toast */}
       {toastBanner && (
         <div className="fixed right-5 bottom-5 z-40 max-w-sm rounded-xl border bg-foreground px-4 py-2.5 text-xs font-medium text-background shadow-lg">
           {toastBanner}

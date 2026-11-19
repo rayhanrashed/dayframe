@@ -1,0 +1,88 @@
+ObjC.import("Foundation");
+ObjC.import("EventKit");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const store = $.EKEventStore.alloc.init;
+
+  let granted = false;
+  let done = false;
+
+  if (store.respondsToSelector("requestFullAccessToEventsWithCompletion:")) {
+    store.requestFullAccessToEventsWithCompletion((ok, _err) => {
+      granted = Boolean(ok);
+      done = true;
+    });
+  } else {
+    store.requestAccessToEntityTypeCompletion(0, (ok, _err) => {
+      granted = Boolean(ok);
+      done = true;
+    });
+  }
+
+  const startWait = Date.now();
+  while (!done && Date.now() - startWait < 15000) {
+    $.NSRunLoop.currentRunLoop.runUntilDate(
+      $.NSDate.dateWithTimeIntervalSinceNow(0.05)
+    );
+  }
+
+  if (!granted) {
+    return JSON.stringify({
+      ok: false,
+      error: "Calendar write permission not granted in macOS System Settings.",
+    });
+  }
+
+  let targetCal = store.defaultCalendarForNewEvents;
+  if (input.calendarId) {
+    const customCal = store.calendarWithIdentifier(input.calendarId);
+    if (customCal && customCal.allowsContentModifications) {
+      targetCal = customCal;
+    }
+  }
+
+  if (!targetCal) {
+    return JSON.stringify({
+      ok: false,
+      error: "No writable calendar found in macOS Calendar.app.",
+    });
+  }
+
+  const ev = $.EKEvent.eventWithEventStore(store);
+  ev.title = String(input.title || "Scheduled Block");
+  ev.startDate = $.NSDate.dateWithTimeIntervalSince1970(
+    Number(input.startMs) / 1000
+  );
+  ev.endDate = $.NSDate.dateWithTimeIntervalSince1970(
+    Number(input.endMs) / 1000
+  );
+  if (input.notes) {
+    ev.notes = String(input.notes);
+  }
+  if (input.location) {
+    ev.location = String(input.location);
+  }
+  ev.calendar = targetCal;
+
+  const errRef = Ref();
+  const saved = store.saveEventSpanCommitError(ev, 0, true, errRef);
+  if (!saved) {
+    return JSON.stringify({
+      ok: false,
+      error: "Failed to save event to macOS Calendar.",
+    });
+  }
+
+  return JSON.stringify({
+    ok: true,
+    externalEventId: ev.eventIdentifier ? ev.eventIdentifier.js : "",
+    calendarTitle: targetCal.title.js,
+  });
+}

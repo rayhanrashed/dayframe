@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef, useState } from "react";
+import React, { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -19,132 +19,120 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { CaptureSettings } from "@/lib/types";
-import { LocalOllamaStatus } from "@/lib/ollama-vlm";
 import {
+  GEMMA4_MODEL_CATALOG,
+  LocalGemmaStatus,
+} from "@/lib/gemma-client";
+import { MacBridgeConnectionState } from "@/lib/calendar-connectors";
+import { OrganizerSettings, PipelineLogEntry } from "@/lib/types";
+import {
+  Activity,
   Camera,
-  CheckCircle2,
   Cpu,
-  Download,
-  Moon,
+  Laptop,
+  Loader2,
   Pause,
   Play,
   RefreshCw,
-  RotateCcw,
+  Settings2,
   SlidersHorizontal,
   Smartphone,
-  Sparkles,
   Square,
-  Upload,
 } from "lucide-react";
 
 interface TopMenubarProps {
-  settings: CaptureSettings;
-  onUpdateSettings: (patch: Partial<CaptureSettings>) => void;
+  settings: OrganizerSettings;
+  onUpdateSettings: (patch: Partial<OrganizerSettings>) => void;
+  gemmaStatus: LocalGemmaStatus;
+  onRecheckGemma: () => Promise<void>;
+  macBridgeState: MacBridgeConnectionState;
   isCapturing: boolean;
   isCapturePaused: boolean;
   onTogglePauseCapture: () => void;
   secondsUntilNext: number;
   skippedStaticCount: number;
-  onStartLiveCapture: () => void;
-  onStopLiveCapture: () => void;
+  onStartCapture: () => void;
+  onStopCapture: () => void;
   onSnapNow: () => void;
-  onSimulateNextMacCapture: () => void;
-  isProcessingCapture: boolean;
-  ollamaStatus: LocalOllamaStatus;
-  onRecheckOllama: () => void;
+  isSyncingCalendar: boolean;
+  onRescanCalendarAndMail: () => void;
   queuedAndroidCount: number;
   onOpenAndroidSync: () => void;
-  onExportIcs: () => void;
-  onImportIcsFile: (file: File) => void;
-  hasSampleData: boolean;
-  onResetSampleWorkspace: () => void;
+  onReopenSetupWizard: () => void;
+  pipelineLogs: PipelineLogEntry[];
 }
 
-function formatCountdown(totalSeconds: number): string {
-  const m = Math.floor(totalSeconds / 60);
-  const s = totalSeconds % 60;
+function formatCountdown(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 export function TopMenubar({
   settings,
   onUpdateSettings,
+  gemmaStatus,
+  onRecheckGemma,
+  macBridgeState,
   isCapturing,
   isCapturePaused,
   onTogglePauseCapture,
   secondsUntilNext,
   skippedStaticCount,
-  onStartLiveCapture,
-  onStopLiveCapture,
+  onStartCapture,
+  onStopCapture,
   onSnapNow,
-  onSimulateNextMacCapture,
-  isProcessingCapture,
-  ollamaStatus,
-  onRecheckOllama,
+  isSyncingCalendar,
+  onRescanCalendarAndMail,
   queuedAndroidCount,
   onOpenAndroidSync,
-  onExportIcs,
-  onImportIcsFile,
-  hasSampleData,
-  onResetSampleWorkspace,
+  onReopenSetupWizard,
+  pipelineLogs,
 }: TopMenubarProps) {
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [ollamaDialogOpen, setOllamaDialogOpen] = useState(false);
-  const icsInputRef = useRef<HTMLInputElement | null>(null);
+  const [cadenceDialogOpen, setCadenceDialogOpen] = useState(false);
+  const [telemetryOpen, setTelemetryOpen] = useState(false);
 
-  const presetIntervals = [
-    { value: "1", label: "Every 1 min" },
-    { value: "3", label: "Every 3 min" },
-    { value: "5", label: "Every 5 min" },
-    { value: "10", label: "Every 10 min" },
-    { value: "15", label: "Every 15 min" },
-  ];
-
-  const currentSelectValue = presetIntervals.some(
-    (p) => Number(p.value) === settings.intervalMinutes
-  )
+  const presets = ["1", "3", "5", "10", "15"];
+  const selectVal = presets.includes(String(settings.intervalMinutes))
     ? String(settings.intervalMinutes)
     : "custom";
+
+  const calendarConnected =
+    macBridgeState.paired || settings.calendarSource === "google-api";
 
   return (
     <header className="sticky top-0 z-30 border-b border-border/80 bg-background/90 backdrop-blur-md">
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center justify-between gap-3 px-4 py-2.5 lg:px-6">
-        {/* Left: MacBook App Identity & Sample Data Status */}
+        {/* Left: App Title & Connection Truth */}
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2.5">
-            <div className="flex size-8 items-center justify-center rounded-xl bg-foreground text-background shadow-xs">
-              <Camera className="size-4" />
+          <div className="flex size-8 items-center justify-center rounded-xl bg-foreground text-background">
+            <Camera className="size-4" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold tracking-tight">
+                Dayframe
+              </span>
+              <Badge
+                variant={calendarConnected ? "secondary" : "outline"}
+                className="gap-1 text-[10px]"
+              >
+                <Laptop className="size-3" />
+                {macBridgeState.paired
+                  ? `macOS Calendar (${settings.writableCalendarTitle})`
+                  : settings.calendarSource === "google-api"
+                    ? "Google Calendar API"
+                    : "Calendar Not Connected"}
+              </Badge>
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold tracking-tight">
-                  Dayframe
-                </span>
-                <Badge
-                  variant="secondary"
-                  className="hidden text-[10px] font-medium sm:inline-flex"
-                >
-                  macOS Local-AI Organizer
-                </Badge>
-                {hasSampleData && (
-                  <Badge
-                    variant="outline"
-                    className="border-amber-500/40 bg-amber-500/10 text-[10px] font-medium text-amber-700 dark:text-amber-300"
-                  >
-                    Sample Day Loaded
-                  </Badge>
-                )}
-              </div>
-              <p className="hidden text-[11px] text-muted-foreground xl:block">
-                Screenshots Mail &amp; Slack → time-blocks your calendar by availability &amp; prep rules
-              </p>
-            </div>
+            <p className="hidden text-[11px] text-muted-foreground xl:block">
+              Local {settings.gemmaModel} organizer • Seamless Calendar, Mail &amp; periodic screenshots
+            </p>
           </div>
         </div>
 
-        {/* Center: Screenshot Cadence & Live Capture Controls */}
-        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border/80 bg-muted/40 p-1.5">
+        {/* Center: Capture Loop Controls */}
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/40 p-1.5">
           {isCapturing ? (
             <div className="flex items-center gap-2 px-2">
               <span
@@ -161,39 +149,34 @@ export function TopMenubar({
               </span>
               {skippedStaticCount > 0 && (
                 <span className="hidden text-[11px] text-muted-foreground md:inline">
-                  ({skippedStaticCount} static skipped)
+                  ({skippedStaticCount} unchanged skipped)
                 </span>
               )}
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 pl-1.5">
-              <span className="size-2 rounded-full bg-muted-foreground/40" />
-              <span className="text-xs text-muted-foreground">Cadence:</span>
-            </div>
+            <span className="pl-2 text-xs text-muted-foreground">
+              Capture:
+            </span>
           )}
 
           <Select
-            value={currentSelectValue}
+            value={selectVal}
             onValueChange={(val) => {
               if (!val) return;
-              if (val === "custom") {
-                setSettingsOpen(true);
-              } else {
-                onUpdateSettings({ intervalMinutes: Number(val) });
-              }
+              if (val === "custom") setCadenceDialogOpen(true);
+              else onUpdateSettings({ intervalMinutes: Number(val) });
             }}
           >
-            <SelectTrigger size="sm" className="h-7 min-w-[118px] bg-background text-xs">
-              <SelectValue>
-                {currentSelectValue === "custom"
-                  ? `Every ${settings.intervalMinutes}m`
-                  : `Every ${settings.intervalMinutes} min`}
-              </SelectValue>
+            <SelectTrigger
+              size="sm"
+              className="h-7 min-w-[116px] bg-background text-xs"
+            >
+              <SelectValue>Every {settings.intervalMinutes} min</SelectValue>
             </SelectTrigger>
             <SelectContent>
-              {presetIntervals.map((item) => (
-                <SelectItem key={item.value} value={item.value}>
-                  {item.label}
+              {presets.map((p) => (
+                <SelectItem key={p} value={p}>
+                  Every {p} min
                 </SelectItem>
               ))}
               <SelectItem value="custom">Custom interval...</SelectItem>
@@ -203,32 +186,29 @@ export function TopMenubar({
           <Button
             variant="ghost"
             size="icon-sm"
-            onClick={() => setSettingsOpen(true)}
-            title="Customize screenshot cadence & workday hours"
+            onClick={() => setCadenceDialogOpen(true)}
+            title="Capture & workday preferences"
           >
             <SlidersHorizontal className="size-3.5" />
           </Button>
 
           {!isCapturing ? (
-            <Button size="sm" onClick={onStartLiveCapture} className="gap-1.5">
+            <Button size="sm" onClick={onStartCapture} className="gap-1.5">
               <Play className="size-3.5" />
-              Start Live Mac Capture
+              {settings.captureEngine === "macos-native" &&
+              macBridgeState.paired
+                ? "Start Silent Mac Capture"
+                : "Start Screen Capture"}
             </Button>
           ) : (
             <div className="flex items-center gap-1">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onSnapNow}
-                disabled={isProcessingCapture}
-              >
+              <Button variant="outline" size="sm" onClick={onSnapNow}>
                 Snap Now
               </Button>
               <Button
                 variant="ghost"
                 size="icon-sm"
                 onClick={onTogglePauseCapture}
-                title={isCapturePaused ? "Resume timer" : "Pause timer"}
               >
                 {isCapturePaused ? (
                   <Play className="size-3.5" />
@@ -239,7 +219,7 @@ export function TopMenubar({
               <Button
                 variant="destructive"
                 size="sm"
-                onClick={onStopLiveCapture}
+                onClick={onStopCapture}
                 className="gap-1"
               >
                 <Square className="size-3" />
@@ -247,36 +227,36 @@ export function TopMenubar({
               </Button>
             </div>
           )}
+        </div>
 
+        {/* Right: Sync Calendar & Mail, Gemma 4 Status, Android Sync & Setup */}
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="secondary"
             size="sm"
-            onClick={onSimulateNextMacCapture}
-            disabled={isProcessingCapture}
-            className="gap-1.5"
+            onClick={onRescanCalendarAndMail}
+            disabled={isSyncingCalendar}
+            className="gap-1.5 text-xs"
           >
-            <Sparkles className="size-3.5" />
-            {isProcessingCapture ? "Analyzing..." : "Simulate Mail/Slack Shot"}
+            {isSyncingCalendar ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3.5" />
+            )}
+            Sync Calendar &amp; Mail
           </Button>
-        </div>
 
-        {/* Right: Local AI Status, Android Nightly Sync & Apple Calendar .ics */}
-        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setOllamaDialogOpen(true)}
+            onClick={() => setTelemetryOpen(true)}
             className="gap-1.5 text-xs"
           >
             <Cpu className="size-3.5" />
-            <span className="hidden sm:inline">
-              {ollamaStatus.connected
-                ? `Ollama: ${settings.ollamaModel}`
-                : "Local AI: On-Device"}
-            </span>
+            <span className="font-mono">{settings.gemmaModel}</span>
             <span
               className={`size-2 rounded-full ${
-                ollamaStatus.connected ? "bg-emerald-500" : "bg-sky-500"
+                gemmaStatus.reachable ? "bg-emerald-500" : "bg-amber-500"
               }`}
             />
           </Button>
@@ -288,7 +268,7 @@ export function TopMenubar({
             className="gap-1.5 text-xs"
           >
             <Smartphone className="size-3.5" />
-            <span className="hidden md:inline">Nightly Android Sync</span>
+            <span className="hidden md:inline">Android Nightly</span>
             {queuedAndroidCount > 0 && (
               <Badge variant="default" className="h-4 px-1.5 text-[10px]">
                 {queuedAndroidCount}
@@ -296,59 +276,33 @@ export function TopMenubar({
             )}
           </Button>
 
-          <input
-            ref={icsInputRef}
-            type="file"
-            accept=".ics,text/calendar"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) {
-                onImportIcsFile(file);
-                e.target.value = "";
-              }
-            }}
-          />
-
           <Button
             variant="outline"
             size="sm"
-            onClick={() => icsInputRef.current?.click()}
+            onClick={onReopenSetupWizard}
             className="gap-1.5 text-xs"
-            title="Import busy events from Apple Calendar or Google Calendar (.ics)"
           >
-            <Upload className="size-3.5" />
-            <span className="hidden lg:inline">Import .ics</span>
-          </Button>
-
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onExportIcs}
-            className="gap-1.5 text-xs"
-            title="Export time-blocked schedule & solo holds to Apple Calendar (.ics)"
-          >
-            <Download className="size-3.5" />
-            <span className="hidden lg:inline">Export to Calendar</span>
+            <Settings2 className="size-3.5" />
+            Setup
           </Button>
         </div>
       </div>
 
-      {/* Capture Cadence & Workday Preferences Dialog */}
-      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+      {/* Cadence & Capture Engine Preferences Dialog */}
+      <Dialog open={cadenceDialogOpen} onOpenChange={setCadenceDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Screenshot Cadence &amp; Workday Bounds</DialogTitle>
+            <DialogTitle>Capture Cadence &amp; Workday Settings</DialogTitle>
             <DialogDescription>
-              Customize how often Dayframe captures your MacBook screen and how tightly it packs your calendar.
+              Configure screenshot frequency, capture engine, and calendar auto-write.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-5 py-2">
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between text-xs font-medium">
+          <div className="space-y-4 py-2 text-xs">
+            <div className="space-y-2">
+              <div className="flex justify-between font-medium">
                 <span>Screenshot Interval</span>
-                <span className="font-mono text-foreground">
+                <span className="font-mono">
                   Every {settings.intervalMinutes} min
                 </span>
               </div>
@@ -356,194 +310,147 @@ export function TopMenubar({
                 min={1}
                 max={30}
                 value={[settings.intervalMinutes]}
-                onValueChange={(val) => {
-                  const next = Array.isArray(val) ? val[0] : val;
+                onValueChange={(v) => {
+                  const next = Array.isArray(v) ? v[0] : v;
                   if (typeof next === "number") {
                     onUpdateSettings({ intervalMinutes: next });
                   }
                 }}
               />
-              <p className="text-[11px] text-muted-foreground">
-                1 min catches fleeting Slack messages; 5 min balances low battery impact on MacBook Air/Pro.
-              </p>
-            </div>
-
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between text-xs font-medium">
-                <span>Minimum Buffer Between Calendar Blocks</span>
-                <span className="font-mono">
-                  {settings.minGapBetweenBlocksMinutes} min
-                </span>
-              </div>
-              <Slider
-                min={0}
-                max={30}
-                value={[settings.minGapBetweenBlocksMinutes]}
-                onValueChange={(val) => {
-                  const next = Array.isArray(val) ? val[0] : val;
-                  if (typeof next === "number") {
-                    onUpdateSettings({
-                      minGapBetweenBlocksMinutes: Math.round(next / 5) * 5,
-                    });
-                  }
-                }}
-              />
-            </div>
-
-            <div className="flex items-center justify-between rounded-lg border p-3">
-              <div className="space-y-0.5 pr-3">
-                <div className="text-xs font-medium">
-                  Skip unchanged static screens
-                </div>
-                <div className="text-[11px] text-muted-foreground">
-                  Uses an 8×8 perceptual luminance check so idle screens skip VLM inference.
-                </div>
-              </div>
-              <Switch
-                checked={settings.skipDuplicateFrames}
-                onCheckedChange={(checked) =>
-                  onUpdateSettings({ skipDuplicateFrames: checked })
-                }
-              />
-            </div>
-
-            <div className="flex items-center justify-between rounded-lg border p-3">
-              <div className="space-y-0.5 pr-3">
-                <div className="flex items-center gap-1.5 text-xs font-medium">
-                  <Moon className="size-3.5" />
-                  Nightly Android Sync Window
-                </div>
-                <div className="text-[11px] text-muted-foreground">
-                  Batch-process raw phone screenshots at {settings.nightlyAndroidSyncHour - 12}:00 PM on Mac.
-                </div>
-              </div>
-              <Select
-                value={String(settings.nightlyAndroidSyncHour)}
-                onValueChange={(v) => {
-                  if (v) onUpdateSettings({ nightlyAndroidSyncHour: Number(v) });
-                }}
-              >
-                <SelectTrigger size="sm" className="w-28 text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="21">9:00 PM</SelectItem>
-                  <SelectItem value="22">10:00 PM</SelectItem>
-                  <SelectItem value="23">11:00 PM</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="flex items-center justify-between border-t pt-3">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  onResetSampleWorkspace();
-                  setSettingsOpen(false);
-                }}
-                className="gap-1.5 text-xs text-muted-foreground"
-              >
-                <RotateCcw className="size-3.5" />
-                Reset to Default Sample Day
-              </Button>
-              <Button size="sm" onClick={() => setSettingsOpen(false)}>
-                Done
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Local MacBook AI Model Dialog */}
-      <Dialog open={ollamaDialogOpen} onOpenChange={setOllamaDialogOpen}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Cpu className="size-4" />
-              Local MacBook Vision Model (Ollama)
-            </DialogTitle>
-            <DialogDescription>
-              Dayframe connects directly from your MacBook to{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-xs">
-                http://127.0.0.1:11434
-              </code>{" "}
-              so screenshots of Mail and Slack never leave your machine.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-4 py-1 text-xs">
-            <div className="flex items-center justify-between rounded-lg border bg-muted/40 p-3">
-              <div className="flex items-center gap-2">
-                {ollamaStatus.connected ? (
-                  <CheckCircle2 className="size-4 text-emerald-500" />
-                ) : (
-                  <Cpu className="size-4 text-sky-500" />
-                )}
-                <div>
-                  <div className="font-medium">
-                    {ollamaStatus.connected
-                      ? `Connected to Local Ollama (${ollamaStatus.models.length} models)`
-                      : "Local Ollama not detected — On-Device Heuristic Active"}
-                  </div>
-                  <div className="text-[11px] text-muted-foreground">
-                    {ollamaStatus.connected
-                      ? "Live screenshots are sent to your Apple Silicon vision model."
-                      : "Everything still works right now using Dayframe's built-in extractor."}
-                  </div>
-                </div>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={onRecheckOllama}
-                className="gap-1"
-              >
-                <RefreshCw className="size-3" />
-                Re-check
-              </Button>
             </div>
 
             <div className="space-y-1.5">
-              <label className="font-medium">Preferred Vision Model</label>
+              <label className="font-medium">Screenshot Source</label>
               <Select
-                value={settings.ollamaModel}
-                onValueChange={(val) => {
-                  if (val) onUpdateSettings({ ollamaModel: val });
+                value={settings.captureEngine}
+                onValueChange={(v) => {
+                  if (v === "macos-native" || v === "browser-screen") {
+                    onUpdateSettings({ captureEngine: v });
+                  }
                 }}
               >
                 <SelectTrigger className="w-full text-xs">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(ollamaStatus.models.length > 0
-                    ? ollamaStatus.models
-                    : [
-                        "llama3.2-vision",
-                        "qwen2.5-vl:7b",
-                        "gemma3:12b",
-                        "minicpm-v",
-                      ]
-                  ).map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
+                  <SelectItem value="macos-native">
+                    macOS Silent screencapture (via npm run mac)
+                  </SelectItem>
+                  <SelectItem value="browser-screen">
+                    Browser Window / Screen Share
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="flex items-center justify-between rounded-lg border p-3">
+              <div className="pr-3">
+                <div className="font-medium">Auto-write new blocks to Calendar</div>
+                <div className="text-[11px] text-muted-foreground">
+                  Writes Gemma 4 scheduled blocks straight into your connected Calendar.
+                </div>
+              </div>
+              <Switch
+                checked={settings.autoWriteToCalendar}
+                onCheckedChange={(checked) =>
+                  onUpdateSettings({ autoWriteToCalendar: checked })
+                }
+              />
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Gemma 4 Model & Live Pipeline Telemetry Dialog */}
+      <Dialog open={telemetryOpen} onOpenChange={setTelemetryOpen}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Activity className="size-4" />
+              Gemma 4 Engine &amp; Live Activity Pipeline
+            </DialogTitle>
+            <DialogDescription>
+              Exact local model status on <code>127.0.0.1:11434</code> and step-by-step activity log.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-1 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/40 p-3">
+              <div>
+                <div className="font-semibold">
+                  {gemmaStatus.reachable
+                    ? `Ollama Connected (${gemmaStatus.pingMs ?? 0}ms)`
+                    : "Ollama Offline on 127.0.0.1:11434"}
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  {gemmaStatus.reachable
+                    ? `Installed models: ${
+                        gemmaStatus.installedModels.join(", ") || "none yet"
+                      }`
+                    : `Start local Gemma 4: ollama pull ${settings.gemmaModel} && OLLAMA_ORIGINS="*" ollama serve`}
+                </div>
+              </div>
+
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => void onRecheckGemma()}
+              >
+                Re-check
+              </Button>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="font-medium">Active Gemma 4 Model</label>
+              <Select
+                value={settings.gemmaModel}
+                onValueChange={(v) => {
+                  if (v) onUpdateSettings({ gemmaModel: v });
+                }}
+              >
+                <SelectTrigger className="w-full text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {GEMMA4_MODEL_CATALOG.map((m) => (
+                    <SelectItem key={m.tag} value={m.tag}>
+                      {m.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
 
-            <div className="space-y-2 rounded-lg border bg-card p-3">
-              <div className="font-medium">
-                1-Minute MacBook Setup (Apple Silicon)
+            <div className="space-y-1.5">
+              <div className="font-medium">Recent Pipeline Execution Log</div>
+              <div className="max-h-56 space-y-1.5 overflow-y-auto rounded-xl border bg-background p-2.5">
+                {pipelineLogs.length === 0 ? (
+                  <p className="py-6 text-center text-[11px] text-muted-foreground">
+                    No captures or scans processed yet in this session.
+                  </p>
+                ) : (
+                  pipelineLogs.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="rounded-lg border bg-muted/25 p-2 text-[11px]"
+                    >
+                      <div className="flex items-center justify-between font-medium">
+                        <span>
+                          [{entry.stage}] {entry.title}
+                        </span>
+                        {entry.latencyMs !== undefined && (
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            {entry.latencyMs}ms
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-0.5 text-muted-foreground">
+                        {entry.detail}
+                      </p>
+                    </div>
+                  ))
+                )}
               </div>
-              <pre className="overflow-x-auto rounded-md bg-muted p-2.5 font-mono text-[11px] leading-relaxed">
-{`# 1. Pull a fast local vision model
-ollama pull llama3.2-vision
-
-# 2. Start Ollama allowing browser loopback access
-OLLAMA_ORIGINS="*" ollama serve`}
-              </pre>
             </div>
           </div>
         </DialogContent>

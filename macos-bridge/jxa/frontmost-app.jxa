@@ -1,0 +1,18 @@
+function run() {
+  try {
+    const se = Application("System Events");
+    const front = se.applicationProcesses.whose({ frontmost: true })[0];
+    const appName = front ? String(front.name()) : "macOS";
+    let windowTitle = "";
+    try {
+      if (front.windows.length > 0) {
+        windowTitle = String(front.windows[0].name() || "");
+      }
+    } catch (_e) {
+      windowTitle = "";
+    }
+    return JSON.stringify({ ok: true, appName, windowTitle });
+  } catch (_err) {
+    return JSON.stringify({ ok: true, appName: "macOS Screen", windowTitle: "" });
+  }
+}
