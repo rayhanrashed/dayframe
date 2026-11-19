@@ -1229,14 +1229,6 @@ export function DayframeApp() {
     showToast(msg);
   };
 
-  if (!hydrated) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-muted/20 text-xs text-muted-foreground">
-        Loading Dayframe...
-      </div>
-    );
-  }
-
   if (!settings.setupCompleted) {
     return (
       <KickstartWizard
