@@ -43,113 +43,160 @@ function hasLocalGemma4Cached() {
   return fs.existsSync(manifestDir);
 }
 
-console.log("\n==============================================================");
-console.log("  Dayframe — All-In-One Offline MacBook Launcher");
-console.log("==============================================================");
-
-// 1. One-time local node_modules check
-if (!fs.existsSync(path.join(rootDir, "node_modules", "next"))) {
-  console.log("[1/3] Installing local dependencies (first run only)...");
-  execFileSync(
-    process.platform === "win32" ? "npm.cmd" : "npm",
-    ["install", "--prefer-offline", "--no-audit", "--no-fund"],
-    { cwd: rootDir, stdio: "inherit", env: cleanEnv }
-  );
-} else {
-  console.log("[1/3] Local dependencies ready.");
-}
-
-// 2. Check offline model weights on disk (without leaving Ollama running in RAM!)
-if (hasLocalGemma4Cached()) {
-  console.log(
-    "[2/3] Offline Gemma 4 weights verified on disk (staying STOPPED at 0 MB RAM until batch run)."
-  );
-} else {
-  console.log(
-    "[2/3] Checking local Gemma 4 weights (one-time setup if not yet pulled)..."
-  );
-  const ollamaBin = findOllamaBin();
-  let tempServe = null;
+function getCurrentGitHead() {
   try {
-    tempServe = spawn(ollamaBin, ["serve"], {
-      stdio: "ignore",
-      env: cleanEnv,
-    });
-    execFileSync(ollamaBin, ["pull", "gemma4:e4b"], {
-      stdio: "inherit",
-      env: cleanEnv,
-    });
-    console.log("      Pulled gemma4:e4b — stopping Ollama now so idle RAM stays 0 MB.");
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
   } catch {
-    console.log(
-      "      Note: Could not auto-pull gemma4:e4b right now (offline or Ollama not installed yet)."
-    );
-    console.log(
-      "      Once Ollama is installed and gemma4:e4b is pulled once, Dayframe runs 100% offline."
-    );
-  } finally {
-    if (tempServe) {
-      try {
-        tempServe.kill("SIGTERM");
-      } catch {}
-    }
+    return "local";
   }
 }
 
-// 3. Build production UI bundle once so runtime uses ~45 MB RAM with zero internet
-const nextBin = path.join(
-  rootDir,
-  "node_modules",
-  ".bin",
-  process.platform === "win32" ? "next.cmd" : "next"
-);
+async function waitForOllamaReady(timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch("http://127.0.0.1:11434/api/tags");
+      if (r.ok) return true;
+    } catch {
+      // retry
+    }
+    await new Promise((r) => setTimeout(r, 350));
+  }
+  return false;
+}
 
-if (!useDevMode && !fs.existsSync(path.join(rootDir, ".next", "BUILD_ID"))) {
-  console.log("[3/3] Building compact local UI bundle (first run only)...");
-  execFileSync(nextBin, ["build"], {
+async function main() {
+  console.log("\n==============================================================");
+  console.log("  Dayframe — All-In-One Offline MacBook Launcher");
+  console.log("==============================================================");
+
+  // 1. Auto-install npm dependencies if node_modules is missing
+  if (!fs.existsSync(path.join(rootDir, "node_modules", "next"))) {
+    console.log("[1/3] Installing local dependencies (first run only)...");
+    execFileSync(
+      process.platform === "win32" ? "npm.cmd" : "npm",
+      ["install", "--prefer-offline", "--no-audit", "--no-fund"],
+      { cwd: rootDir, stdio: "inherit", env: cleanEnv }
+    );
+  } else {
+    console.log("[1/3] Local dependencies ready.");
+  }
+
+  // 2. Verify local Gemma 4 weights on disk (then keep Ollama STOPPED at 0 MB RAM!)
+  if (hasLocalGemma4Cached()) {
+    console.log(
+      "[2/3] Offline Gemma 4 weights verified on disk (staying STOPPED at 0 MB RAM until batch run)."
+    );
+  } else {
+    console.log(
+      "[2/3] Checking local Gemma 4 weights (one-time download if not yet cached)..."
+    );
+    const ollamaBin = findOllamaBin();
+    let tempServe = null;
+    try {
+      const alreadyUp = await waitForOllamaReady(500);
+      if (!alreadyUp) {
+        tempServe = spawn(ollamaBin, ["serve"], {
+          stdio: "ignore",
+          env: cleanEnv,
+        });
+        await waitForOllamaReady(8000);
+      }
+      execFileSync(ollamaBin, ["pull", "gemma4:e4b"], {
+        stdio: "inherit",
+        env: cleanEnv,
+      });
+      console.log(
+        "      Cached gemma4:e4b — stopping Ollama now so idle RAM stays 0 MB."
+      );
+    } catch {
+      console.log(
+        "      Note: Ollama not installed or currently offline. Install Ollama once (brew install ollama) and re-run ./dayframe."
+      );
+    } finally {
+      if (tempServe) {
+        try {
+          tempServe.kill("SIGTERM");
+        } catch {}
+      }
+    }
+  }
+
+  // 3. Build production UI bundle whenever git HEAD changed (fast ~1.5s Turbopack build)
+  const nextBin = path.join(
+    rootDir,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "next.cmd" : "next"
+  );
+  const headSha = getCurrentGitHead();
+  const stampPath = path.join(rootDir, ".next", ".dayframe-built-sha");
+  const builtSha = fs.existsSync(stampPath)
+    ? fs.readFileSync(stampPath, "utf8").trim()
+    : "";
+
+  if (
+    !useDevMode &&
+    (!fs.existsSync(path.join(rootDir, ".next", "BUILD_ID")) ||
+      builtSha !== headSha)
+  ) {
+    console.log("[3/3] Building compact local UI bundle...");
+    execFileSync(nextBin, ["build"], {
+      cwd: rootDir,
+      stdio: "inherit",
+      env: cleanEnv,
+    });
+    try {
+      fs.writeFileSync(stampPath, headSha, "utf8");
+    } catch {}
+  } else {
+    console.log(
+      `[3/3] Starting loopback UI (127.0.0.1:${uiPort}) + Native Mac Bridge...`
+    );
+  }
+
+  const nextArgs = useDevMode
+    ? ["dev", "--hostname", "127.0.0.1", "--port", uiPort]
+    : ["start", "--hostname", "127.0.0.1", "--port", uiPort];
+
+  const nextProc = spawn(nextBin, nextArgs, {
     cwd: rootDir,
     stdio: "inherit",
     env: cleanEnv,
   });
-} else {
-  console.log("[3/3] Starting loopback UI (127.0.0.1:" + uiPort + ") + Mac Daemon...");
-}
 
-const nextArgs = useDevMode
-  ? ["dev", "--hostname", "127.0.0.1", "--port", uiPort]
-  : ["start", "--hostname", "127.0.0.1", "--port", uiPort];
+  let bridgeProc = null;
 
-const nextProc = spawn(nextBin, nextArgs, {
-  cwd: rootDir,
-  stdio: "inherit",
-  env: cleanEnv,
-});
+  setTimeout(() => {
+    bridgeProc = spawn(
+      process.execPath,
+      [path.join(__dirname, "dayframe-mac.mjs"), "--open"],
+      {
+        cwd: rootDir,
+        stdio: "inherit",
+        env: { ...cleanEnv, DAYFRAME_UI_PORT: uiPort },
+      }
+    );
+  }, 1400);
 
-let bridgeProc = null;
-
-setTimeout(() => {
-  bridgeProc = spawn(
-    process.execPath,
-    [path.join(__dirname, "dayframe-mac.mjs"), "--open"],
-    {
-      cwd: rootDir,
-      stdio: "inherit",
-      env: { ...cleanEnv, DAYFRAME_UI_PORT: uiPort },
+  function shutdown() {
+    if (bridgeProc) {
+      try {
+        bridgeProc.kill("SIGTERM");
+      } catch {}
     }
-  );
-}, 1400);
-
-function shutdown() {
-  if (bridgeProc) {
     try {
-      bridgeProc.kill("SIGTERM");
+      nextProc.kill("SIGTERM");
     } catch {}
+    setTimeout(() => process.exit(0), 400);
   }
-  try {
-    nextProc.kill("SIGTERM");
-  } catch {}
-  setTimeout(() => process.exit(0), 400);
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+void main();
