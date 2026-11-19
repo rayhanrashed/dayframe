@@ -18,13 +18,13 @@ export const GEMMA4_MODEL_CATALOG: GemmaModelOption[] = [
     tag: "gemma4:e4b",
     label: "Gemma 4 E4B (Default • Recommended for MacBook)",
     sizeNote: "~6.6 GB • 128K ctx",
-    modalityNote: "Vision + Text + Tool Calling",
+    modalityNote: "Vision + Text • Loaded only during batch",
   },
   {
     tag: "gemma4:e2b",
     label: "Gemma 4 E2B (Ultra-Fast Edge)",
     sizeNote: "~4.6 GB • 128K ctx",
-    modalityNote: "Vision + Text • Lowest RAM",
+    modalityNote: "Vision + Text • Lowest Peak RAM",
   },
   {
     tag: "gemma4:12b",
@@ -114,17 +114,39 @@ export async function probeLocalGemma(
       installedGemma4Models: [],
       selectedModelInstalled: false,
       errorDetail:
-        "Cannot reach local Ollama at http://127.0.0.1:11434. Make sure Ollama is running on your Mac with OLLAMA_ORIGINS=\"*\" ollama serve.",
+        "Ollama is currently sleeping (0 MB RAM) — Dayframe wakes it automatically only when a batch sweep runs.",
     };
   }
 }
 
-export async function testGemma4Ping(model: string): Promise<{
+export async function unloadGemmaModelImmediately(
+  model: string
+): Promise<void> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    await fetch(`${OLLAMA_BASE}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({ model, keep_alive: 0 }),
+    });
+    clearTimeout(timer);
+  } catch {
+    // Already unloaded or daemon stopped
+  }
+}
+
+export async function testGemma4Ping(params: {
+  model: string;
+  unloadImmediately?: boolean;
+}): Promise<{
   ok: boolean;
   latencyMs: number;
   resolvedModel: string;
   message: string;
 }> {
+  const { model, unloadImmediately = true } = params;
   const t0 = performance.now();
   const status = await probeLocalGemma(model);
   if (!status.reachable) {
@@ -133,8 +155,7 @@ export async function testGemma4Ping(model: string): Promise<{
       latencyMs: Math.round(performance.now() - t0),
       resolvedModel: model,
       message:
-        status.errorDetail ??
-        "Ollama is not reachable at 127.0.0.1:11434 on this machine.",
+        "Ollama is currently stopped (0 MB RAM). Click 'Wake & Test' or run ./dayframe on your MacBook.",
     };
   }
 
@@ -156,11 +177,12 @@ export async function testGemma4Ping(model: string): Promise<{
       body: JSON.stringify({
         model: targetModel,
         stream: false,
+        keep_alive: unloadImmediately ? 0 : "90s",
         messages: [
           {
             role: "user",
             content:
-              "Reply in one short sentence confirming Gemma 4 is ready to organize calendar blocks.",
+              "Reply in one short sentence confirming Gemma 4 works offline and will unload to 0 MB RAM right after.",
           },
         ],
       }),
@@ -174,10 +196,9 @@ export async function testGemma4Ping(model: string): Promise<{
         ok: false,
         latencyMs,
         resolvedModel: targetModel,
-        message:
-          errText.includes("not found")
-            ? `Model "${targetModel}" is not pulled yet. Run: ollama pull ${model}`
-            : `Ollama returned HTTP ${res.status}: ${errText.slice(0, 140)}`,
+        message: errText.includes("not found")
+          ? `Model "${targetModel}" is not downloaded yet. Run "./dayframe" once while online to cache it.`
+          : `Ollama returned HTTP ${res.status}: ${errText.slice(0, 140)}`,
       };
     }
 
@@ -187,8 +208,9 @@ export async function testGemma4Ping(model: string): Promise<{
       latencyMs,
       resolvedModel: targetModel,
       message:
-        body.message?.content?.trim() ||
-        `${targetModel} responded cleanly in ${latencyMs}ms.`,
+        (body.message?.content?.trim() ||
+          `${targetModel} responded cleanly in ${latencyMs}ms.`) +
+        (unloadImmediately ? " (Unloaded back to 0 MB RAM)" : ""),
     };
   } catch (err) {
     return {
@@ -265,15 +287,17 @@ export async function analyzeScreenshotWithGemma4(params: {
       }.`
     : "";
 
-  const prompt = `You are Dayframe's Stage-2 Gemma 4 multimodal calendar planner running on the user's MacBook.
+  const prompt = `You are Dayframe's Stage-2 Gemma 4 multimodal calendar planner running 100% offline on the user's MacBook.
 Today's local date is ${todayDateKey}.
 Captured device: ${device} | Active app: "${appName}" | Window title: "${windowTitle}".${stage1Context}
 
-Inspect the screenshot image carefully (especially emails in Mail/Gmail, Slack threads, or meeting mentions).
-Decide if there is a concrete item that should be placed on the user's calendar:
-1. If the screenshot mentions a specific meeting time (even informally in an email or Slack message without an invite), output detectedKind="meeting" and isSoloInvite=true (a personal hold just for the user), with proposedDateKey ("YYYY-MM-DD") and proposedStartMinutes (minutes from midnight, e.g. 14:30 -> 870).
-2. If the screenshot shows a concrete task, review, deliverable, or reply the user needs to do, estimate realistic duration in minutes (15, 30, 45, 60, 90, 120) so we can time-block it onto an open calendar slot (detectedKind="deep-work" for >=45m focus work, or "follow-up" for 15-30m replies). Do NOT create vague to-dos.
-3. If the screen is just general browsing, code with no new commitment, or already reflected, set hasActionableItem=false.
+Inspect the screenshot carefully (emails, Slack messages, or meeting mentions).
+IMPORTANT: When you are even slightly unsure whether an item belongs on the user's calendar, whether it is assigned to the user vs FYI, whether a meeting time is tentative, or how much focus time it needs, set "needsUserConfirmation": true and write a clear, conversational "clarifyingQuestion" asking the user! We prefer asking the user OFTEN rather than silently guessing.
+
+Rules for extraction:
+1. Informal or unconfirmed meeting mention in email/Slack -> detectedKind="meeting", isSoloInvite=true, needsUserConfirmation=true, clarifyingQuestion="Put a solo hold for '<title>' on your calendar, or wait until confirmed?".
+2. Concrete task, review, deliverable, or reply -> detectedKind="deep-work" (>=45m) or "follow-up" (15-30m) with realistic estimatedMinutes (15, 30, 45, 60, 90, 120). If ownership or duration isn't 100% certain, set needsUserConfirmation=true and ask in clarifyingQuestion.
+3. General browsing, reading code with no commitment, or noise -> set hasActionableItem=false.
 
 User's Standing Rules:
 ${rulesList || "- Reserve prep time at least 2 hours before recurring meetings."}
@@ -290,7 +314,11 @@ Return ONLY valid JSON matching this schema:
   "isRecurringMention": boolean,
   "isSoloInvite": boolean,
   "locationOrUrl": string | null,
-  "fingerprintKey": string
+  "fingerprintKey": string,
+  "confidence": number,
+  "needsUserConfirmation": boolean,
+  "clarifyingQuestion": string,
+  "uncertaintyReason": string
 }`;
 
   try {
@@ -304,6 +332,7 @@ Return ONLY valid JSON matching this schema:
       body: JSON.stringify({
         model,
         stream: false,
+        keep_alive: "90s",
         format: "json",
         messages: [
           {
@@ -322,7 +351,7 @@ Return ONLY valid JSON matching this schema:
         ok: false,
         modelUsed: model,
         latencyMs,
-        error: `Ollama HTTP ${res.status} — verify "ollama pull ${model}" and OLLAMA_ORIGINS="*" ollama serve.`,
+        error: `Local Ollama HTTP ${res.status} — queued for next batch sweep.`,
       };
     }
 
@@ -331,6 +360,11 @@ Return ONLY valid JSON matching this schema:
       ExtractedCaptureSignal
     >;
 
+    const rawConf = Number(parsed.confidence);
+    const confidence = Number.isFinite(rawConf)
+      ? Math.max(0.1, Math.min(0.99, rawConf))
+      : 0.74;
+
     return {
       ok: true,
       modelUsed: model,
@@ -338,7 +372,10 @@ Return ONLY valid JSON matching this schema:
       signal: {
         hasActionableItem: Boolean(parsed.hasActionableItem),
         title: String(parsed.title || "Captured calendar block").slice(0, 120),
-        summary: String(parsed.summary || "Analyzed by Gemma 4").slice(0, 280),
+        summary: String(parsed.summary || "Analyzed offline by Gemma 4").slice(
+          0,
+          280
+        ),
         detectedKind:
           parsed.detectedKind === "meeting" ||
           parsed.detectedKind === "follow-up"
@@ -346,7 +383,10 @@ Return ONLY valid JSON matching this schema:
             : "deep-work",
         estimatedMinutes: Math.max(
           15,
-          Math.min(180, Math.round((Number(parsed.estimatedMinutes) || 45) / 15) * 15)
+          Math.min(
+            180,
+            Math.round((Number(parsed.estimatedMinutes) || 45) / 15) * 15
+          )
         ),
         proposedDateKey:
           typeof parsed.proposedDateKey === "string" &&
@@ -365,6 +405,17 @@ Return ONLY valid JSON matching this schema:
         fingerprintKey: parsed.fingerprintKey
           ? String(parsed.fingerprintKey)
           : undefined,
+        confidence,
+        needsUserConfirmation:
+          parsed.needsUserConfirmation !== undefined
+            ? Boolean(parsed.needsUserConfirmation)
+            : confidence < 0.88,
+        clarifyingQuestion: parsed.clarifyingQuestion
+          ? String(parsed.clarifyingQuestion).slice(0, 220)
+          : undefined,
+        uncertaintyReason: parsed.uncertaintyReason
+          ? String(parsed.uncertaintyReason).slice(0, 100)
+          : undefined,
       },
     };
   } catch (err) {
@@ -375,7 +426,7 @@ Return ONLY valid JSON matching this schema:
       error:
         err instanceof Error
           ? err.message
-          : "Could not reach local Gemma 4 on 127.0.0.1:11434.",
+          : "Local Gemma 4 is currently sleeping — queued for next batch.",
     };
   }
 }
@@ -387,7 +438,9 @@ export async function analyzeInboxEmailsWithGemma4(params: {
   rules: StandingRule[];
 }): Promise<{
   ok: boolean;
-  signals: Array<ExtractedCaptureSignal & { sourceEmailId: string; sourceLabel: string }>;
+  signals: Array<
+    ExtractedCaptureSignal & { sourceEmailId: string; sourceLabel: string }
+  >;
   latencyMs: number;
   error?: string;
 }> {
@@ -410,11 +463,12 @@ export async function analyzeInboxEmailsWithGemma4(params: {
     .map((r) => `- ${r.title}`)
     .join("\n");
 
-  const prompt = `You are Dayframe's local Gemma 4 organizer performing the user's One-Off Initial Inbox Scan.
+  const prompt = `You are Dayframe's offline local Gemma 4 organizer scanning the user's Apple Mail inbox.
 Today's date is ${todayDateKey}.
-Inspect these real inbox emails and extract ONLY items that belong on the user's calendar:
-- Informal or unbooked meeting mentions -> detectedKind="meeting", isSoloInvite=true (creates a solo calendar hold just for the user)
+Extract items that may belong on the user's calendar:
+- Informal or unbooked meeting mentions -> detectedKind="meeting", isSoloInvite=true, needsUserConfirmation=true
 - Concrete work/deliverables/replies -> detectedKind="deep-work" or "follow-up" with realistic estimatedMinutes (15..120).
+Whenever you are not 100% sure whether the user wants an email placed on their calendar or how long it takes, set "needsUserConfirmation": true and write a helpful "clarifyingQuestion" asking the user directly!
 Ignore newsletters, receipts, automated notifications, and spam.
 
 Standing Rules:
@@ -435,7 +489,11 @@ Return ONLY valid JSON with shape:
       "proposedDateKey": string | null,
       "proposedStartMinutes": number | null,
       "isRecurringMention": boolean,
-      "isSoloInvite": boolean
+      "isSoloInvite": boolean,
+      "confidence": number,
+      "needsUserConfirmation": boolean,
+      "clarifyingQuestion": string,
+      "uncertaintyReason": string
     }
   ]
 }`;
@@ -450,6 +508,7 @@ Return ONLY valid JSON with shape:
       body: JSON.stringify({
         model,
         stream: false,
+        keep_alive: "90s",
         format: "json",
         messages: [{ role: "user", content: prompt }],
       }),
@@ -473,9 +532,13 @@ Return ONLY valid JSON with shape:
 
     const signals = (parsed.items ?? []).map((item) => {
       const email = emails.find((e) => e.id === item.sourceEmailId);
+      const rawConf = Number(item.confidence);
+      const confidence = Number.isFinite(rawConf)
+        ? Math.max(0.1, Math.min(0.99, rawConf))
+        : 0.72;
       return {
         sourceEmailId: String(item.sourceEmailId || ""),
-        sourceLabel: email ? `Email: ${email.subject}` : "Inbox Scan",
+        sourceLabel: email ? `Mail: ${email.subject}` : "Mail Scan",
         hasActionableItem: true,
         title: String(item.title || email?.subject || "Email follow-up").slice(
           0,
@@ -488,7 +551,10 @@ Return ONLY valid JSON with shape:
             : ("deep-work" as const),
         estimatedMinutes: Math.max(
           15,
-          Math.min(180, Math.round((Number(item.estimatedMinutes) || 45) / 15) * 15)
+          Math.min(
+            180,
+            Math.round((Number(item.estimatedMinutes) || 45) / 15) * 15
+          )
         ),
         proposedDateKey:
           typeof item.proposedDateKey === "string" &&
@@ -502,6 +568,17 @@ Return ONLY valid JSON with shape:
         isRecurringMention: Boolean(item.isRecurringMention),
         isSoloInvite: Boolean(item.isSoloInvite),
         fingerprintKey: `email-${String(item.sourceEmailId || item.title)}`,
+        confidence,
+        needsUserConfirmation:
+          item.needsUserConfirmation !== undefined
+            ? Boolean(item.needsUserConfirmation)
+            : true,
+        clarifyingQuestion: item.clarifyingQuestion
+          ? String(item.clarifyingQuestion).slice(0, 220)
+          : undefined,
+        uncertaintyReason: item.uncertaintyReason
+          ? String(item.uncertaintyReason).slice(0, 100)
+          : undefined,
       };
     });
 

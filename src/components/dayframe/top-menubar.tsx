@@ -29,7 +29,13 @@ import {
 } from "@/lib/valen-decision";
 import { MacBridgeConnectionState } from "@/lib/calendar-connectors";
 import {
+  BATCH_SCHEDULE_PRESETS,
+  getNextScheduledBatchLabel,
+} from "@/lib/scheduler";
+import {
+  ConfirmationPolicy,
   GatekeeperStats,
+  ModelLifecycleState,
   OrganizerSettings,
   PipelineLogEntry,
 } from "@/lib/types";
@@ -40,13 +46,17 @@ import {
   Filter,
   Laptop,
   Loader2,
+  Moon,
   Pause,
   Play,
+  PowerOff,
   RefreshCw,
   Settings2,
   SlidersHorizontal,
   Smartphone,
+  Sparkles,
   Square,
+  WifiOff,
 } from "lucide-react";
 
 interface TopMenubarProps {
@@ -56,6 +66,8 @@ interface TopMenubarProps {
   onRecheckGemma: () => Promise<void>;
   valenStatus: ValenRuntimeStatus;
   onRecheckValen: () => Promise<ValenRuntimeStatus>;
+  modelLifecycle: ModelLifecycleState;
+  onForceSleepModels: () => Promise<void>;
   gateStats: GatekeeperStats;
   macBridgeState: MacBridgeConnectionState;
   isCapturing: boolean;
@@ -66,6 +78,9 @@ interface TopMenubarProps {
   onStartCapture: () => void;
   onStopCapture: () => void;
   onSnapNow: () => void;
+  queuedBatchCount: number;
+  isRunningBatchSweep: boolean;
+  onRunBatchSweepNow: () => void;
   isSyncingCalendar: boolean;
   onRescanCalendarAndMail: () => void;
   queuedAndroidCount: number;
@@ -80,6 +95,25 @@ function formatCountdown(sec: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function formatLifecycleBadge(lifecycle: ModelLifecycleState): string {
+  switch (lifecycle.activePhase) {
+    case "waking-valen":
+      return "Waking Valen...";
+    case "screening-valen":
+      return "Stage 1: Valen Screening";
+    case "waking-gemma":
+      return "Waking Gemma 4...";
+    case "reasoning-gemma":
+      return "Stage 2: Gemma 4 Extracting";
+    case "unloading":
+      return "Unloading to 0 MB...";
+    default:
+      return lifecycle.allModelsSleeping
+        ? "Models Sleeping • 0 MB RAM"
+        : `Active (${lifecycle.residentAiRamMb} MB RAM)`;
+  }
+}
+
 export function TopMenubar({
   settings,
   onUpdateSettings,
@@ -87,6 +121,8 @@ export function TopMenubar({
   onRecheckGemma,
   valenStatus,
   onRecheckValen,
+  modelLifecycle,
+  onForceSleepModels,
   gateStats,
   macBridgeState,
   isCapturing,
@@ -97,6 +133,9 @@ export function TopMenubar({
   onStartCapture,
   onStopCapture,
   onSnapNow,
+  queuedBatchCount,
+  isRunningBatchSweep,
+  onRunBatchSweepNow,
   isSyncingCalendar,
   onRescanCalendarAndMail,
   queuedAndroidCount,
@@ -112,41 +151,56 @@ export function TopMenubar({
     ? String(settings.intervalMinutes)
     : "custom";
 
-  const calendarConnected =
-    macBridgeState.paired || settings.calendarSource === "google-api";
+  const activePreset =
+    BATCH_SCHEDULE_PRESETS.find(
+      (p) =>
+        JSON.stringify(p.windows) ===
+        JSON.stringify(settings.batchWindowMinutes)
+    )?.id ?? "3x";
 
   return (
     <header className="sticky top-0 z-30 border-b border-border/80 bg-background/90 backdrop-blur-md">
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center justify-between gap-3 px-4 py-2.5 lg:px-6">
-        {/* Left: App Identity & Calendar Status */}
+        {/* Left: App Identity, Offline Guarantee & Calendar Status */}
         <div className="flex items-center gap-3">
           <div className="flex size-8 items-center justify-center rounded-xl bg-foreground text-background">
             <Camera className="size-4" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-sm font-semibold tracking-tight">
                 Dayframe
               </span>
+              <Badge variant="outline" className="gap-1 text-[10px]">
+                <WifiOff className="size-2.5 text-emerald-600" />
+                Offline
+              </Badge>
               <Badge
-                variant={calendarConnected ? "secondary" : "outline"}
+                variant={macBridgeState.paired ? "secondary" : "outline"}
                 className="gap-1 text-[10px]"
               >
                 <Laptop className="size-3" />
                 {macBridgeState.paired
                   ? `macOS Calendar (${settings.writableCalendarTitle})`
-                  : settings.calendarSource === "google-api"
-                    ? "Google Calendar API"
-                    : "Calendar Not Connected"}
+                  : "Mac Daemon Not Paired"}
               </Badge>
             </div>
             <p className="hidden text-[11px] text-muted-foreground xl:block">
-              Stage 1: {settings.valenModelId} Gate • Stage 2: {settings.gemmaModel} Planner
+              Next AI batch:{" "}
+              {settings.batchExecutionMode === "scheduled-batches"
+                ? getNextScheduledBatchLabel(settings.batchWindowMinutes)
+                : "Instant per shot"}{" "}
+              • Policy:{" "}
+              {settings.confirmationPolicy === "always-ask"
+                ? "Always Ask"
+                : settings.confirmationPolicy === "ask-often"
+                  ? "Ask Often"
+                  : "Auto High-Conf"}
             </p>
           </div>
         </div>
 
-        {/* Center: Capture Loop */}
+        {/* Center: Zero-AI-RAM Capture Queue Loop */}
         <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/40 p-1.5">
           {isCapturing ? (
             <div className="flex items-center gap-2 px-2">
@@ -159,7 +213,7 @@ export function TopMenubar({
               />
               <span className="font-mono text-xs font-medium">
                 {isCapturePaused
-                  ? "Paused"
+                  ? "Queue Paused"
                   : `Next shot ${formatCountdown(secondsUntilNext)}`}
               </span>
               {skippedStaticCount > 0 && (
@@ -170,7 +224,7 @@ export function TopMenubar({
             </div>
           ) : (
             <span className="pl-2 text-xs text-muted-foreground">
-              Capture:
+              Queue (0 MB AI):
             </span>
           )}
 
@@ -202,7 +256,7 @@ export function TopMenubar({
             variant="ghost"
             size="icon-sm"
             onClick={() => setCadenceDialogOpen(true)}
-            title="Capture & gatekeeper preferences"
+            title="Batch schedule, capture cadence & confirmation preferences"
           >
             <SlidersHorizontal className="size-3.5" />
           </Button>
@@ -210,15 +264,12 @@ export function TopMenubar({
           {!isCapturing ? (
             <Button size="sm" onClick={onStartCapture} className="gap-1.5">
               <Play className="size-3.5" />
-              {settings.captureEngine === "macos-native" &&
-              macBridgeState.paired
-                ? "Start Silent Mac Capture"
-                : "Start Screen Capture"}
+              Start Silent Queue
             </Button>
           ) : (
             <div className="flex items-center gap-1">
               <Button variant="outline" size="sm" onClick={onSnapNow}>
-                Snap Now
+                Queue Shot
               </Button>
               <Button
                 variant="ghost"
@@ -244,13 +295,33 @@ export function TopMenubar({
           )}
         </div>
 
-        {/* Right: Calendar Sync, Two-Stage AI Status, Android Nightly & Setup */}
+        {/* Right: On-Demand Batch Sweep, Model Sleep Status, Android & Setup */}
         <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="default"
+            size="sm"
+            onClick={onRunBatchSweepNow}
+            disabled={isRunningBatchSweep || isSyncingCalendar}
+            className="gap-1.5 text-xs"
+            title="Wake Valen -> screen queue -> stop Valen -> wake Gemma 4 -> extract -> unload back to 0 MB RAM"
+          >
+            {isRunningBatchSweep ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="size-3.5" />
+            )}
+            {isRunningBatchSweep
+              ? "Running Batch..."
+              : queuedBatchCount > 0
+                ? `Run Batch Sweep (${queuedBatchCount})`
+                : "Run Batch Sweep"}
+          </Button>
+
           <Button
             variant="secondary"
             size="sm"
             onClick={onRescanCalendarAndMail}
-            disabled={isSyncingCalendar}
+            disabled={isSyncingCalendar || isRunningBatchSweep}
             className="gap-1.5 text-xs"
           >
             {isSyncingCalendar ? (
@@ -258,7 +329,7 @@ export function TopMenubar({
             ) : (
               <RefreshCw className="size-3.5" />
             )}
-            Sync Calendar &amp; Mail
+            Sync Calendar
           </Button>
 
           <Button
@@ -266,16 +337,19 @@ export function TopMenubar({
             size="sm"
             onClick={() => setTelemetryOpen(true)}
             className="gap-1.5 text-xs"
-            title="Inspect Valen-Decision-1.5 Gatekeeper + Gemma 4 Pipeline"
+            title="Inspect AI Sleep/Wake Memory & Valen/Gemma Telemetry"
           >
-            <Filter className="size-3.5" />
+            <Moon className="size-3.5" />
             <span className="hidden font-mono sm:inline">
-              {settings.valenEnabled ? `${settings.valenModelId} → ` : ""}
-              {settings.gemmaModel}
+              {formatLifecycleBadge(modelLifecycle)}
             </span>
             <span
               className={`size-2 rounded-full ${
-                gemmaStatus.reachable ? "bg-emerald-500" : "bg-amber-500"
+                modelLifecycle.activePhase !== "sleeping"
+                  ? "animate-pulse bg-amber-500"
+                  : modelLifecycle.allModelsSleeping
+                    ? "bg-emerald-500"
+                    : "bg-sky-500"
               }`}
             />
           </Button>
@@ -287,7 +361,7 @@ export function TopMenubar({
             className="gap-1.5 text-xs"
           >
             <Smartphone className="size-3.5" />
-            <span className="hidden md:inline">Android Nightly</span>
+            <span className="hidden md:inline">Android</span>
             {queuedAndroidCount > 0 && (
               <Badge variant="default" className="h-4 px-1.5 text-[10px]">
                 {queuedAndroidCount}
@@ -307,20 +381,99 @@ export function TopMenubar({
         </div>
       </div>
 
-      {/* Capture & Gatekeeper Settings Dialog */}
+      {/* Batch Schedule, Cadence & Confirmation Policy Dialog */}
       <Dialog open={cadenceDialogOpen} onOpenChange={setCadenceDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Capture &amp; Valen Gate Settings</DialogTitle>
+            <DialogTitle>Offline Batch &amp; Confirmation Settings</DialogTitle>
             <DialogDescription>
-              Tune screenshot frequency, Valen probability threshold, and calendar sync.
+              Keep AI models stopped (0 MB RAM) between scheduled daily sweeps, and ask whenever items are uncertain.
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-2 text-xs">
+            <div className="space-y-1.5">
+              <label className="font-medium">
+                When Should AI Models Wake Up?
+              </label>
+              <Select
+                value={
+                  settings.batchExecutionMode === "instant-per-capture"
+                    ? "instant"
+                    : activePreset
+                }
+                onValueChange={(v) => {
+                  if (!v) return;
+                  if (v === "instant") {
+                    onUpdateSettings({
+                      batchExecutionMode: "instant-per-capture",
+                    });
+                    return;
+                  }
+                  const found = BATCH_SCHEDULE_PRESETS.find((p) => p.id === v);
+                  if (found) {
+                    onUpdateSettings({
+                      batchExecutionMode: "scheduled-batches",
+                      batchWindowMinutes: found.windows,
+                    });
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {BATCH_SCHEDULE_PRESETS.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.label}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value="instant">
+                    Instant on every screenshot (uses RAM more often)
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-[10.5px] text-muted-foreground">
+                Between batch runs, both Valen and Gemma 4 are unloaded and stopped so Dayframe uses 0 MB of GPU/AI memory.
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="font-medium">
+                Ask User Before Putting on Calendar
+              </label>
+              <Select
+                value={settings.confirmationPolicy}
+                onValueChange={(v) => {
+                  if (
+                    v === "ask-often" ||
+                    v === "always-ask" ||
+                    v === "auto-high-confidence"
+                  ) {
+                    onUpdateSettings({ confirmationPolicy: v as ConfirmationPolicy });
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ask-often">
+                    Ask Often When Unsure (Recommended)
+                  </SelectItem>
+                  <SelectItem value="always-ask">
+                    Always Ask Every Single Item
+                  </SelectItem>
+                  <SelectItem value="auto-high-confidence">
+                    Auto-Schedule High Confidence (&ge;72%)
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
             <div className="space-y-2">
               <div className="flex justify-between font-medium">
-                <span>Screenshot Interval</span>
+                <span>Silent Screenshot Queue Interval</span>
                 <span className="font-mono">
                   Every {settings.intervalMinutes} min
                 </span>
@@ -338,57 +491,19 @@ export function TopMenubar({
               />
             </div>
 
-            <div className="space-y-2">
-              <div className="flex justify-between font-medium">
-                <span>Valen Gate Cutoff (Wake Gemma 4)</span>
-                <span className="font-mono">
-                  p ≥ {settings.valenSignalThreshold.toFixed(2)}
-                </span>
-              </div>
-              <Slider
-                min={20}
-                max={80}
-                value={[Math.round(settings.valenSignalThreshold * 100)]}
-                onValueChange={(v) => {
-                  const next = Array.isArray(v) ? v[0] : v;
-                  if (typeof next === "number") {
-                    onUpdateSettings({ valenSignalThreshold: next / 100 });
-                  }
-                }}
-              />
-            </div>
-
             <div className="flex items-center justify-between rounded-lg border p-3">
               <div className="pr-3">
                 <div className="font-medium">
-                  Enable Valen-Decision-1.5 Gatekeeper
+                  Unload &amp; Stop Models Immediately After Batch
                 </div>
                 <div className="text-[11px] text-muted-foreground">
-                  Screens captures in 1 forward pass (0 output tokens) &amp; crops{" "}
-                  <code>bbox</code> before Gemma 4.
+                  Sends <code>keep_alive: 0</code> to Ollama and terminates Valen right after each sweep.
                 </div>
               </div>
               <Switch
-                checked={settings.valenEnabled}
+                checked={settings.unloadModelsAfterBatch}
                 onCheckedChange={(checked) =>
-                  onUpdateSettings({ valenEnabled: checked })
-                }
-              />
-            </div>
-
-            <div className="flex items-center justify-between rounded-lg border p-3">
-              <div className="pr-3">
-                <div className="font-medium">
-                  Auto-write new blocks to Calendar
-                </div>
-                <div className="text-[11px] text-muted-foreground">
-                  Writes Gemma 4 scheduled blocks directly into your Calendar.
-                </div>
-              </div>
-              <Switch
-                checked={settings.autoWriteToCalendar}
-                onCheckedChange={(checked) =>
-                  onUpdateSettings({ autoWriteToCalendar: checked })
+                  onUpdateSettings({ unloadModelsAfterBatch: checked })
                 }
               />
             </div>
@@ -396,21 +511,45 @@ export function TopMenubar({
         </DialogContent>
       </Dialog>
 
-      {/* Two-Stage AI Telemetry & Gatekeeper Savings Dialog */}
+      {/* AI Memory Lifecycle & Gatekeeper Savings Dialog */}
       <Dialog open={telemetryOpen} onOpenChange={setTelemetryOpen}>
         <DialogContent className="sm:max-w-xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Activity className="size-4" />
-              System-1 (Valen-Decision-1.5) → System-2 (Gemma 4) Pipeline
+              Zero-Idle-Resource Offline Pipeline
             </DialogTitle>
             <DialogDescription>
-              Live status and token-free gatekeeper savings on your MacBook.
+              Sequential memory handoff: Wake Valen &rarr; Stop Valen (0 MB) &rarr; Wake Gemma 4 &rarr; Unload (0 MB).
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-1 text-xs">
-            {/* Gatekeeper Compute Savings Strip */}
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/35 p-3">
+              <div>
+                <div className="font-semibold">
+                  Current AI Memory:{" "}
+                  <span className="font-mono">
+                    {modelLifecycle.allModelsSleeping
+                      ? "0 MB (All Models Stopped)"
+                      : `${modelLifecycle.residentAiRamMb} MB Resident`}
+                  </span>
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  Phase: {formatLifecycleBadge(modelLifecycle)}
+                </div>
+              </div>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => void onForceSleepModels()}
+                className="gap-1"
+              >
+                <PowerOff className="size-3" />
+                Unload &amp; Stop Models Now
+              </Button>
+            </div>
+
             <div className="grid grid-cols-4 gap-2 rounded-xl border bg-muted/30 p-3 text-center">
               <div>
                 <div className="font-mono text-base font-semibold">
@@ -458,13 +597,13 @@ export function TopMenubar({
                     variant="outline"
                     onClick={() => void onRecheckValen()}
                   >
-                    Re-check
+                    Check
                   </Button>
                 </div>
                 <div className="text-[11px] text-muted-foreground">
                   {valenStatus.reachable
-                    ? `Online on 127.0.0.1:${valenStatus.port} (${valenStatus.pingMs ?? 0}ms)`
-                    : `Standby on port ${settings.valenPort} (direct Gemma 4 fallback)`}
+                    ? `Active on 127.0.0.1:${valenStatus.port}`
+                    : "Sleeping (0 MB RAM)"}
                 </div>
                 <Select
                   value={settings.valenModelId}
@@ -496,13 +635,15 @@ export function TopMenubar({
                     variant="outline"
                     onClick={() => void onRecheckGemma()}
                   >
-                    Re-check
+                    Check
                   </Button>
                 </div>
                 <div className="text-[11px] text-muted-foreground">
                   {gemmaStatus.reachable
-                    ? `Ollama Online (${gemmaStatus.pingMs ?? 0}ms)`
-                    : "Ollama Offline on 127.0.0.1:11434"}
+                    ? modelLifecycle.loadedOllamaModels.length > 0
+                      ? `Loaded (${modelLifecycle.residentAiRamMb} MB)`
+                      : "Daemon idle • Weights unloaded (0 MB)"
+                    : "Stopped (0 MB RAM)"}
                 </div>
                 <Select
                   value={settings.gemmaModel}
@@ -525,11 +666,11 @@ export function TopMenubar({
             </div>
 
             <div className="space-y-1.5">
-              <div className="font-medium">Live Pipeline Log</div>
+              <div className="font-medium">Offline Batch &amp; Lifecycle Log</div>
               <div className="max-h-52 space-y-1.5 overflow-y-auto rounded-xl border bg-background p-2.5">
                 {pipelineLogs.length === 0 ? (
                   <p className="py-5 text-center text-[11px] text-muted-foreground">
-                    No captures or scans processed yet in this session.
+                    Models are sleeping at 0 MB RAM. Run a batch sweep to view lifecycle telemetry.
                   </p>
                 ) : (
                   pipelineLogs.map((entry) => (

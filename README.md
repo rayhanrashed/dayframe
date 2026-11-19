@@ -1,33 +1,26 @@
 # Dayframe
 
-**Dayframe** is a two-stage local-AI MacBook calendar organizer pairing **Valen-Decision-1.5** (`Valen-Team/Valen-Decision-1.5-*-GGUF` — System-1 multimodal decision gatekeeper) with **Gemma 4** (`gemma4:e4b` / `12b` / `26b` / `31b` via Ollama — System-2 extractor and planner).
+**Dayframe** is an all-in-one, **100% offline** MacBook calendar organizer powered by on-demand local AI (**Valen-Decision-1.5** + **Gemma 4**).
 
-## Two-Stage Local AI Architecture
+## Key Design Principles
 
-1. **Stage 1 — System-1 Gatekeeper (`Valen-Decision-1.5` via `/v1/decisions`)**:
-   - Evaluates `predicate`, `choice`, `score`, and `bbox` questions in **one forward pass (`0` autoregressive output tokens)**.
-   - **Screenshot Noise Filter**: Skips ~85% of non-actionable periodic screenshots (coding, docs, static browsing) before waking Gemma 4.
-   - **Privacy Drop Gate**: Immediately discards screenshots displaying passwords, API keys, or banking screens in memory.
-   - **`bbox` Visual Grounding**: Crops multi-window MacBook screenshots down to the exact actionable Mail or Slack pane before handing off to Gemma 4.
-   - **Inbox & Prep Triage**: Screens out newsletters/automated alerts during inbox scans and scores whether one-off meetings require advance prep.
-   - *Graceful Standby*: If the local Valen GGUF server is not running yet, Dayframe automatically falls back to routing directly to Gemma 4.
-2. **Stage 2 — System-2 Extractor & Calendar Planner (`Gemma 4` via Ollama)**:
-   - Runs only on screenshots and emails that pass the Valen gate, sizing task durations, creating solo meeting holds, and scheduling prep blocks (e.g. **≥2 hours before recurring meetings**) directly into your real calendar.
-3. **Native macOS Bridge (`npm run mac`)**:
-   - Talks directly to **macOS `Calendar.app`** (Apple EventKit), **macOS `Mail.app`**, and silent **`screencapture -x`** without `.ics` files.
+1. **All-In-One Single Launcher (`./dayframe` or `Dayframe.command`)**:
+   - No juggling separate terminal windows. One command (or double-clicking `Dayframe.command` in Finder) auto-installs dependencies on first run, checks cached model weights, starts the loopback UI (`127.0.0.1:43820`), and pairs the native macOS EventKit/Mail/Capture daemon (`127.0.0.1:43822`).
+2. **Zero-Idle-Resource Scheduled Batches (`0 MB` AI RAM 99% of the Day)**:
+   - Throughout the day, screenshots queue silently as tiny compressed frames (`~/.dayframe/capture-queue/`) with **both AI models completely stopped (`0 MB` RAM / `0%` GPU)**.
+   - At scheduled batch windows (**3x/day by default: `9:30 AM`, `1:30 PM`, `5:30 PM`**, or whenever you click **Run Batch Sweep**):
+     1. **Wake `Valen-Decision-1.5`** &rarr; Screen queued frames in 1 forward pass (`0` output tokens), drop private screens, skip ~85% non-actionable frames, crop `bbox` &rarr; **Immediately terminate Valen (`0 MB` RAM)** before Stage 2 loads.
+     2. **Wake `Gemma 4` via local Ollama** (only if actionable items survived) &rarr; Extract tasks, durations, and solo meeting holds &rarr; **Immediately unload weights (`keep_alive: 0`) and stop transient Ollama (`0 MB` RAM)**.
+3. **Ask Often When Unsure**:
+   - Whenever an email, Slack message, solo meeting mention, or task duration isn't 100% certain, Dayframe queues a plain-English **Yes / No / Adjust Duration / Always / Never** confirmation card rather than blindly writing to `Calendar.app`.
+4. **100% Offline Workflow**:
+   - Every single request in Dayframe's runtime workflow stays strictly on `127.0.0.1` loopback (`NEXT_TELEMETRY_DISABLED=1`, `OLLAMA_NOUPDATE=1`, native system fonts, local Apple EventKit `Calendar.app` & `Mail.app`). Once weights are cached once, Wi-Fi can be turned completely off.
 
-## Quickstart on macOS
+## Run on Your MacBook
 
 ```bash
-npm install
-
-# Stage 2: Start Gemma 4 in Ollama
-ollama pull gemma4:e4b
-OLLAMA_ORIGINS="*" ollama serve
-
-# (Optional) Stage 1: Serve Valen-Decision-1.5 GGUF (0.8B / 2B / 4B / 9B) on port 43823
-# ./serve -m ./Valen-Decision-1.5-9B-Q8_0.gguf --mmproj ./vision-native-limits-F32.gguf --host 127.0.0.1 --port 43823
-
-# Launch Dayframe + Native macOS Calendar/Mail/Screen Bridge
-npm run mac
+cd dayframe
+./dayframe
 ```
+
+*(Or double-click `Dayframe.command` in Finder, or run `npm run mac`.)*

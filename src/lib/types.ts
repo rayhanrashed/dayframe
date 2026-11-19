@@ -1,6 +1,13 @@
-export type CalendarSourceMode = "none" | "macos-bridge" | "google-api";
+export type CalendarSourceMode = "none" | "macos-bridge";
 
 export type CaptureEngineMode = "macos-native" | "browser-screen";
+
+export type BatchExecutionMode = "scheduled-batches" | "instant-per-capture";
+
+export type ConfirmationPolicy =
+  | "ask-often"
+  | "always-ask"
+  | "auto-high-confidence";
 
 export type CalendarBlockKind =
   | "meeting"
@@ -34,13 +41,19 @@ export interface CalendarBlock {
   sourceLabel: string;
   rationale: string;
   confidence: number;
+  /** Plain-language question shown when Dayframe is unsure whether to add this block */
+  clarifyingQuestion?: string;
+  /** Short badge reason why Dayframe is asking before writing to Calendar.app */
+  uncertaintyReason?: string;
 }
 
 export type RuleCategory =
   | "prep-time"
   | "duration-calibration"
   | "availability"
-  | "solo-invite";
+  | "solo-invite"
+  | "auto-confirm"
+  | "ignore-pattern";
 
 export interface StandingRule {
   id: string;
@@ -69,10 +82,15 @@ export interface ExtractedCaptureSignal {
   isSoloInvite?: boolean;
   locationOrUrl?: string;
   fingerprintKey?: string;
+  confidence?: number;
+  needsUserConfirmation?: boolean;
+  clarifyingQuestion?: string;
+  uncertaintyReason?: string;
 }
 
 export interface ScreenshotCapture {
   id: string;
+  diskQueueId?: string;
   timestampIso: string;
   device: "macbook" | "android";
   appName: string;
@@ -89,6 +107,8 @@ export interface ScreenshotCapture {
     bboxCropped?: boolean;
   };
   syncState:
+    | "queued-for-batch"
+    | "awaiting-confirmation"
     | "scheduled"
     | "queued-for-tonight"
     | "deduplicated"
@@ -106,6 +126,22 @@ export interface GatekeeperStats {
   routedToGemmaCount: number;
 }
 
+export interface ModelLifecycleState {
+  allModelsSleeping: boolean;
+  valenRunning: boolean;
+  ollamaDaemonRunning: boolean;
+  loadedOllamaModels: string[];
+  residentAiRamMb: number;
+  activePhase:
+    | "sleeping"
+    | "waking-valen"
+    | "screening-valen"
+    | "waking-gemma"
+    | "reasoning-gemma"
+    | "unloading";
+  lastBatchCompletedIso?: string;
+}
+
 export interface MacCalendarDescriptor {
   id: string;
   title: string;
@@ -120,7 +156,7 @@ export interface ScannedEmailItem {
   sender: string;
   dateIso: string;
   snippet: string;
-  source: "apple-mail" | "gmail";
+  source: "apple-mail";
 }
 
 export interface PipelineLogEntry {
@@ -130,8 +166,10 @@ export interface PipelineLogEntry {
     | "setup"
     | "scan"
     | "capture"
+    | "lifecycle"
     | "valen-gate"
     | "gemma4"
+    | "ask-user"
     | "calendar-write"
     | "feedback";
   title: string;
@@ -160,11 +198,17 @@ export interface SuggestedPreferencePrompt {
 export interface OrganizerSettings {
   setupCompleted: boolean;
   lastInitialScanIso?: string;
+  lastBatchRunIso?: string;
   gemmaModel: string;
   valenEnabled: boolean;
   valenModelId: string;
   valenPort: number;
   valenSignalThreshold: number;
+  batchExecutionMode: BatchExecutionMode;
+  /** Scheduled daily batch times in minutes from 00:00 (e.g. [570, 810, 1050] = 9:30 AM, 1:30 PM, 5:30 PM) */
+  batchWindowMinutes: number[];
+  unloadModelsAfterBatch: boolean;
+  confirmationPolicy: ConfirmationPolicy;
   calendarSource: CalendarSourceMode;
   captureEngine: CaptureEngineMode;
   writableCalendarId: string;

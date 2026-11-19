@@ -1,22 +1,11 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "Dayframe — Local-AI MacBook Calendar Organizer",
+  title: "Dayframe — Offline Local-AI MacBook Calendar Organizer",
   description:
-    "Periodic MacBook screen, email & Slack capture powered by local AI to time-block your calendar by availability, task duration, and recurring meeting prep rules.",
+    "100% offline MacBook calendar organizer: queues lightweight screenshots at 0 MB AI RAM, wakes local Valen-Decision + Gemma 4 only a few times a day, and asks before scheduling uncertain items.",
 };
 
 export default function RootLayout({
@@ -25,10 +14,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
+    <html lang="en" className="h-full antialiased">
       <body className="min-h-full flex flex-col">
         <TooltipProvider>{children}</TooltipProvider>
       </body>

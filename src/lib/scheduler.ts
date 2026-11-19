@@ -15,11 +15,15 @@ export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   valenModelId: "valen-9b",
   valenPort: 43823,
   valenSignalThreshold: 0.45,
+  batchExecutionMode: "scheduled-batches",
+  batchWindowMinutes: [9 * 60 + 30, 13 * 60 + 30, 17 * 60 + 30], // 9:30 AM, 1:30 PM, 5:30 PM
+  unloadModelsAfterBatch: true,
+  confirmationPolicy: "ask-often",
   calendarSource: "none",
   captureEngine: "macos-native",
   writableCalendarId: "",
   writableCalendarTitle: "Default Calendar",
-  autoWriteToCalendar: true,
+  autoWriteToCalendar: false,
   intervalMinutes: 5,
   skipDuplicateFrames: true,
   workdayStartMinutes: 9 * 60, // 9:00 AM
@@ -27,6 +31,32 @@ export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   minGapBetweenBlocksMinutes: 15,
   nightlyAndroidSyncHour: 23,
 };
+
+export const BATCH_SCHEDULE_PRESETS: Array<{
+  id: string;
+  label: string;
+  note: string;
+  windows: number[];
+}> = [
+  {
+    id: "3x",
+    label: "3x / day (9:30 AM, 1:30 PM, 5:30 PM)",
+    note: "Recommended • Models sleep 99% of the day at 0 MB RAM",
+    windows: [9 * 60 + 30, 13 * 60 + 30, 17 * 60 + 30],
+  },
+  {
+    id: "2x",
+    label: "2x / day (12:00 PM, 5:30 PM)",
+    note: "Midday + End-of-day sweep",
+    windows: [12 * 60, 17 * 60 + 30],
+  },
+  {
+    id: "4x",
+    label: "4x / day (9:00 AM, 12:30 PM, 3:30 PM, 6:30 PM)",
+    note: "Frequent check-ins • Still 0 MB RAM between sweeps",
+    windows: [9 * 60, 12 * 60 + 30, 15 * 60 + 30, 18 * 60 + 30],
+  },
+];
 
 export const DEFAULT_STANDING_RULES: StandingRule[] = [
   {
@@ -44,7 +74,7 @@ export const DEFAULT_STANDING_RULES: StandingRule[] = [
     id: "rule-solo-holds",
     title: "Solo calendar holds from email & Slack mentions",
     description:
-      "When an email or Slack message mentions a specific meeting time without a formal invite, place a personal hold on your calendar just for you.",
+      "When an email or Slack message mentions a specific meeting time without a formal invite, propose a personal hold on your calendar and ask before adding.",
     category: "solo-invite",
     enabled: true,
   },
@@ -82,7 +112,7 @@ export const DEFAULT_SUGGESTED_QUESTIONS: SuggestedPreferencePrompt[] = [
   {
     id: "q-external-prep",
     question:
-      "Also add 45m of prep (≥2h ahead) before non-recurring 1:1, Interview, or Client calls?",
+      "Also propose 45m of prep (≥2h ahead) before non-recurring 1:1, Interview, or Client calls?",
     whyItMatters:
       "Extends your 2-hour prep runway beyond weekly recurring syncs to one-off high-stakes calls.",
     acceptLabel: "Enable for 1:1 / Client / Interview",
@@ -101,8 +131,7 @@ export const DEFAULT_SUGGESTED_QUESTIONS: SuggestedPreferencePrompt[] = [
     id: "q-evening-cutoff",
     question:
       "Set a 5:30 PM cutoff so late-afternoon Slack/email tasks roll into tomorrow morning?",
-    whyItMatters:
-      "Prevents late messages from booking your evening.",
+    whyItMatters: "Prevents late messages from booking your evening.",
     acceptLabel: "Add 5:30 PM cutoff",
     ruleToCreate: {
       title: "Hard stop after 5:30 PM",
@@ -126,6 +155,22 @@ export function formatMinutesToTime(totalMinutes: number): string {
   const period = hours24 >= 12 ? "PM" : "AM";
   const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
   return `${hours12}:${String(mins).padStart(2, "0")} ${period}`;
+}
+
+export function getNextScheduledBatchLabel(
+  batchWindowMinutes: number[],
+  now: Date = new Date()
+): string {
+  if (!batchWindowMinutes || batchWindowMinutes.length === 0) {
+    return "Manual batch only";
+  }
+  const sorted = [...batchWindowMinutes].sort((a, b) => a - b);
+  const nowMins = now.getHours() * 60 + now.getMinutes();
+  const nextToday = sorted.find((m) => m > nowMins);
+  if (nextToday !== undefined) {
+    return `Today ${formatMinutesToTime(nextToday)}`;
+  }
+  return `Tomorrow ${formatMinutesToTime(sorted[0])}`;
 }
 
 export function formatDuration(minutes: number): string {
@@ -168,6 +213,15 @@ function intervalsOverlap(
   bEnd: number
 ): boolean {
   return aStart < bEnd && bStart < aEnd;
+}
+
+function matchesRulePattern(text: string, pattern?: string): boolean {
+  if (!pattern) return false;
+  try {
+    return new RegExp(pattern, "i").test(text);
+  } catch {
+    return text.toLowerCase().includes(pattern.toLowerCase());
+  }
 }
 
 export function getProtectedIntervals(
@@ -282,24 +336,11 @@ export function calibrateDuration(
     ) {
       continue;
     }
-    try {
-      if (new RegExp(rule.triggerPattern, "i").test(title)) {
-        if (rule.fixedMinutesOverride) {
-          return {
-            minutes: roundTo15(rule.fixedMinutesOverride),
-            appliedRule: rule,
-          };
-        }
-      }
-    } catch {
-      if (title.toLowerCase().includes(rule.triggerPattern.toLowerCase())) {
-        if (rule.fixedMinutesOverride) {
-          return {
-            minutes: roundTo15(rule.fixedMinutesOverride),
-            appliedRule: rule,
-          };
-        }
-      }
+    if (matchesRulePattern(title, rule.triggerPattern) && rule.fixedMinutesOverride) {
+      return {
+        minutes: roundTo15(rule.fixedMinutesOverride),
+        appliedRule: rule,
+      };
     }
   }
   return { minutes: roundTo15(baseMinutes) };
@@ -312,14 +353,8 @@ function findMatchingPrepRule(
   const prepRules = rules.filter((r) => r.enabled && r.category === "prep-time");
   for (const rule of prepRules) {
     if (rule.appliesToRecurring && meeting.isRecurring) return rule;
-    if (rule.triggerPattern) {
-      try {
-        if (new RegExp(rule.triggerPattern, "i").test(meeting.title)) return rule;
-      } catch {
-        if (meeting.title.toLowerCase().includes(rule.triggerPattern.toLowerCase())) {
-          return rule;
-        }
-      }
+    if (rule.triggerPattern && matchesRulePattern(meeting.title, rule.triggerPattern)) {
+      return rule;
     }
   }
   return undefined;
@@ -330,7 +365,7 @@ export function reconcilePrepBlocks(
   rules: StandingRule[],
   settings: OrganizerSettings,
   todayKey: string = toLocalDateKey(new Date()),
-  initialStatus: "confirmed" | "proposed" | "auto-scheduled" = "auto-scheduled"
+  initialStatus: "confirmed" | "proposed" | "auto-scheduled" = "proposed"
 ): CalendarBlock[] {
   const retained = currentBlocks.filter(
     (b) => !(b.kind === "prep" && !b.syncedToExternalCalendar && b.status !== "confirmed")
@@ -345,6 +380,17 @@ export function reconcilePrepBlocks(
     );
 
   for (const meeting of meetings) {
+    if (
+      rules.some(
+        (r) =>
+          r.enabled &&
+          r.category === "ignore-pattern" &&
+          matchesRulePattern(`Prep: ${meeting.title}`, r.triggerPattern)
+      )
+    ) {
+      continue;
+    }
+
     const alreadyHasPrep = working.some(
       (b) =>
         (b.kind === "prep" && b.linkedMeetingId === meeting.id) ||
@@ -379,7 +425,6 @@ export function reconcilePrepBlocks(
       }
     }
 
-    // If the meeting is on a future day and starts too early for a 2h morning lead, place prep on the afternoon prior
     if (chosenStart === null && meeting.dateKey > todayKey) {
       const prevDayKey = addDaysToDateKey(meeting.dateKey, -1);
       const prevSlot = findOpenSlot({
@@ -419,11 +464,24 @@ export function reconcilePrepBlocks(
     }
 
     if (chosenStart !== null) {
+      const hasAutoConfirmRule = rules.some(
+        (r) =>
+          r.enabled &&
+          r.category === "auto-confirm" &&
+          matchesRulePattern(meeting.title, r.triggerPattern)
+      );
+      const effectiveStatus =
+        settings.confirmationPolicy === "always-ask"
+          ? "proposed"
+          : hasAutoConfirmRule
+            ? "auto-scheduled"
+            : initialStatus;
+
       working.push({
         id: `prep-${meeting.id}`,
         title: `Prep: ${meeting.title}`,
         kind: "prep",
-        status: initialStatus,
+        status: effectiveStatus,
         dateKey: chosenDateKey,
         startMinutes: chosenStart,
         durationMinutes: prepDuration,
@@ -431,7 +489,15 @@ export function reconcilePrepBlocks(
         ruleId: rule.id,
         sourceLabel: rule.title,
         rationale,
-        confidence: 0.95,
+        confidence: meeting.isRecurring ? 0.92 : 0.78,
+        clarifyingQuestion: `Put ${formatDuration(
+          prepDuration
+        )} of prep before "${meeting.title}" (${formatMinutesToTime(
+          chosenStart
+        )} on ${chosenDateKey}) on your calendar?`,
+        uncertaintyReason: meeting.isRecurring
+          ? "Confirm recurring prep slot"
+          : "Suggested meeting prep — confirm if needed",
       });
     }
   }
@@ -472,7 +538,8 @@ export function isDuplicateOfExisting(
   if (signal.fingerprintKey) {
     const matchingCap = captures.some(
       (c) =>
-        c.syncState === "scheduled" &&
+        (c.syncState === "scheduled" ||
+          c.syncState === "awaiting-confirmation") &&
         c.extractedSignal?.fingerprintKey === signal.fingerprintKey
     );
     if (matchingCap) return true;
@@ -491,6 +558,104 @@ export function isDuplicateOfExisting(
   return false;
 }
 
+export function evaluateConfirmationRequirement(params: {
+  signal: ExtractedCaptureSignal;
+  calibratedMinutes: number;
+  hasDurationRule: boolean;
+  sourceLabel: string;
+  rules: StandingRule[];
+  settings: OrganizerSettings;
+}): {
+  ignoredByRule: boolean;
+  shouldAskUser: boolean;
+  clarifyingQuestion: string;
+  uncertaintyReason: string;
+} {
+  const {
+    signal,
+    calibratedMinutes,
+    hasDurationRule,
+    sourceLabel,
+    rules,
+    settings,
+  } = params;
+
+  const isIgnored = rules.some(
+    (r) =>
+      r.enabled &&
+      r.category === "ignore-pattern" &&
+      matchesRulePattern(signal.title, r.triggerPattern)
+  );
+  if (isIgnored) {
+    return {
+      ignoredByRule: true,
+      shouldAskUser: false,
+      clarifyingQuestion: "",
+      uncertaintyReason: "",
+    };
+  }
+
+  const isExplicitlyAutoConfirmed = rules.some(
+    (r) =>
+      r.enabled &&
+      r.category === "auto-confirm" &&
+      matchesRulePattern(signal.title, r.triggerPattern)
+  );
+
+  const conf = signal.confidence ?? 0.75;
+
+  let shouldAskUser = false;
+  let defaultReason = signal.uncertaintyReason || "";
+
+  if (settings.confirmationPolicy === "always-ask") {
+    shouldAskUser = true;
+    defaultReason = defaultReason || "Always-ask policy active";
+  } else if (isExplicitlyAutoConfirmed) {
+    shouldAskUser = false;
+  } else if (settings.confirmationPolicy === "ask-often") {
+    if (signal.isSoloInvite || signal.detectedKind === "meeting") {
+      shouldAskUser = true;
+      defaultReason =
+        defaultReason || "Informal meeting mention — confirm solo hold";
+    } else if (signal.needsUserConfirmation) {
+      shouldAskUser = true;
+      defaultReason =
+        defaultReason || "Model flagged uncertainty — asking you first";
+    } else if (conf < 0.9) {
+      shouldAskUser = true;
+      defaultReason =
+        defaultReason ||
+        `Confidence ${Math.round(conf * 100)}% — confirm before adding`;
+    } else if (!hasDurationRule && calibratedMinutes >= 45) {
+      shouldAskUser = true;
+      defaultReason =
+        defaultReason ||
+        `Estimated ${formatDuration(calibratedMinutes)} focus time — confirm duration`;
+    }
+  } else {
+    // auto-high-confidence
+    shouldAskUser = conf < 0.72 || Boolean(signal.needsUserConfirmation && conf < 0.8);
+    defaultReason = defaultReason || "Low confidence — confirm before scheduling";
+  }
+
+  const clarifyingQuestion =
+    signal.clarifyingQuestion ||
+    (signal.isSoloInvite
+      ? `Saw "${signal.title}" in ${sourceLabel} — put a ${formatDuration(
+          calibratedMinutes
+        )} solo hold on your calendar, or skip?`
+      : `Should I put "${signal.title}" (${formatDuration(
+          calibratedMinutes
+        )}) on your calendar from ${sourceLabel}, or skip it?`);
+
+  return {
+    ignoredByRule: false,
+    shouldAskUser,
+    clarifyingQuestion,
+    uncertaintyReason: defaultReason || "Confirm before writing to Calendar",
+  };
+}
+
 export function placeSignalOnCalendar(params: {
   signal: ExtractedCaptureSignal;
   sourceLabel: string;
@@ -500,11 +665,13 @@ export function placeSignalOnCalendar(params: {
   captures: ScreenshotCapture[];
   rules: StandingRule[];
   settings: OrganizerSettings;
-  status?: "confirmed" | "proposed" | "auto-scheduled";
+  forceAskUser?: boolean;
 }): {
   updatedBlocks: CalendarBlock[];
   createdBlock?: CalendarBlock;
   deduplicated: boolean;
+  ignoredByRule?: boolean;
+  askedUser: boolean;
 } {
   const {
     signal,
@@ -515,16 +682,47 @@ export function placeSignalOnCalendar(params: {
     captures,
     rules,
     settings,
-    status = "auto-scheduled",
+    forceAskUser = false,
   } = params;
 
   if (!signal.hasActionableItem) {
-    return { updatedBlocks: blocks, deduplicated: false };
+    return { updatedBlocks: blocks, deduplicated: false, askedUser: false };
   }
 
   if (isDuplicateOfExisting(signal, blocks, captures)) {
-    return { updatedBlocks: blocks, deduplicated: true };
+    return { updatedBlocks: blocks, deduplicated: true, askedUser: false };
   }
+
+  const { minutes: calibratedMinutes, appliedRule } = calibrateDuration(
+    signal.title,
+    signal.estimatedMinutes || 45,
+    rules
+  );
+
+  const decision = evaluateConfirmationRequirement({
+    signal,
+    calibratedMinutes,
+    hasDurationRule: Boolean(appliedRule),
+    sourceLabel,
+    rules,
+    settings,
+  });
+
+  if (decision.ignoredByRule) {
+    return {
+      updatedBlocks: blocks,
+      deduplicated: false,
+      ignoredByRule: true,
+      askedUser: false,
+    };
+  }
+
+  const askUser = forceAskUser || decision.shouldAskUser;
+  const blockStatus = askUser
+    ? "proposed"
+    : settings.autoWriteToCalendar
+      ? "confirmed"
+      : "auto-scheduled";
 
   const targetDateKey = signal.proposedDateKey || defaultDateKey;
 
@@ -537,7 +735,7 @@ export function placeSignalOnCalendar(params: {
       id: `blk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       title: signal.title,
       kind: "meeting",
-      status,
+      status: blockStatus,
       dateKey: targetDateKey,
       startMinutes: signal.proposedStartMinutes,
       durationMinutes: duration,
@@ -547,27 +745,24 @@ export function placeSignalOnCalendar(params: {
       sourceCaptureId,
       sourceLabel,
       rationale: `Solo calendar hold created just for you (${signal.summary}).`,
-      confidence: 0.92,
+      confidence: signal.confidence ?? 0.78,
+      clarifyingQuestion: askUser ? decision.clarifyingQuestion : undefined,
+      uncertaintyReason: askUser ? decision.uncertaintyReason : undefined,
     };
     const next = reconcilePrepBlocks(
       [...blocks, soloMeeting],
       rules,
       settings,
       defaultDateKey,
-      status
+      "proposed"
     );
     return {
       updatedBlocks: next,
       createdBlock: soloMeeting,
       deduplicated: false,
+      askedUser: askUser,
     };
   }
-
-  const { minutes: calibratedMinutes, appliedRule } = calibrateDuration(
-    signal.title,
-    signal.estimatedMinutes || 45,
-    rules
-  );
 
   const preferAfternoon =
     signal.detectedKind === "follow-up" || calibratedMinutes <= 30;
@@ -575,7 +770,6 @@ export function placeSignalOnCalendar(params: {
   let chosenDate = targetDateKey;
   let chosenStart: number | null = null;
 
-  // Search up to 5 days ahead for an open focus window
   for (let d = 0; d < 5; d++) {
     const candidateDate = addDaysToDateKey(targetDateKey, d);
     const slot = findOpenSlot({
@@ -602,7 +796,7 @@ export function placeSignalOnCalendar(params: {
     id: `blk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     title: signal.title,
     kind: signal.detectedKind === "follow-up" ? "follow-up" : "deep-work",
-    status,
+    status: blockStatus,
     dateKey: chosenDate,
     startMinutes: chosenStart,
     durationMinutes: calibratedMinutes,
@@ -614,7 +808,9 @@ export function placeSignalOnCalendar(params: {
         ? ` • Calibrated to ${formatDuration(calibratedMinutes)} via "${appliedRule.title}".`
         : ` • Slotted into open ${formatDuration(calibratedMinutes)} window.`
     }`,
-    confidence: 0.9,
+    confidence: signal.confidence ?? 0.76,
+    clarifyingQuestion: askUser ? decision.clarifyingQuestion : undefined,
+    uncertaintyReason: askUser ? decision.uncertaintyReason : undefined,
   };
 
   const nextBlocks = [...blocks, workBlock].sort(
@@ -626,7 +822,18 @@ export function placeSignalOnCalendar(params: {
     updatedBlocks: nextBlocks,
     createdBlock: workBlock,
     deduplicated: false,
+    askedUser: askUser,
   };
+}
+
+export function extractRuleTriggerFromTitle(title: string): string {
+  return title
+    .replace(/^Prep:\s*/i, "")
+    .replace(/[^a-zA-Z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 3)
+    .slice(0, 2)
+    .join("|");
 }
 
 export function applyUserRuleFeedback(params: {
@@ -643,6 +850,39 @@ export function applyUserRuleFeedback(params: {
 } {
   const { text, blocks, rules, settings } = params;
   const lower = text.toLowerCase();
+
+  if (
+    lower.includes("always ask") ||
+    lower.includes("ask me every") ||
+    lower.includes("never auto")
+  ) {
+    return {
+      blocks,
+      rules,
+      settings: {
+        ...settings,
+        confirmationPolicy: "always-ask",
+        autoWriteToCalendar: false,
+      },
+      assistantReply:
+        "Switched to Always Ask — I will ask for your Yes/No confirmation on every single item before touching your Calendar.",
+      actionSummary: "Confirmation policy → Always Ask",
+    };
+  }
+
+  if (lower.includes("ask often") || lower.includes("when unsure")) {
+    return {
+      blocks,
+      rules,
+      settings: {
+        ...settings,
+        confirmationPolicy: "ask-often",
+      },
+      assistantReply:
+        "Set to Ask Often — whenever a task, meeting mention, or duration isn't 100% certain, I'll queue a Yes/No question for you first.",
+      actionSummary: "Confirmation policy → Ask Often",
+    };
+  }
 
   const hoursLeadMatch = lower.match(
     /(\d+(?:\.\d+)?)\s*(?:hour|hr|h)s?\s*(?:before|ahead|prior)/
@@ -686,7 +926,8 @@ export function applyUserRuleFeedback(params: {
           ...prev,
           enabled: true,
           minLeadMinutesBeforeMeeting: newLeadMinutes,
-          prepDurationMinutes: newPrepDuration ?? prev.prepDurationMinutes ?? 60,
+          prepDurationMinutes:
+            newPrepDuration ?? prev.prepDurationMinutes ?? 60,
           title: `≥${formatDuration(newLeadMinutes)} runway before recurring meetings`,
           description: `Reserve ${formatDuration(
             newPrepDuration ?? prev.prepDurationMinutes ?? 60
@@ -771,7 +1012,7 @@ export function applyUserRuleFeedback(params: {
 
     const updatedBlocks = blocks.map((b) =>
       (b.kind === "deep-work" || b.kind === "follow-up") &&
-      new RegExp(keyword, "i").test(b.title)
+      matchesRulePattern(b.title, keyword)
         ? { ...b, durationMinutes: mins }
         : b
     );
@@ -794,9 +1035,9 @@ export function applyUserRuleFeedback(params: {
       blocks,
       rules,
       settings: { ...settings, intervalMinutes: mins },
-      assistantReply: `Updated your screenshot interval to every ${mins} minute${
+      assistantReply: `Updated your silent screenshot queue cadence to every ${mins} minute${
         mins === 1 ? "" : "s"
-      }.`,
+      } (models remain stopped at 0 MB RAM until your next batch window).`,
       actionSummary: `Capture cadence → ${mins}m`,
     };
   }
@@ -804,7 +1045,7 @@ export function applyUserRuleFeedback(params: {
   const noteRule: StandingRule = {
     id: `rule-note-${Date.now()}`,
     title: text.length > 56 ? `${text.slice(0, 53)}...` : text,
-    description: `Organizer preference passed to Gemma 4: "${text}"`,
+    description: `Organizer preference passed to local Gemma 4: "${text}"`,
     category: "availability",
     enabled: true,
     createdFromFeedback: true,
@@ -814,7 +1055,7 @@ export function applyUserRuleFeedback(params: {
     blocks,
     rules: [noteRule, ...rules],
     settings,
-    assistantReply: `Added to your Standing Rules context so Gemma 4 applies "${noteRule.title}" on every screenshot and inbox scan.`,
-    actionSummary: "Saved rule to Gemma 4 prompt memory",
+    assistantReply: `Saved to your local Standing Rules so Gemma 4 applies "${noteRule.title}" during each offline batch run.`,
+    actionSummary: "Saved rule to local Gemma 4 memory",
   };
 }

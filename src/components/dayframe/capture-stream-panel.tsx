@@ -17,12 +17,18 @@ import {
   CalendarPlus,
   Camera,
   CheckCircle2,
+  Clock,
+  HelpCircle,
   ImagePlus,
   Layers,
+  Play,
 } from "lucide-react";
 
 interface CaptureStreamPanelProps {
   captures: ScreenshotCapture[];
+  queuedBatchCount: number;
+  isRunningBatch: boolean;
+  onRunBatchNow: () => void;
   captureError: string | null;
   onDismissCaptureError: () => void;
   onUploadScreenshotFile: (file: File) => void;
@@ -32,6 +38,9 @@ interface CaptureStreamPanelProps {
 
 export function CaptureStreamPanel({
   captures,
+  queuedBatchCount,
+  isRunningBatch,
+  onRunBatchNow,
   captureError,
   onDismissCaptureError,
   onUploadScreenshotFile,
@@ -67,10 +76,11 @@ export function CaptureStreamPanel({
       <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-sm font-semibold tracking-tight">
-            Captured Screen Feed
+            Captured Screen Queue
           </h2>
           <p className="text-[11px] text-muted-foreground">
-            Analyzed locally by <span className="font-mono">{gemmaModel}</span>
+            0 MB AI RAM while queued • Batch via{" "}
+            <span className="font-mono">{gemmaModel}</span>
           </p>
         </div>
         <div className="flex items-center gap-1.5">
@@ -92,13 +102,35 @@ export function CaptureStreamPanel({
             size="xs"
             onClick={() => fileInputRef.current?.click()}
             className="gap-1"
-            title="Drop or paste (⌘V) a screenshot to test Gemma 4 extraction"
+            title="Drop or paste (⌘V) a screenshot into the offline queue"
           >
             <ImagePlus className="size-3" />
             Add Shot
           </Button>
         </div>
       </div>
+
+      {queuedBatchCount > 0 && (
+        <div className="flex items-center justify-between gap-2 rounded-xl border bg-muted/40 px-3 py-2 text-xs">
+          <div>
+            <div className="font-medium">
+              {queuedBatchCount} shot{queuedBatchCount === 1 ? "" : "s"} queued
+            </div>
+            <div className="text-[10.5px] text-muted-foreground">
+              Models stay stopped until batch sweep
+            </div>
+          </div>
+          <Button
+            size="xs"
+            onClick={onRunBatchNow}
+            disabled={isRunningBatch}
+            className="gap-1"
+          >
+            <Play className="size-3" />
+            {isRunningBatch ? "Sweeping..." : "Sweep Now"}
+          </Button>
+        </div>
+      )}
 
       {captureError && (
         <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-900 dark:text-amber-200">
@@ -118,10 +150,16 @@ export function CaptureStreamPanel({
         {macCaptures.length === 0 ? (
           <div className="flex flex-col items-center justify-center rounded-xl border border-dashed px-4 py-12 text-center">
             <Camera className="mb-2.5 size-6 text-muted-foreground" />
-            <p className="text-xs font-medium">No screenshots taken yet</p>
+            <p className="text-xs font-medium">No screenshots queued yet</p>
             <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-              Click <span className="font-medium text-foreground">Start Capture</span> in the top bar (or paste a screenshot with <kbd className="rounded border px-1">⌘V</kbd>) to watch{" "}
-              <span className="font-mono">{gemmaModel}</span> extract meetings and tasks onto your calendar.
+              Click{" "}
+              <span className="font-medium text-foreground">
+                Start Silent Queue
+              </span>{" "}
+              in the top bar (or paste a screenshot with{" "}
+              <kbd className="rounded border px-1">⌘V</kbd>). Frames queue using{" "}
+              <span className="font-medium text-foreground">0 MB AI RAM</span>{" "}
+              until a batch sweep runs.
             </p>
           </div>
         ) : (
@@ -135,6 +173,21 @@ export function CaptureStreamPanel({
                   {cap.appName}
                 </span>
 
+                {cap.syncState === "queued-for-batch" && (
+                  <Badge variant="outline" className="gap-1 text-[10px]">
+                    <Clock className="size-2.5" />
+                    Queued (0 MB RAM)
+                  </Badge>
+                )}
+                {cap.syncState === "awaiting-confirmation" && (
+                  <Badge
+                    variant="outline"
+                    className="gap-1 border-amber-500/50 bg-amber-500/10 text-[10px] text-amber-800 dark:text-amber-200"
+                  >
+                    <HelpCircle className="size-2.5" />
+                    Asking You
+                  </Badge>
+                )}
                 {cap.syncState === "scheduled" && (
                   <Badge variant="secondary" className="gap-1 text-[10px]">
                     <CheckCircle2 className="size-2.5 text-emerald-500" />
@@ -166,30 +219,32 @@ export function CaptureStreamPanel({
                     className="gap-1 border-amber-500/40 text-[10px] text-amber-700 dark:text-amber-300"
                   >
                     <AlertCircle className="size-2.5" />
-                    Ollama Offline
+                    Waiting for Batch
                   </Badge>
                 )}
               </div>
 
-              <button
-                type="button"
-                onClick={() => setSelectedCapture(cap)}
-                className="mb-2 block w-full overflow-hidden rounded-lg border bg-muted/40"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={cap.imageDataUrl}
-                  alt={cap.windowTitle}
-                  className="h-24 w-full object-cover"
-                />
-              </button>
+              {cap.imageDataUrl && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedCapture(cap)}
+                  className="mb-2 block w-full overflow-hidden rounded-lg border bg-muted/40"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={cap.imageDataUrl}
+                    alt={cap.windowTitle}
+                    className="h-24 w-full object-cover"
+                  />
+                </button>
+              )}
 
               <p className="line-clamp-2 text-[11px] leading-relaxed text-muted-foreground">
                 {cap.summaryText}
               </p>
 
               {cap.valenGate && cap.syncState !== "filtered-by-valen" && (
-                <div className="mt-1.5 text-[10px] font-mono text-muted-foreground">
+                <div className="mt-1.5 font-mono text-[10px] text-muted-foreground">
                   Valen p={cap.valenGate.signalProbability.toFixed(2)} •{" "}
                   {cap.valenGate.intentChoice}
                   {cap.valenGate.bboxCropped ? " • bbox cropped" : ""}
@@ -238,16 +293,18 @@ export function CaptureStreamPanel({
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-3 text-xs">
-                <div className="overflow-hidden rounded-xl border bg-muted/30">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={selectedCapture.imageDataUrl}
-                    alt={selectedCapture.windowTitle}
-                    className="max-h-80 w-full object-contain"
-                  />
-                </div>
+                {selectedCapture.imageDataUrl && (
+                  <div className="overflow-hidden rounded-xl border bg-muted/30">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={selectedCapture.imageDataUrl}
+                      alt={selectedCapture.windowTitle}
+                      className="max-h-80 w-full object-contain"
+                    />
+                  </div>
+                )}
                 <div className="rounded-lg border bg-muted/30 p-3">
-                  <div className="font-medium">Gemma 4 Assessment</div>
+                  <div className="font-medium">Local Assessment</div>
                   <p className="mt-1 text-muted-foreground">
                     {selectedCapture.summaryText}
                   </p>

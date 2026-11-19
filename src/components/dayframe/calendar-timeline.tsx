@@ -165,10 +165,10 @@ export function CalendarTimeline({
                   settings.workdayStartMinutes
                 )} – ${formatMinutesToTime(
                   settings.workdayEndMinutes
-                )} • Connect your Mac or Google calendar to populate your real schedule.`
+                )} • 100% offline local macOS Calendar.app & Mail.app.`
               : `${blocks.length} total blocks across your week • ${
                   blocks.filter((b) => b.syncedToExternalCalendar).length
-                } synced with external calendar`}
+                } synced with macOS Calendar`}
           </p>
         </div>
 
@@ -225,7 +225,7 @@ export function CalendarTimeline({
             Your calendar workspace is clean and ready
           </h2>
           <p className="mt-1 max-w-md text-xs leading-relaxed text-muted-foreground">
-            Connect your MacBook&apos;s native <span className="font-medium text-foreground">Calendar.app</span> &amp; <span className="font-medium text-foreground">Mail.app</span> via <code className="rounded bg-muted px-1">npm run mac</code> (or connect Google Calendar in Setup) to pull in your real schedule and let Gemma 4 organize your prep and focus blocks.
+            Run <code className="rounded bg-muted px-1">./dayframe</code> (or double-click <code className="rounded bg-muted px-1">Dayframe.command</code>) on your MacBook to connect native <span className="font-medium text-foreground">Calendar.app</span> &amp; <span className="font-medium text-foreground">Mail.app</span> offline, with AI models sleeping at 0 MB RAM until batch runs.
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <Button size="sm" onClick={onOpenSetupWizard}>
@@ -380,9 +380,11 @@ export function CalendarTimeline({
                             <span
                               className={`shrink-0 rounded px-1.5 py-0.5 text-[9.5px] font-semibold ${theme.pill}`}
                             >
-                              {block.status !== "confirmed"
-                                ? theme.label
-                                : formatDuration(block.durationMinutes)}
+                              {block.status === "proposed"
+                                ? `? Ask (${formatDuration(block.durationMinutes)})`
+                                : block.status !== "confirmed"
+                                  ? theme.label
+                                  : formatDuration(block.durationMinutes)}
                             </span>
                           </div>
                         </button>

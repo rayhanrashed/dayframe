@@ -1,6 +1,7 @@
 import {
   CalendarBlock,
   MacCalendarDescriptor,
+  ModelLifecycleState,
   ScannedEmailItem,
 } from "./types";
 
@@ -10,7 +11,12 @@ export interface MacBridgeConnectionState {
   reachable: boolean;
   paired: boolean;
   isMac?: boolean;
+  offlineLoopbackOnly?: boolean;
   androidSyncFolder?: string;
+  queuedCaptureCount?: number;
+  collectorEnabled?: boolean;
+  modelsSleeping?: boolean;
+  residentAiRamMb?: number;
   error?: string;
 }
 
@@ -46,7 +52,7 @@ export async function probeMacBridge(
       return {
         reachable: false,
         paired: false,
-        error: "Mac Bridge did not respond cleanly on 127.0.0.1:43822.",
+        error: "Mac Daemon did not respond cleanly on 127.0.0.1:43822.",
       };
     }
 
@@ -54,7 +60,8 @@ export async function probeMacBridge(
       return {
         reachable: true,
         paired: false,
-        error: "Mac Bridge detected! Paste the Pairing Token printed in your terminal.",
+        error:
+          "Mac Daemon detected on 127.0.0.1:43822! Paste the Pairing Token printed in your terminal.",
       };
     }
 
@@ -66,28 +73,303 @@ export async function probeMacBridge(
       return {
         reachable: true,
         paired: false,
-        error: "Pairing token rejected — check the token printed by npm run mac.",
+        error: "Pairing token rejected — check the token printed by ./dayframe.",
       };
     }
 
     const body = (await statusRes.json()) as {
       ok?: boolean;
       isMac?: boolean;
+      offlineLoopbackOnly?: boolean;
       androidSyncFolder?: string;
+      queuedCaptureCount?: number;
+      collectorEnabled?: boolean;
+      modelsSleeping?: boolean;
+      residentAiRamMb?: number;
     };
 
     return {
       reachable: true,
       paired: Boolean(body.ok),
       isMac: body.isMac,
+      offlineLoopbackOnly: body.offlineLoopbackOnly,
       androidSyncFolder: body.androidSyncFolder,
+      queuedCaptureCount: body.queuedCaptureCount ?? 0,
+      collectorEnabled: body.collectorEnabled ?? false,
+      modelsSleeping: body.modelsSleeping ?? true,
+      residentAiRamMb: body.residentAiRamMb ?? 0,
     };
   } catch {
     return {
       reachable: false,
       paired: false,
-      error: "Mac Bridge is not running yet on 127.0.0.1:43822.",
+      error: "Mac Daemon is not running yet on 127.0.0.1:43822.",
     };
+  }
+}
+
+export async function fetchMacModelLifecycle(params: {
+  pairingToken: string;
+  valenPort: number;
+}): Promise<Omit<ModelLifecycleState, "activePhase"> | null> {
+  if (!params.pairingToken.trim()) return null;
+  try {
+    const res = await fetch(
+      `${MAC_BRIDGE_BASE}/api/models/lifecycle?valenPort=${params.valenPort}`,
+      {
+        headers: { Authorization: `Bearer ${params.pairingToken.trim()}` },
+      }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      ok?: boolean;
+      valenRunning?: boolean;
+      ollamaDaemonRunning?: boolean;
+      loadedOllamaModels?: string[];
+      residentAiRamMb?: number;
+      allModelsSleeping?: boolean;
+      lastBatchCompletedIso?: string;
+    };
+    if (!data.ok) return null;
+    return {
+      allModelsSleeping: Boolean(data.allModelsSleeping),
+      valenRunning: Boolean(data.valenRunning),
+      ollamaDaemonRunning: Boolean(data.ollamaDaemonRunning),
+      loadedOllamaModels: data.loadedOllamaModels ?? [],
+      residentAiRamMb: data.residentAiRamMb ?? 0,
+      lastBatchCompletedIso: data.lastBatchCompletedIso,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function wakeValenViaMacDaemon(params: {
+  pairingToken: string;
+  port: number;
+  ggufFile: string;
+}): Promise<{ ok: boolean; running: boolean; reason?: string }> {
+  if (!params.pairingToken.trim()) {
+    return { ok: false, running: false, reason: "Mac Daemon not paired." };
+  }
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/models/wake-valen`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({
+        port: params.port,
+        ggufFile: params.ggufFile,
+      }),
+    });
+    return (await res.json()) as {
+      ok: boolean;
+      running: boolean;
+      reason?: string;
+    };
+  } catch {
+    return { ok: false, running: false };
+  }
+}
+
+export async function stopValenViaMacDaemon(
+  pairingToken: string
+): Promise<void> {
+  if (!pairingToken.trim()) return;
+  try {
+    await fetch(`${MAC_BRIDGE_BASE}/api/models/stop-valen`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${pairingToken.trim()}` },
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function wakeOllamaViaMacDaemon(
+  pairingToken: string
+): Promise<{ ok: boolean; running: boolean; error?: string }> {
+  if (!pairingToken.trim()) {
+    return { ok: false, running: false, error: "Mac Daemon not paired." };
+  }
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/models/wake-ollama`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${pairingToken.trim()}` },
+    });
+    return (await res.json()) as {
+      ok: boolean;
+      running: boolean;
+      error?: string;
+    };
+  } catch {
+    return { ok: false, running: false };
+  }
+}
+
+export async function sleepAllModelsViaMacDaemon(params: {
+  pairingToken: string;
+  gemmaModel: string;
+}): Promise<{ ok: boolean; unloadedModels: string[]; daemonStopped: boolean }> {
+  if (params.pairingToken.trim()) {
+    try {
+      const res = await fetch(`${MAC_BRIDGE_BASE}/api/models/sleep-ollama`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${params.pairingToken.trim()}`,
+        },
+        body: JSON.stringify({ model: params.gemmaModel }),
+      });
+      if (res.ok) {
+        const body = (await res.json()) as {
+          unloadedModels?: string[];
+          daemonStopped?: boolean;
+        };
+        return {
+          ok: true,
+          unloadedModels: body.unloadedModels ?? [],
+          daemonStopped: Boolean(body.daemonStopped),
+        };
+      }
+    } catch {
+      // Fall back to direct loopback keep_alive: 0 below
+    }
+  }
+
+  try {
+    await fetch("http://127.0.0.1:11434/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: params.gemmaModel, keep_alive: 0 }),
+    });
+    return {
+      ok: true,
+      unloadedModels: [params.gemmaModel],
+      daemonStopped: false,
+    };
+  } catch {
+    return { ok: true, unloadedModels: [], daemonStopped: false };
+  }
+}
+
+export async function configureMacBackgroundCollector(params: {
+  pairingToken: string;
+  enabled: boolean;
+  intervalMinutes: number;
+}): Promise<boolean> {
+  if (!params.pairingToken.trim()) return false;
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/collector/config`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({
+        enabled: params.enabled,
+        intervalMinutes: params.intervalMinutes,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchMacDiskCaptureQueue(params: {
+  pairingToken: string;
+  includeImages?: boolean;
+}): Promise<{
+  ok: boolean;
+  totalQueued: number;
+  skippedDuplicates: number;
+  items: Array<{
+    id: string;
+    capturedAtIso: string;
+    appName: string;
+    windowTitle: string;
+    imageDataUrl: string;
+  }>;
+}> {
+  if (!params.pairingToken.trim()) {
+    return { ok: false, totalQueued: 0, skippedDuplicates: 0, items: [] };
+  }
+  try {
+    const flag = params.includeImages === false ? "0" : "1";
+    const res = await fetch(
+      `${MAC_BRIDGE_BASE}/api/capture/queue?images=${flag}`,
+      {
+        headers: { Authorization: `Bearer ${params.pairingToken.trim()}` },
+      }
+    );
+    if (!res.ok) {
+      return { ok: false, totalQueued: 0, skippedDuplicates: 0, items: [] };
+    }
+    const data = (await res.json()) as {
+      ok?: boolean;
+      totalQueued?: number;
+      skippedDuplicates?: number;
+      items?: Array<{
+        id: string;
+        capturedAtIso: string;
+        appName: string;
+        windowTitle: string;
+        imageDataUrl: string;
+      }>;
+    };
+    return {
+      ok: Boolean(data.ok),
+      totalQueued: data.totalQueued ?? 0,
+      skippedDuplicates: data.skippedDuplicates ?? 0,
+      items: data.items ?? [],
+    };
+  } catch {
+    return { ok: false, totalQueued: 0, skippedDuplicates: 0, items: [] };
+  }
+}
+
+export async function acknowledgeMacDiskCaptures(params: {
+  pairingToken: string;
+  ids: string[];
+}): Promise<void> {
+  if (!params.pairingToken.trim() || params.ids.length === 0) return;
+  try {
+    await fetch(`${MAC_BRIDGE_BASE}/api/capture/ack`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ ids: params.ids }),
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function sendMacNativeNotification(params: {
+  pairingToken: string;
+  title: string;
+  message: string;
+}): Promise<void> {
+  if (!params.pairingToken.trim()) return;
+  try {
+    await fetch(`${MAC_BRIDGE_BASE}/api/notify`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({
+        title: params.title,
+        message: params.message,
+      }),
+    });
+  } catch {
+    // Non-fatal
   }
 }
 
@@ -188,7 +470,7 @@ export async function scanMacCalendarEvents(params: {
       error:
         err instanceof Error
           ? err.message
-          : "Could not reach Mac Calendar Bridge.",
+          : "Could not reach Mac Calendar Daemon on 127.0.0.1:43822.",
     };
   }
 }
@@ -264,7 +546,7 @@ export async function writeBlockToMacCalendar(params: {
         title: `${prefix}${block.title}`,
         startMs,
         endMs,
-        notes: `${block.rationale}\nScheduled by Dayframe (${block.sourceLabel})`,
+        notes: `${block.rationale}\nScheduled offline by Dayframe (${block.sourceLabel})`,
         location: block.locationOrUrl || "",
         calendarId: calendarId || "",
       }),
@@ -292,6 +574,7 @@ export async function captureSilentMacScreenshot(
 ): Promise<{
   ok: boolean;
   skippedPrivateApp?: boolean;
+  skippedDuplicate?: boolean;
   appName?: string;
   windowTitle?: string;
   imageDataUrl?: string;
@@ -305,6 +588,7 @@ export async function captureSilentMacScreenshot(
     return (await res.json()) as {
       ok: boolean;
       skippedPrivateApp?: boolean;
+      skippedDuplicate?: boolean;
       appName?: string;
       windowTitle?: string;
       imageDataUrl?: string;
@@ -352,195 +636,6 @@ export async function fetchMacAndroidFolderQueue(
       ok: false,
       folder: "~/Pictures/Dayframe-Android",
       screenshots: [],
-    };
-  }
-}
-
-/**
- * Direct Google Calendar + Gmail REST connector for browser-only mode (no .ics files).
- */
-export async function scanGoogleCalendarAndGmail(params: {
-  googleAccessToken: string;
-  daysAhead?: number;
-}): Promise<{
-  ok: boolean;
-  blocks: CalendarBlock[];
-  emails: ScannedEmailItem[];
-  error?: string;
-}> {
-  const token = params.googleAccessToken.trim();
-  if (!token) {
-    return { ok: false, blocks: [], emails: [], error: "Missing Google OAuth access token." };
-  }
-
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(
-    start.getTime() + (params.daysAhead ?? 7) * 24 * 60 * 60 * 1000
-  );
-
-  try {
-    const calUrl = new URL(
-      "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-    );
-    calUrl.searchParams.set("timeMin", start.toISOString());
-    calUrl.searchParams.set("timeMax", end.toISOString());
-    calUrl.searchParams.set("singleEvents", "true");
-    calUrl.searchParams.set("orderBy", "startTime");
-    calUrl.searchParams.set("maxResults", "100");
-
-    const calRes = await fetch(calUrl.toString(), {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (!calRes.ok) {
-      return {
-        ok: false,
-        blocks: [],
-        emails: [],
-        error: `Google Calendar API returned HTTP ${calRes.status}. Verify your token has calendar.events scope.`,
-      };
-    }
-
-    const calJson = (await calRes.json()) as {
-      items?: Array<{
-        id: string;
-        summary?: string;
-        location?: string;
-        recurringEventId?: string;
-        start?: { dateTime?: string };
-        end?: { dateTime?: string };
-      }>;
-    };
-
-    const blocks: CalendarBlock[] = [];
-    for (const item of calJson.items ?? []) {
-      if (!item.start?.dateTime || !item.end?.dateTime) continue;
-      const s = new Date(item.start.dateTime);
-      const e = new Date(item.end.dateTime);
-      const startMinutes = s.getHours() * 60 + s.getMinutes();
-      const durationMinutes = Math.max(
-        15,
-        Math.min(480, Math.round((e.getTime() - s.getTime()) / 60000 / 15) * 15)
-      );
-
-      blocks.push({
-        id: `gcal-${item.id}`,
-        title: item.summary || "Busy",
-        kind: "meeting",
-        status: "confirmed",
-        dateKey: toLocalDateKey(s),
-        startMinutes,
-        durationMinutes,
-        isRecurring: Boolean(item.recurringEventId),
-        locationOrUrl: item.location,
-        externalEventId: item.id,
-        syncedToExternalCalendar: true,
-        sourceLabel: "Google Calendar",
-        rationale: item.recurringEventId
-          ? "Recurring Google Calendar meeting."
-          : "Existing Google Calendar event.",
-        confidence: 1,
-      });
-    }
-
-    // Optional Gmail unread messages scan if token also includes gmail.readonly
-    const emails: ScannedEmailItem[] = [];
-    try {
-      const listRes = await fetch(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8&q=in:inbox",
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (listRes.ok) {
-        const listData = (await listRes.json()) as {
-          messages?: Array<{ id: string }>;
-        };
-        for (const m of (listData.messages ?? []).slice(0, 6)) {
-          const detailRes = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`,
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-          if (!detailRes.ok) continue;
-          const detail = (await detailRes.json()) as {
-            id: string;
-            snippet?: string;
-            payload?: { headers?: Array<{ name: string; value: string }> };
-          };
-          const headers = detail.payload?.headers ?? [];
-          const subject =
-            headers.find((h) => h.name === "Subject")?.value || "(No subject)";
-          const sender = headers.find((h) => h.name === "From")?.value || "";
-          emails.push({
-            id: `gmail-${detail.id}`,
-            subject,
-            sender,
-            dateIso: new Date().toISOString(),
-            snippet: detail.snippet || "",
-            source: "gmail",
-          });
-        }
-      }
-    } catch {
-      // Gmail scope is optional; calendar events still succeed
-    }
-
-    return { ok: true, blocks, emails };
-  } catch (err) {
-    return {
-      ok: false,
-      blocks: [],
-      emails: [],
-      error: err instanceof Error ? err.message : "Google API request failed.",
-    };
-  }
-}
-
-export async function writeBlockToGoogleCalendar(params: {
-  googleAccessToken: string;
-  block: CalendarBlock;
-}): Promise<{ ok: boolean; externalEventId?: string; error?: string }> {
-  const { googleAccessToken, block } = params;
-  const startMs = dateKeyAndMinutesToEpochMs(block.dateKey, block.startMinutes);
-  const endMs = startMs + block.durationMinutes * 60 * 1000;
-  const prefix =
-    block.kind === "prep"
-      ? "[Prep] "
-      : block.isSoloHold
-        ? "[Solo Hold] "
-        : block.kind === "deep-work"
-          ? "[Focus] "
-          : "";
-
-  try {
-    const res = await fetch(
-      "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${googleAccessToken.trim()}`,
-        },
-        body: JSON.stringify({
-          summary: `${prefix}${block.title}`,
-          description: `${block.rationale}\nScheduled by Dayframe (${block.sourceLabel})`,
-          location: block.locationOrUrl,
-          start: { dateTime: new Date(startMs).toISOString() },
-          end: { dateTime: new Date(endMs).toISOString() },
-        }),
-      }
-    );
-    if (!res.ok) {
-      return {
-        ok: false,
-        error: `Google Calendar write failed (HTTP ${res.status}).`,
-      };
-    }
-    const created = (await res.json()) as { id?: string };
-    return { ok: true, externalEventId: created.id };
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : "Google Calendar write failed.",
     };
   }
 }

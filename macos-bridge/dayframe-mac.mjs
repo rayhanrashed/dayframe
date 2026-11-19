@@ -4,12 +4,17 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = path.resolve(__dirname, "..");
 const BRIDGE_PORT = 43822;
+const DAYFRAME_HOME = path.join(os.homedir(), ".dayframe");
 const TOKEN_FILE = path.join(os.homedir(), ".dayframe-bridge-token");
+const QUEUE_DIR = path.join(DAYFRAME_HOME, "capture-queue");
+const MODELS_DIR = path.join(DAYFRAME_HOME, "models");
+const COLLECTOR_CONFIG_FILE = path.join(DAYFRAME_HOME, "collector-config.json");
 const ANDROID_SYNC_DIR = path.join(os.homedir(), "Pictures", "Dayframe-Android");
 
 const PRIVATE_APP_BLOCKLIST = new Set([
@@ -18,8 +23,16 @@ const PRIVATE_APP_BLOCKLIST = new Set([
   "Bitwarden",
   "Passwords",
   "LastPass",
+  "ScreenSaverEngine",
+  "loginwindow",
 ]);
 
+fs.mkdirSync(QUEUE_DIR, { recursive: true });
+fs.mkdirSync(MODELS_DIR, { recursive: true });
+
+// ---------------------------------------------------------------------------
+// Pairing Token & Strict Loopback Security
+// ---------------------------------------------------------------------------
 function loadOrCreatePairingToken() {
   try {
     if (fs.existsSync(TOKEN_FILE)) {
@@ -33,7 +46,7 @@ function loadOrCreatePairingToken() {
   try {
     fs.writeFileSync(TOKEN_FILE, fresh, { mode: 0o600 });
   } catch {
-    // Non-fatal if home dir is read-only
+    // Non-fatal
   }
   return fresh;
 }
@@ -79,7 +92,7 @@ function readJsonBody(req) {
     let raw = "";
     req.on("data", (chunk) => {
       raw += chunk;
-      if (raw.length > 2_000_000) {
+      if (raw.length > 4_000_000) {
         reject(new Error("Payload too large"));
         req.destroy();
       }
@@ -96,6 +109,9 @@ function readJsonBody(req) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Static JXA Runner (Calendar.app EventKit, Mail.app, Frontmost App, Notify)
+// ---------------------------------------------------------------------------
 function runStaticJxa(scriptName, stdinObject = {}) {
   const scriptPath = path.join(__dirname, "jxa", scriptName);
   return new Promise((resolve) => {
@@ -130,6 +146,41 @@ function runStaticJxa(scriptName, stdinObject = {}) {
       child.stdin.end();
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// Zero-AI-RAM Background Screen Capture Queue (~/.dayframe/capture-queue/)
+// ---------------------------------------------------------------------------
+let lastFrameHash = "";
+let skippedDuplicateCount = 0;
+let collectorTimer = null;
+let collectorConfig = {
+  enabled: false,
+  intervalMinutes: 5,
+};
+
+try {
+  if (fs.existsSync(COLLECTOR_CONFIG_FILE)) {
+    const parsed = JSON.parse(fs.readFileSync(COLLECTOR_CONFIG_FILE, "utf8"));
+    collectorConfig = {
+      enabled: Boolean(parsed.enabled),
+      intervalMinutes: Math.max(1, Math.min(60, Number(parsed.intervalMinutes) || 5)),
+    };
+  }
+} catch {
+  // Use defaults
+}
+
+function saveCollectorConfig() {
+  try {
+    fs.writeFileSync(
+      COLLECTOR_CONFIG_FILE,
+      JSON.stringify(collectorConfig, null, 2),
+      { mode: 0o600 }
+    );
+  } catch {
+    // Non-fatal
+  }
 }
 
 function captureMacScreenSilent() {
@@ -170,32 +221,450 @@ function captureMacScreenSilent() {
           resolve({
             ok: false,
             error:
-              "macOS Screen Recording permission needed. Allow Terminal / Node in System Settings → Privacy & Security → Screen Recording.",
+              "macOS Screen Recording permission needed. Allow Terminal / Node in System Settings -> Privacy & Security -> Screen Recording.",
           });
           return;
         }
         try {
           const bytes = fs.readFileSync(tempShotPath);
           fs.unlinkSync(tempShotPath);
+          const hash = crypto.createHash("sha256").update(bytes).digest("hex");
+          if (hash === lastFrameHash) {
+            skippedDuplicateCount++;
+            resolve({
+              ok: true,
+              skippedDuplicate: true,
+              appName,
+              windowTitle,
+            });
+            return;
+          }
+          lastFrameHash = hash;
           const imageDataUrl = `data:image/jpeg;base64,${bytes.toString("base64")}`;
           resolve({
             ok: true,
             skippedPrivateApp: false,
+            skippedDuplicate: false,
             appName,
             windowTitle,
             imageDataUrl,
+            bytes,
           });
         } catch {
           try {
             if (fs.existsSync(tempShotPath)) fs.unlinkSync(tempShotPath);
           } catch {
-            // ignore cleanup error
+            // ignore cleanup
           }
           resolve({ ok: false, error: "Failed reading captured frame." });
         }
       }
     );
   });
+}
+
+async function captureAndEnqueueToDisk() {
+  const shot = await captureMacScreenSilent();
+  if (!shot.ok || shot.skippedPrivateApp || shot.skippedDuplicate || !shot.bytes) {
+    return shot;
+  }
+  const id = `q-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+  const jpgPath = path.join(QUEUE_DIR, `${id}.jpg`);
+  const metaPath = path.join(QUEUE_DIR, `${id}.json`);
+  const capturedAtIso = new Date().toISOString();
+  try {
+    fs.writeFileSync(jpgPath, shot.bytes, { mode: 0o600 });
+    fs.writeFileSync(
+      metaPath,
+      JSON.stringify({
+        id,
+        capturedAtIso,
+        appName: shot.appName,
+        windowTitle: shot.windowTitle,
+      }),
+      { mode: 0o600 }
+    );
+    // Cap disk queue at 120 pending screenshots (FIFO)
+    const metas = fs
+      .readdirSync(QUEUE_DIR)
+      .filter((n) => n.endsWith(".json"))
+      .sort();
+    while (metas.length > 120) {
+      const oldest = metas.shift();
+      if (!oldest) break;
+      const base = oldest.replace(/\.json$/, "");
+      try {
+        fs.unlinkSync(path.join(QUEUE_DIR, `${base}.json`));
+        fs.unlinkSync(path.join(QUEUE_DIR, `${base}.jpg`));
+      } catch {
+        // ignore
+      }
+    }
+    return {
+      ok: true,
+      queuedId: id,
+      capturedAtIso,
+      appName: shot.appName,
+      windowTitle: shot.windowTitle,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Queue write failed" };
+  }
+}
+
+function restartCollectorTimer() {
+  if (collectorTimer) {
+    clearInterval(collectorTimer);
+    collectorTimer = null;
+  }
+  if (collectorConfig.enabled && process.platform === "darwin") {
+    const ms = collectorConfig.intervalMinutes * 60 * 1000;
+    collectorTimer = setInterval(() => {
+      void captureAndEnqueueToDisk();
+    }, ms);
+  }
+}
+
+restartCollectorTimer();
+
+function listDiskQueuedCaptures(includeImages = true) {
+  try {
+    const metas = fs
+      .readdirSync(QUEUE_DIR)
+      .filter((n) => /^q-[\w-]+\.json$/.test(n))
+      .sort();
+    const items = [];
+    for (const metaFile of metas.slice(0, 60)) {
+      const base = metaFile.replace(/\.json$/, "");
+      const metaFull = path.join(QUEUE_DIR, metaFile);
+      const jpgFull = path.join(QUEUE_DIR, `${base}.jpg`);
+      if (!fs.existsSync(jpgFull)) continue;
+      const meta = JSON.parse(fs.readFileSync(metaFull, "utf8"));
+      items.push({
+        id: meta.id || base,
+        capturedAtIso: meta.capturedAtIso || new Date().toISOString(),
+        appName: meta.appName || "macOS",
+        windowTitle: meta.windowTitle || "",
+        imageDataUrl: includeImages
+          ? `data:image/jpeg;base64,${fs.readFileSync(jpgFull).toString("base64")}`
+          : "",
+      });
+    }
+    return {
+      ok: true,
+      totalQueued: metas.length,
+      skippedDuplicates: skippedDuplicateCount,
+      collectorEnabled: collectorConfig.enabled,
+      intervalMinutes: collectorConfig.intervalMinutes,
+      items,
+    };
+  } catch {
+    return {
+      ok: true,
+      totalQueued: 0,
+      skippedDuplicates: skippedDuplicateCount,
+      collectorEnabled: collectorConfig.enabled,
+      intervalMinutes: collectorConfig.intervalMinutes,
+      items: [],
+    };
+  }
+}
+
+function acknowledgeQueuedCaptures(ids) {
+  let removed = 0;
+  for (const rawId of ids) {
+    const safeId = String(rawId || "").trim();
+    if (!/^q-[\w-]+$/.test(safeId)) continue;
+    for (const ext of [".json", ".jpg"]) {
+      const p = path.join(QUEUE_DIR, `${safeId}${ext}`);
+      try {
+        if (fs.existsSync(p)) {
+          fs.unlinkSync(p);
+          if (ext === ".jpg") removed++;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return removed;
+}
+
+// ---------------------------------------------------------------------------
+// On-Demand Local Model Lifecycle Manager (0 MB Idle RAM Between Batches!)
+// ---------------------------------------------------------------------------
+let valenProc = null;
+let ollamaProc = null;
+let ollamaSpawnedByBridge = false;
+let lastBatchCompletedIso = null;
+
+function findExecutable(candidates) {
+  for (const p of candidates) {
+    try {
+      if (p && fs.existsSync(p)) return p;
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
+
+function resolveOllamaBinary() {
+  return (
+    findExecutable([
+      "/opt/homebrew/bin/ollama",
+      "/usr/local/bin/ollama",
+      "/Applications/Ollama.app/Contents/Resources/ollama",
+    ]) || "ollama"
+  );
+}
+
+function resolveValenArtifacts(preferredGgufName) {
+  const searchDirs = [MODELS_DIR, path.join(ROOT_DIR, "models"), ROOT_DIR];
+  for (const dir of searchDirs) {
+    if (!fs.existsSync(dir)) continue;
+    const files = fs.readdirSync(dir);
+    const serverBin = findExecutable([
+      path.join(dir, "serve"),
+      path.join(dir, "valen-serve"),
+      path.join(dir, "llama-server"),
+      "/opt/homebrew/bin/llama-server",
+    ]);
+    const mmproj = files.find((f) => /vision.*\.gguf$/i.test(f) || /mmproj.*\.gguf$/i.test(f));
+    const exactModel =
+      preferredGgufName && files.includes(preferredGgufName)
+        ? preferredGgufName
+        : files.find(
+            (f) =>
+              f.toLowerCase().endsWith(".gguf") &&
+              !/vision|mmproj/i.test(f) &&
+              /valen/i.test(f)
+          );
+    if (serverBin && exactModel) {
+      return {
+        serverBin,
+        modelPath: path.join(dir, exactModel),
+        mmprojPath: mmproj ? path.join(dir, mmproj) : null,
+      };
+    }
+  }
+  return null;
+}
+
+async function checkHttpReachable(url, timeoutMs = 1200) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    return r.ok || r.status < 500;
+  } catch {
+    clearTimeout(t);
+    return false;
+  }
+}
+
+async function queryOllamaLifecycle() {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 1400);
+  try {
+    const psRes = await fetch("http://127.0.0.1:11434/api/ps", {
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!psRes.ok) {
+      return { daemonRunning: false, loadedModels: [], residentRamMb: 0 };
+    }
+    const data = await psRes.json();
+    const models = Array.isArray(data.models) ? data.models : [];
+    let totalBytes = 0;
+    const loadedModels = models.map((m) => {
+      const sz = Number(m.size_vram || m.size || 0);
+      totalBytes += sz;
+      return String(m.name || m.model || "model");
+    });
+    return {
+      daemonRunning: true,
+      loadedModels,
+      residentRamMb: Math.round(totalBytes / (1024 * 1024)),
+    };
+  } catch {
+    clearTimeout(t);
+    return { daemonRunning: false, loadedModels: [], residentRamMb: 0 };
+  }
+}
+
+async function wakeValenOnDemand(port = 43823, ggufFile = "") {
+  const safePort = [43823, 8080, 8000, 30000].includes(Number(port))
+    ? Number(port)
+    : 43823;
+
+  if (await checkHttpReachable(`http://127.0.0.1:${safePort}/health`, 900)) {
+    return { ok: true, running: true, spawned: false };
+  }
+
+  const artifacts = resolveValenArtifacts(ggufFile);
+  if (!artifacts) {
+    return {
+      ok: false,
+      running: false,
+      reason:
+        "No local Valen GGUF weights found in ~/.dayframe/models (staying in Standby; Gemma 4 will handle the batch directly).",
+    };
+  }
+
+  const args = [
+    "-m",
+    artifacts.modelPath,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(safePort),
+  ];
+  if (artifacts.mmprojPath) {
+    args.push("--mmproj", artifacts.mmprojPath);
+  }
+
+  valenProc = spawn(artifacts.serverBin, args, {
+    stdio: "ignore",
+    detached: false,
+  });
+  valenProc.on("exit", () => {
+    valenProc = null;
+  });
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (await checkHttpReachable(`http://127.0.0.1:${safePort}/health`, 800)) {
+      return { ok: true, running: true, spawned: true };
+    }
+    await new Promise((r) => setTimeout(r, 450));
+  }
+  return { ok: false, running: false, reason: "Timed out waking Valen server." };
+}
+
+async function stopValenImmediately() {
+  if (!valenProc) {
+    return { ok: true, stopped: false };
+  }
+  const proc = valenProc;
+  valenProc = null;
+  await new Promise((resolve) => {
+    const killTimer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+      resolve();
+    }, 1500);
+    proc.once("exit", () => {
+      clearTimeout(killTimer);
+      resolve();
+    });
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      clearTimeout(killTimer);
+      resolve();
+    }
+  });
+  return { ok: true, stopped: true };
+}
+
+async function wakeOllamaOnDemand() {
+  const existing = await queryOllamaLifecycle();
+  if (existing.daemonRunning) {
+    return { ok: true, running: true, spawnedByBridge: ollamaSpawnedByBridge };
+  }
+
+  const bin = resolveOllamaBinary();
+  try {
+    ollamaProc = spawn(bin, ["serve"], {
+      stdio: "ignore",
+      detached: false,
+      env: {
+        ...process.env,
+        OLLAMA_HOST: "127.0.0.1:11434",
+        OLLAMA_ORIGINS: "*",
+        OLLAMA_NOUPDATE: "1",
+        OLLAMA_KEEP_ALIVE: "90s",
+      },
+    });
+    ollamaSpawnedByBridge = true;
+    ollamaProc.on("exit", () => {
+      ollamaProc = null;
+      ollamaSpawnedByBridge = false;
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      running: false,
+      error: err instanceof Error ? err.message : "Could not launch ollama serve.",
+    };
+  }
+
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    if (await checkHttpReachable("http://127.0.0.1:11434/api/tags", 800)) {
+      return { ok: true, running: true, spawnedByBridge: true };
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return {
+    ok: false,
+    running: false,
+    error: "Timed out waiting for local Ollama daemon on 127.0.0.1:11434.",
+  };
+}
+
+async function unloadAndStopOllama(preferredModel = "") {
+  const state = await queryOllamaLifecycle();
+  const modelsToUnload = new Set(state.loadedModels);
+  if (preferredModel) modelsToUnload.add(preferredModel);
+
+  for (const modelName of modelsToUnload) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      await fetch("http://127.0.0.1:11434/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: ctrl.signal,
+        body: JSON.stringify({ model: modelName, keep_alive: 0 }),
+      });
+      clearTimeout(t);
+    } catch {
+      // Ignore if already unloaded
+    }
+  }
+
+  let daemonStopped = false;
+  if (ollamaProc && ollamaSpawnedByBridge) {
+    const proc = ollamaProc;
+    ollamaProc = null;
+    ollamaSpawnedByBridge = false;
+    await new Promise((resolve) => {
+      const killTimer = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {}
+        resolve();
+      }, 1500);
+      proc.once("exit", () => {
+        clearTimeout(killTimer);
+        resolve();
+      });
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        clearTimeout(killTimer);
+        resolve();
+      }
+    });
+    daemonStopped = true;
+  }
+
+  lastBatchCompletedIso = new Date().toISOString();
+  return { ok: true, unloadedModels: Array.from(modelsToUnload), daemonStopped };
 }
 
 function listAndroidSyncedScreenshots() {
@@ -212,7 +681,8 @@ function listAndroidSyncedScreenshots() {
       const stat = fs.statSync(fullPath);
       if (!stat.isFile() || stat.size > 8 * 1024 * 1024) continue;
       const ext = path.extname(name).toLowerCase().replace(".", "");
-      const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+      const mime =
+        ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
       const dataUrl = `data:${mime};base64,${fs.readFileSync(fullPath).toString("base64")}`;
       images.push({
         filename: name,
@@ -226,6 +696,9 @@ function listAndroidSyncedScreenshots() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// HTTP Loopback Server (127.0.0.1:43822 ONLY — Zero Internet)
+// ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     applyCorsHeaders(req, res);
@@ -240,6 +713,7 @@ const server = http.createServer(async (req, res) => {
     sendJson(req, res, 200, {
       ok: true,
       service: "dayframe-macos-bridge",
+      offlineLoopbackOnly: true,
       platform: process.platform,
       requiresPairing: true,
     });
@@ -256,20 +730,132 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (req.method === "GET" && url.pathname === "/api/status") {
+      const queueSummary = listDiskQueuedCaptures(false);
+      const ollamaState = await queryOllamaLifecycle();
       sendJson(req, res, 200, {
         ok: true,
         platform: process.platform,
         isMac: process.platform === "darwin",
+        offlineLoopbackOnly: true,
         androidSyncFolder: ANDROID_SYNC_DIR,
+        queuedCaptureCount: queueSummary.totalQueued,
+        collectorEnabled: collectorConfig.enabled,
+        collectorIntervalMinutes: collectorConfig.intervalMinutes,
+        modelsSleeping:
+          valenProc === null && ollamaState.loadedModels.length === 0,
+        residentAiRamMb: ollamaState.residentRamMb,
+        lastBatchCompletedIso,
       });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/models/lifecycle") {
+      const port = Number(url.searchParams.get("valenPort")) || 43823;
+      const valenUp = await checkHttpReachable(
+        `http://127.0.0.1:${port}/health`,
+        650
+      );
+      const ollamaState = await queryOllamaLifecycle();
+      sendJson(req, res, 200, {
+        ok: true,
+        valenRunning: valenUp || valenProc !== null,
+        ollamaDaemonRunning: ollamaState.daemonRunning,
+        loadedOllamaModels: ollamaState.loadedModels,
+        residentAiRamMb: ollamaState.residentRamMb,
+        allModelsSleeping: !valenUp && ollamaState.loadedModels.length === 0,
+        lastBatchCompletedIso,
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/models/wake-valen") {
+      const body = await readJsonBody(req);
+      const result = await wakeValenOnDemand(body.port, body.ggufFile);
+      sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/models/stop-valen") {
+      const result = await stopValenImmediately();
+      sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/models/wake-ollama") {
+      const result = await wakeOllamaOnDemand();
+      sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/models/sleep-ollama") {
+      const body = await readJsonBody(req);
+      const valenStopped = await stopValenImmediately();
+      const ollamaStopped = await unloadAndStopOllama(
+        body.model ? String(body.model) : ""
+      );
+      sendJson(req, res, 200, {
+        ok: true,
+        valenStopped: valenStopped.stopped,
+        ...ollamaStopped,
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/collector/config") {
+      const body = await readJsonBody(req);
+      if (typeof body.enabled === "boolean") {
+        collectorConfig.enabled = body.enabled;
+      }
+      if (typeof body.intervalMinutes === "number") {
+        collectorConfig.intervalMinutes = Math.max(
+          1,
+          Math.min(60, Math.round(body.intervalMinutes))
+        );
+      }
+      saveCollectorConfig();
+      restartCollectorTimer();
+      sendJson(req, res, 200, {
+        ok: true,
+        enabled: collectorConfig.enabled,
+        intervalMinutes: collectorConfig.intervalMinutes,
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/capture/enqueue") {
+      const queued = await captureAndEnqueueToDisk();
+      sendJson(req, res, 200, queued);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/capture/queue") {
+      const includeImages = url.searchParams.get("images") !== "0";
+      sendJson(req, res, 200, listDiskQueuedCaptures(includeImages));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/capture/ack") {
+      const body = await readJsonBody(req);
+      const ids = Array.isArray(body.ids) ? body.ids : [];
+      const removed = acknowledgeQueuedCaptures(ids);
+      sendJson(req, res, 200, { ok: true, removed });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/notify") {
+      const body = await readJsonBody(req);
+      const out = await runStaticJxa("notify.jxa", {
+        title: String(body.title || "Dayframe").slice(0, 80),
+        message: String(body.message || "").slice(0, 220),
+      });
+      sendJson(req, res, 200, out);
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/calendar/scan") {
       const body = await readJsonBody(req);
       const startMs = Number(body.startMs) || Date.now();
-      const endMs =
-        Number(body.endMs) || startMs + 7 * 24 * 60 * 60 * 1000;
+      const endMs = Number(body.endMs) || startMs + 7 * 24 * 60 * 60 * 1000;
       const result = await runStaticJxa("read-calendars.jxa", {
         startMs,
         endMs,
@@ -283,8 +869,15 @@ const server = http.createServer(async (req, res) => {
       const title = String(body.title || "Scheduled Block").slice(0, 200);
       const startMs = Number(body.startMs);
       const endMs = Number(body.endMs);
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
-        sendJson(req, res, 400, { ok: false, error: "Invalid start/end timestamps." });
+      if (
+        !Number.isFinite(startMs) ||
+        !Number.isFinite(endMs) ||
+        endMs <= startMs
+      ) {
+        sendJson(req, res, 400, {
+          ok: false,
+          error: "Invalid start/end timestamps.",
+        });
         return;
       }
       const result = await runStaticJxa("write-event.jxa", {
@@ -308,8 +901,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/capture/screen") {
-      const result = await captureMacScreenSilent();
-      sendJson(req, res, 200, result);
+      const shot = await captureMacScreenSilent();
+      if (shot.bytes) delete shot.bytes;
+      sendJson(req, res, 200, shot);
       return;
     }
 
@@ -322,18 +916,24 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const allowedPorts = new Set([43823, 8080, 8000, 30000]);
       const requestedPort = Number(body.port);
-      const targetPort = allowedPorts.has(requestedPort) ? requestedPort : 43823;
-      const payload = body.payload && typeof body.payload === "object" ? body.payload : {};
+      const targetPort = allowedPorts.has(requestedPort)
+        ? requestedPort
+        : 43823;
+      const payload =
+        body.payload && typeof body.payload === "object" ? body.payload : {};
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       try {
-        const upstream = await fetch(`http://127.0.0.1:${targetPort}/v1/decisions`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify(payload),
-        });
+        const upstream = await fetch(
+          `http://127.0.0.1:${targetPort}/v1/decisions`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
+            body: JSON.stringify(payload),
+          }
+        );
         clearTimeout(timer);
         const text = await upstream.text();
         let parsed = {};
@@ -354,7 +954,7 @@ const server = http.createServer(async (req, res) => {
           error:
             e instanceof Error
               ? e.message
-              : `Valen GGUF server not reachable on 127.0.0.1:${targetPort}`,
+              : `Valen GGUF server sleeping on 127.0.0.1:${targetPort}`,
         });
       }
       return;
@@ -369,18 +969,27 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+async function cleanShutdown() {
+  if (collectorTimer) clearInterval(collectorTimer);
+  await stopValenImmediately();
+  await unloadAndStopOllama();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => void cleanShutdown());
+process.on("SIGTERM", () => void cleanShutdown());
+
 server.listen(BRIDGE_PORT, "127.0.0.1", () => {
-  console.log("\n========================================================");
-  console.log("  Dayframe Native macOS Bridge running on 127.0.0.1:43822");
-  console.log("========================================================");
-  console.log(`  Pairing Token: ${PAIRING_TOKEN}`);
-  console.log(`  Android Sync Folder: ${ANDROID_SYNC_DIR}`);
-  console.log(
-    "  Capabilities: macOS Calendar.app (EventKit), Mail.app, Silent screencapture\n"
-  );
+  console.log("\n==============================================================");
+  console.log("  Dayframe Offline macOS Daemon (127.0.0.1:43822)");
+  console.log("==============================================================");
+  console.log("  Network Mode  : 100% Offline Loopback (0 internet calls)");
+  console.log("  AI RAM Policy : Sleeping at 0 MB (wakes ONLY during batches)");
+  console.log(`  Capture Queue : ${QUEUE_DIR}`);
+  console.log(`  Pairing Token : ${PAIRING_TOKEN}\n`);
 
   if (process.argv.includes("--open") && process.platform === "darwin") {
-    const uiPort = process.env.DAYFRAME_UI_PORT || "3000";
+    const uiPort = process.env.DAYFRAME_UI_PORT || "43820";
     const targetUrl = `http://127.0.0.1:${uiPort}/#pair=${PAIRING_TOKEN}`;
     execFile("/usr/bin/open", [targetUrl], () => {});
   }

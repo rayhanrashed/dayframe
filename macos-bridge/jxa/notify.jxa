@@ -1,0 +1,25 @@
+ObjC.import("Foundation");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const title = String(input.title || "Dayframe").slice(0, 80);
+  const message = String(input.message || "Calendar review ready.").slice(0, 220);
+
+  try {
+    const app = Application.currentApplication();
+    app.includeStandardAdditions = true;
+    app.displayNotification(message, {
+      withTitle: title,
+      subtitle: "100% Offline • AI Models Sleeping",
+    });
+    return JSON.stringify({ ok: true });
+  } catch (_err) {
+    return JSON.stringify({ ok: false });
+  }
+}
