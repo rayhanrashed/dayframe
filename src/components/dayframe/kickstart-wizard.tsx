@@ -25,6 +25,7 @@ import {
 } from "@/lib/valen-decision";
 import {
   MacBridgeConnectionState,
+  openMacCalendarPrivacySettings,
   sleepAllModelsViaMacDaemon,
   wakeOllamaViaMacDaemon,
 } from "@/lib/calendar-connectors";
@@ -830,12 +831,31 @@ export function KickstartWizard({
             {scanError && (
               <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-900 dark:text-amber-200">
                 <div className="font-semibold">
-                  Mac Daemon Not Paired Yet
+                  {macBridgeState.paired
+                    ? "macOS Calendar Access Check"
+                    : "Mac Daemon Not Paired Yet"}
                 </div>
                 <p className="mt-1">{scanError}</p>
-                <p className="mt-1.5 text-[11px] opacity-90">
-                  Run <code className="rounded bg-background/60 px-1">./dayframe</code> (or double-click <code className="rounded bg-background/60 px-1">Dayframe.command</code>) on your MacBook, or open your clean workspace below and scan anytime.
-                </p>
+                {macBridgeState.paired ? (
+                  <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() =>
+                        void openMacCalendarPrivacySettings(macPairingToken)
+                      }
+                    >
+                      Open macOS Calendar Privacy Settings
+                    </Button>
+                    <span className="text-[11px] opacity-90">
+                      Tip: If you ran <code>./dayframe</code> inside Cursor&apos;s terminal, macOS checks permission for <strong>Cursor</strong> (not Terminal.app).
+                    </span>
+                  </div>
+                ) : (
+                  <p className="mt-1.5 text-[11px] opacity-90">
+                    Run <code className="rounded bg-background/60 px-1">./dayframe</code> (or double-click <code className="rounded bg-background/60 px-1">Dayframe.command</code>) on your MacBook.
+                  </p>
+                )}
               </div>
             )}
 

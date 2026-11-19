@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>local.dayframe.eventkit-helper</string>
+  <key>CFBundleName</key>
+  <string>Dayframe</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Dayframe reads your existing meetings and writes confirmed prep and focus blocks offline onto your macOS Calendar.</string>
+  <key>NSCalendarsWriteOnlyAccessUsageDescription</key>
+  <string>Dayframe writes confirmed prep and focus blocks onto your macOS Calendar.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>Dayframe organizes prep and focus blocks around your existing macOS Calendar schedule.</string>
+</dict>
+</plist>

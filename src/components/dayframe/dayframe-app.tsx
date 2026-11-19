@@ -287,8 +287,23 @@ export function DayframeApp() {
       }
     });
 
+    const onHashChange = () => {
+      if (window.location.hash.startsWith("#pair=")) {
+        const hashToken = decodeURIComponent(
+          window.location.hash.replace("#pair=", "").trim()
+        );
+        if (hashToken) {
+          setMacPairingToken(hashToken);
+          window.history.replaceState(null, "", window.location.pathname);
+          void probeMacBridge(hashToken).then((st) => setMacBridgeState(st));
+        }
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+
     return () => {
       cancelled = true;
+      window.removeEventListener("hashchange", onHashChange);
     };
   }, []);
 

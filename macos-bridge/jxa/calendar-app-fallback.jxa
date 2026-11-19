@@ -1,0 +1,152 @@
+ObjC.import("Foundation");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const action = input.action || "scan";
+
+  try {
+    const CalendarApp = Application("Calendar");
+    const cals = CalendarApp.calendars();
+
+    if (action === "create") {
+      let targetCal = null;
+      for (let i = 0; i < cals.length; i++) {
+        const c = cals[i];
+        let writable = true;
+        try {
+          writable = Boolean(c.writable());
+        } catch (_e) {
+          writable = true;
+        }
+        if (!writable) continue;
+        const cid = String(c.id ? c.id() : c.name());
+        if (input.calendarId && (cid === input.calendarId || String(c.name()) === input.calendarId)) {
+          targetCal = c;
+          break;
+        }
+        if (!targetCal) targetCal = c;
+      }
+
+      if (!targetCal) {
+        return JSON.stringify({
+          ok: false,
+          error: "No writable calendar found in Calendar.app.",
+        });
+      }
+
+      const ev = CalendarApp.Event({
+        summary: String(input.title || "Scheduled Block"),
+        startDate: new Date(Number(input.startMs)),
+        endDate: new Date(Number(input.endMs)),
+        description: input.notes ? String(input.notes) : "",
+        location: input.location ? String(input.location) : "",
+      });
+      targetCal.events.push(ev);
+
+      return JSON.stringify({
+        ok: true,
+        backend: "calendar-app-automation",
+        externalEventId: ev.uid ? String(ev.uid()) : "calapp-" + Date.now(),
+        calendarTitle: String(targetCal.name()),
+      });
+    }
+
+    const startDate = new Date(input.startMs || Date.now());
+    const endDate = new Date(
+      input.endMs || startDate.getTime() + 7 * 24 * 60 * 60 * 1000
+    );
+
+    const calendars = [];
+    let defaultCalId = "";
+    const events = [];
+
+    for (let i = 0; i < cals.length; i++) {
+      const c = cals[i];
+      const calName = String(c.name());
+      let calId = calName;
+      try {
+        calId = String(c.id());
+      } catch (_e) {
+        calId = calName;
+      }
+      let writable = true;
+      try {
+        writable = Boolean(c.writable());
+      } catch (_e) {
+        writable = true;
+      }
+
+      if (!defaultCalId && writable) {
+        defaultCalId = calId;
+      }
+
+      calendars.push({
+        id: calId,
+        title: calName,
+        sourceTitle: "Calendar.app",
+        allowsModify: writable,
+        isDefault: calId === defaultCalId,
+      });
+
+      try {
+        const filtered = c.events.whose({
+          _and: [
+            { startDate: { _greaterThanEquals: startDate } },
+            { startDate: { _lessThanEquals: endDate } },
+          ],
+        })();
+        const count = Math.min(filtered.length, 60);
+        for (let j = 0; j < count; j++) {
+          const ev = filtered[j];
+          try {
+            if (ev.alldayEvent && ev.alldayEvent()) continue;
+            const s = ev.startDate();
+            const e = ev.endDate();
+            let rec = "";
+            try {
+              rec = String(ev.recurrence() || "");
+            } catch (_r) {
+              rec = "";
+            }
+            events.push({
+              id: ev.uid ? String(ev.uid()) : `cal-${i}-${j}`,
+              title: String(ev.summary() || "Untitled Event"),
+              startIso: new Date(s).toISOString(),
+              endIso: new Date(e).toISOString(),
+              isRecurring: rec.length > 0,
+              location: ev.location ? String(ev.location() || "") : "",
+              notes: "",
+              calendarId: calId,
+              calendarTitle: calName,
+            });
+          } catch (_evErr) {
+            // Skip unreadable individual event
+          }
+        }
+      } catch (_calErr) {
+        // Continue to next calendar
+      }
+    }
+
+    return JSON.stringify({
+      ok: true,
+      backend: "calendar-app-automation",
+      defaultCalendarId: defaultCalId,
+      calendars,
+      events,
+    });
+  } catch (err) {
+    return JSON.stringify({
+      ok: false,
+      error: err && err.message ? String(err.message) : "Calendar.app Automation not authorized.",
+      calendars: [],
+      events: [],
+    });
+  }
+}

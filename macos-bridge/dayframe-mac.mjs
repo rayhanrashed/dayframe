@@ -109,6 +109,117 @@ function readJsonBody(req) {
   });
 }
 
+function detectHostTerminalApp() {
+  const term = String(process.env.TERM_PROGRAM || "");
+  if (process.env.CURSOR_TRACE_ID || /cursor/i.test(term)) return "Cursor";
+  if (term === "vscode") return "Cursor / VS Code";
+  if (term === "iTerm.app") return "iTerm";
+  if (term === "WarpTerminal") return "Warp";
+  if (term === "Apple_Terminal") return "Terminal";
+  return term || "Terminal (or the app where you ran ./dayframe)";
+}
+
+const BIN_DIR = path.join(DAYFRAME_HOME, "bin");
+fs.mkdirSync(BIN_DIR, { recursive: true });
+
+let cachedSwiftHelperPath = null;
+let swiftCompileAttempted = false;
+
+function ensureSwiftEventKitBinary() {
+  if (process.platform !== "darwin") return null;
+  if (cachedSwiftHelperPath && fs.existsSync(cachedSwiftHelperPath)) {
+    return cachedSwiftHelperPath;
+  }
+  if (swiftCompileAttempted) return null;
+  swiftCompileAttempted = true;
+
+  const swiftSrc = path.join(__dirname, "swift", "dayframe-eventkit.swift");
+  const plistPath = path.join(__dirname, "swift", "Info.plist");
+  const outBin = path.join(BIN_DIR, "dayframe-eventkit");
+  const stampFile = path.join(BIN_DIR, "dayframe-eventkit.mtime");
+
+  if (!fs.existsSync("/usr/bin/swiftc") || !fs.existsSync(swiftSrc) || !fs.existsSync(plistPath)) {
+    return null;
+  }
+
+  const srcMtime = String(Math.floor(fs.statSync(swiftSrc).mtimeMs));
+  if (
+    fs.existsSync(outBin) &&
+    fs.existsSync(stampFile) &&
+    fs.readFileSync(stampFile, "utf8").trim() === srcMtime
+  ) {
+    cachedSwiftHelperPath = outBin;
+    return outBin;
+  }
+
+  return new Promise((resolve) => {
+    execFile(
+      "/usr/bin/swiftc",
+      [
+        swiftSrc,
+        "-framework",
+        "EventKit",
+        "-framework",
+        "Foundation",
+        "-Xlinker",
+        "-sectcreate",
+        "-Xlinker",
+        "__TEXT",
+        "-Xlinker",
+        "__info_plist",
+        "-Xlinker",
+        plistPath,
+        "-o",
+        outBin,
+      ],
+      { timeout: 25000 },
+      (err) => {
+        if (err || !fs.existsSync(outBin)) {
+          resolve(null);
+          return;
+        }
+        execFile(
+          "/usr/bin/codesign",
+          ["-s", "-", "--force", "--identifier", "local.dayframe.eventkit-helper", outBin],
+          { timeout: 5000 },
+          () => {
+            try {
+              fs.writeFileSync(stampFile, srcMtime, "utf8");
+            } catch {}
+            cachedSwiftHelperPath = outBin;
+            resolve(outBin);
+          }
+        );
+      }
+    );
+  });
+}
+
+function runSwiftEventKit(binPath, stdinObject = {}) {
+  return new Promise((resolve) => {
+    const child = execFile(
+      binPath,
+      [],
+      { timeout: 22000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err && !stdout) {
+          resolve({ ok: false, error: err.message });
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout.trim()));
+        } catch {
+          resolve({ ok: false, error: "Invalid output from Swift EventKit helper." });
+        }
+      }
+    );
+    if (child.stdin) {
+      child.stdin.write(JSON.stringify(stdinObject));
+      child.stdin.end();
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Static JXA Runner (Calendar.app EventKit, Mail.app, Frontmost App, Notify)
 // ---------------------------------------------------------------------------
@@ -146,6 +257,51 @@ function runStaticJxa(scriptName, stdinObject = {}) {
       child.stdin.end();
     }
   });
+}
+
+async function runCalendarWaterfall(action, payload) {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      error: "macOS Calendar integration requires running ./dayframe on macOS.",
+      calendars: [],
+      events: [],
+    };
+  }
+
+  // Tier 1: Native Swift EventKit helper (embeds NSCalendarsFullAccessUsageDescription in Mach-O Info.plist)
+  const swiftBin = await ensureSwiftEventKitBinary();
+  if (swiftBin) {
+    const swiftRes = await runSwiftEventKit(swiftBin, { action, ...payload });
+    if (swiftRes && swiftRes.ok) {
+      return swiftRes;
+    }
+  }
+
+  // Tier 2: Fixed JXA EventKit (checks authorizationStatusForEntityType(0) === 3 directly)
+  const jxaScript = action === "create" ? "write-event.jxa" : "read-calendars.jxa";
+  const jxaRes = await runStaticJxa(jxaScript, payload);
+  if (jxaRes && jxaRes.ok) {
+    return jxaRes;
+  }
+
+  // Tier 3: Calendar.app AppleEvents Automation fallback (works even if EventKit TCC is tied to another terminal app)
+  const appFallbackRes = await runStaticJxa("calendar-app-fallback.jxa", {
+    action,
+    ...payload,
+  });
+  if (appFallbackRes && appFallbackRes.ok) {
+    return appFallbackRes;
+  }
+
+  const hostApp = detectHostTerminalApp();
+  return {
+    ok: false,
+    hostTerminalApp: hostApp,
+    error: `macOS blocked Calendar access for "${hostApp}". Make sure "${hostApp}" (the exact app where you ran ./dayframe — e.g. Cursor vs Terminal.app) is enabled under System Settings → Privacy & Security → Calendars (and Automation → Calendar).`,
+    calendars: [],
+    events: [],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -852,11 +1008,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/system/open-calendar-privacy") {
+      if (process.platform === "darwin") {
+        execFile(
+          "/usr/bin/open",
+          ["x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars"],
+          () => {}
+        );
+      }
+      sendJson(req, res, 200, { ok: true, hostTerminalApp: detectHostTerminalApp() });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/calendar/scan") {
       const body = await readJsonBody(req);
       const startMs = Number(body.startMs) || Date.now();
       const endMs = Number(body.endMs) || startMs + 7 * 24 * 60 * 60 * 1000;
-      const result = await runStaticJxa("read-calendars.jxa", {
+      const result = await runCalendarWaterfall("scan", {
         startMs,
         endMs,
       });
@@ -880,7 +1048,7 @@ const server = http.createServer(async (req, res) => {
         });
         return;
       }
-      const result = await runStaticJxa("write-event.jxa", {
+      const result = await runCalendarWaterfall("create", {
         title,
         startMs,
         endMs,

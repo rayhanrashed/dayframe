@@ -350,6 +350,20 @@ export async function acknowledgeMacDiskCaptures(params: {
   }
 }
 
+export async function openMacCalendarPrivacySettings(
+  pairingToken: string
+): Promise<void> {
+  if (!pairingToken.trim()) return;
+  try {
+    await fetch(`${MAC_BRIDGE_BASE}/api/system/open-calendar-privacy`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${pairingToken.trim()}` },
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
 export async function sendMacNativeNotification(params: {
   pairingToken: string;
   title: string;

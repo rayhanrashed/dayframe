@@ -11,32 +11,41 @@ function run() {
   const input = readStdinJson();
   const store = $.EKEventStore.alloc.init;
 
-  let granted = false;
-  let done = false;
+  const initialStatus = Number($.EKEventStore.authorizationStatusForEntityType(0));
+  let granted = initialStatus === 3 || initialStatus === 4;
+  let done = initialStatus !== 0;
 
-  if (store.respondsToSelector("requestFullAccessToEventsWithCompletion:")) {
-    store.requestFullAccessToEventsWithCompletion((ok, _err) => {
-      granted = Boolean(ok);
-      done = true;
-    });
-  } else {
-    store.requestAccessToEntityTypeCompletion(0, (ok, _err) => {
-      granted = Boolean(ok);
-      done = true;
-    });
+  if (!done) {
+    if (typeof store.requestFullAccessToEventsWithCompletion === "function") {
+      store.requestFullAccessToEventsWithCompletion((ok, _err) => {
+        granted = Boolean(ok);
+        done = true;
+      });
+    } else {
+      store.requestAccessToEntityTypeCompletion(0, (ok, _err) => {
+        granted = Boolean(ok);
+        done = true;
+      });
+    }
+
+    const startWait = Date.now();
+    while (!done && Date.now() - startWait < 15000) {
+      $.NSRunLoop.currentRunLoop.runUntilDate(
+        $.NSDate.dateWithTimeIntervalSinceNow(0.05)
+      );
+    }
   }
 
-  const startWait = Date.now();
-  while (!done && Date.now() - startWait < 15000) {
-    $.NSRunLoop.currentRunLoop.runUntilDate(
-      $.NSDate.dateWithTimeIntervalSinceNow(0.05)
-    );
+  const finalStatus = Number($.EKEventStore.authorizationStatusForEntityType(0));
+  if (finalStatus === 3 || finalStatus === 4) {
+    granted = true;
   }
 
   if (!granted) {
     return JSON.stringify({
       ok: false,
-      error: "Calendar write permission not granted in macOS System Settings.",
+      authStatus: finalStatus,
+      error: `Calendar write permission not granted (status=${finalStatus}).`,
     });
   }
 

@@ -11,33 +11,42 @@ function run() {
   const input = readStdinJson();
   const store = $.EKEventStore.alloc.init;
 
-  let granted = false;
-  let done = false;
+  // EKAuthorizationStatus: 0=notDetermined, 1=restricted, 2=denied, 3=fullAccess/authorized, 4=writeOnly
+  const initialStatus = Number($.EKEventStore.authorizationStatusForEntityType(0));
+  let granted = initialStatus === 3;
+  let done = initialStatus !== 0;
 
-  if (store.respondsToSelector("requestFullAccessToEventsWithCompletion:")) {
-    store.requestFullAccessToEventsWithCompletion((ok, _err) => {
-      granted = Boolean(ok);
-      done = true;
-    });
-  } else {
-    store.requestAccessToEntityTypeCompletion(0, (ok, _err) => {
-      granted = Boolean(ok);
-      done = true;
-    });
+  if (!done) {
+    if (typeof store.requestFullAccessToEventsWithCompletion === "function") {
+      store.requestFullAccessToEventsWithCompletion((ok, _err) => {
+        granted = Boolean(ok);
+        done = true;
+      });
+    } else {
+      store.requestAccessToEntityTypeCompletion(0, (ok, _err) => {
+        granted = Boolean(ok);
+        done = true;
+      });
+    }
+
+    const startWait = Date.now();
+    while (!done && Date.now() - startWait < 15000) {
+      $.NSRunLoop.currentRunLoop.runUntilDate(
+        $.NSDate.dateWithTimeIntervalSinceNow(0.05)
+      );
+    }
   }
 
-  const startWait = Date.now();
-  while (!done && Date.now() - startWait < 15000) {
-    $.NSRunLoop.currentRunLoop.runUntilDate(
-      $.NSDate.dateWithTimeIntervalSinceNow(0.05)
-    );
+  const finalStatus = Number($.EKEventStore.authorizationStatusForEntityType(0));
+  if (finalStatus === 3) {
+    granted = true;
   }
 
   if (!granted) {
     return JSON.stringify({
       ok: false,
-      error:
-        "Calendar permission not granted yet. Enable Calendar access for Terminal / Node in macOS System Settings → Privacy & Security → Calendars.",
+      authStatus: finalStatus,
+      error: `EventKit JXA status=${finalStatus}`,
       calendars: [],
       events: [],
     });
@@ -94,6 +103,7 @@ function run() {
 
   return JSON.stringify({
     ok: true,
+    backend: "jxa-eventkit",
     defaultCalendarId: defaultCalId,
     calendars,
     events,
