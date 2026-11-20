@@ -14,7 +14,7 @@ import {
   CalendarBlock,
   CalibrationSample,
   DiscussionMessage,
-  EventChatMessage,
+  EventAugmentation,
   EventSubtask,
   GatekeeperStats,
   MacCalendarDescriptor,
@@ -24,6 +24,7 @@ import {
   RelevantPaperRef,
   ScannedEmailItem,
   ScreenshotCapture,
+  StagedCandidateAddition,
   StandingRule,
   SuggestedPreferencePrompt,
   UserModelGraph,
@@ -94,6 +95,12 @@ import {
   upsertTaskModelFromSchedule,
 } from "@/lib/user-task-model";
 import {
+  extractAugmentationFromBlock,
+  getStableEventKey,
+  isProtectedCalendarInvite,
+  mergeAugmentationsIntoBlocks,
+} from "@/lib/event-augmentations";
+import {
   describeCalendar,
   isPersonalUmichCalendar,
   pickDefaultReadCalendarIds,
@@ -108,9 +115,11 @@ import {
   fetchMacAndroidFolderQueue,
   fetchMacDiskCaptureQueue,
   fetchMacModelLifecycle,
+  loadMacEventAugmentations,
   MacBridgeConnectionState,
   probeMacBridge,
   openLocalMacFile,
+  saveMacEventAugmentations,
   scanMacCalendarEvents,
   scanMacMailMessages,
   searchLocalMacPapers,
@@ -139,6 +148,7 @@ interface PersistedWorkspaceV2 {
   gateStats: GatekeeperStats;
   calibrationSamples: CalibrationSample[];
   userGraph: UserModelGraph;
+  eventAugmentations: Record<string, EventAugmentation>;
   macPairingToken: string;
 }
 
@@ -206,6 +216,10 @@ export function DayframeApp() {
   const [userGraph, setUserGraph] = useState<UserModelGraph>(
     DEFAULT_USER_MODEL_GRAPH
   );
+  const [eventAugmentations, setEventAugmentations] = useState<
+    Record<string, EventAugmentation>
+  >({});
+  const eventAugmentationsRef = useRef<Record<string, EventAugmentation>>({});
   const [isInducingModels, setIsInducingModels] = useState(false);
   const [isEnrichingEvent, setIsEnrichingEvent] = useState(false);
   const [scopeDialogOpen, setScopeDialogOpen] = useState(false);
@@ -299,11 +313,12 @@ export function DayframeApp() {
                 parsed.settings.calendarSource === "macos-bridge"
                   ? "macos-bridge"
                   : "none",
-              autoWriteToCalendar: true,
               confirmationPolicy:
-                parsed.settings.confirmationPolicy === "always-ask"
-                  ? "always-ask"
-                  : "auto-high-confidence",
+                parsed.settings.confirmationPolicy === "always-ask" ||
+                parsed.settings.confirmationPolicy === "ask-often" ||
+                parsed.settings.confirmationPolicy === "auto-high-confidence"
+                  ? parsed.settings.confirmationPolicy
+                  : "ask-often",
             };
             if (
               !merged.pinnedWriteCalendar &&
@@ -335,6 +350,10 @@ export function DayframeApp() {
               ...DEFAULT_USER_MODEL_GRAPH,
               ...parsed.userGraph,
             });
+          if (parsed.eventAugmentations) {
+            eventAugmentationsRef.current = parsed.eventAugmentations;
+            setEventAugmentations(parsed.eventAugmentations);
+          }
           if (parsed.macPairingToken) {
             loadedToken = parsed.macPairingToken;
             setMacPairingToken(parsed.macPairingToken);
@@ -383,13 +402,23 @@ export function DayframeApp() {
           calendarSource: "macos-bridge",
           captureEngine: "macos-native",
         }));
-        const [life, calInit] = await Promise.all([
+        const [life, calInit, diskAugs] = await Promise.all([
           fetchMacModelLifecycle({
             pairingToken: loadedToken,
             valenPort: loadedValenPort,
           }),
           scanMacCalendarEvents({ pairingToken: loadedToken, daysAhead: 28 }),
+          loadMacEventAugmentations(loadedToken),
         ]);
+        if (!cancelled && Object.keys(diskAugs).length > 0) {
+          const combined = {
+            ...eventAugmentationsRef.current,
+            ...diskAugs,
+          };
+          eventAugmentationsRef.current = combined;
+          setEventAugmentations(combined);
+          setBlocks((prev) => mergeAugmentationsIntoBlocks(prev, combined));
+        }
         if (!cancelled && life) {
           setModelLifecycle({ ...life, activePhase: "sleeping" });
         }
@@ -454,6 +483,10 @@ export function DayframeApp() {
   }, []);
 
   useEffect(() => {
+    eventAugmentationsRef.current = eventAugmentations;
+  }, [eventAugmentations]);
+
+  useEffect(() => {
     if (!hydrated) return;
     try {
       const payload: PersistedWorkspaceV2 = {
@@ -466,6 +499,7 @@ export function DayframeApp() {
         gateStats,
         calibrationSamples,
         userGraph,
+        eventAugmentations,
         macPairingToken,
       };
       localStorage.setItem(STORAGE_KEY_V3, JSON.stringify(payload));
@@ -476,6 +510,7 @@ export function DayframeApp() {
     blocks,
     calibrationSamples,
     captures,
+    eventAugmentations,
     gateStats,
     hydrated,
     macPairingToken,
@@ -1003,7 +1038,12 @@ export function DayframeApp() {
       }
 
       setCaptures(workingCaptures);
-      setBlocks(workingBlocks);
+      setBlocks(
+        mergeAugmentationsIntoBlocks(
+          workingBlocks,
+          eventAugmentationsRef.current
+        )
+      );
       const proposedCount = workingBlocks.filter(
         (b) => b.status === "proposed"
       ).length;
@@ -2260,7 +2300,10 @@ export function DayframeApp() {
       ),
     }));
     setBlocks(
-      [...mapped, ...localUnsynced].sort(
+      mergeAugmentationsIntoBlocks(
+        [...mapped, ...localUnsynced],
+        eventAugmentationsRef.current
+      ).sort(
         (a, b) =>
           a.dateKey.localeCompare(b.dateKey) ||
           a.startMinutes - b.startMinutes
@@ -2348,38 +2391,29 @@ export function DayframeApp() {
       });
     }
 
-    const [rawMatchedEmails, rawMatchedPapers] =
+    // Only check relevant emails (NEVER auto-search or auto-attach papers behind the user's back!)
+    const rawMatchedEmails =
       macBridgeState.paired && macPairingToken
-        ? await Promise.all([
-            searchMacMailByQuery({
-              pairingToken: macPairingToken,
-              query: parsed.canonicalTitle,
-              limit: 5,
-            }),
-            searchLocalMacPapers({
-              pairingToken: macPairingToken,
-              query: parsed.canonicalTitle,
-            }),
-          ])
-        : [[], []];
+        ? await searchMacMailByQuery({
+            pairingToken: macPairingToken,
+            query: parsed.canonicalTitle,
+            limit: 4,
+          })
+        : [];
 
     let matchedEmails = rawMatchedEmails;
-    let matchedPapers = rawMatchedPapers;
-    if (
-      settings.valenEnabled &&
-      (rawMatchedEmails.length > 0 || rawMatchedPapers.length > 0)
-    ) {
+    const matchedPapers: Awaited<ReturnType<typeof searchLocalMacPapers>> = [];
+    if (settings.valenEnabled && rawMatchedEmails.length > 0) {
       const reranked = await rerankContextItemsWithValen({
         eventTitle: parsed.canonicalTitle,
         emails: rawMatchedEmails,
-        papers: rawMatchedPapers,
+        papers: [],
         modelId: settings.valenModelId,
         port: settings.valenPort,
         macPairingToken,
       });
       if (reranked?.usedValen) {
         matchedEmails = reranked.emails;
-        matchedPapers = reranked.papers;
       }
     }
 
@@ -2503,10 +2537,6 @@ export function DayframeApp() {
               subtasks:
                 enrichedTm.immediateTodos.length > 0
                   ? enrichedTm.immediateTodos
-                  : undefined,
-              relevantPapers:
-                enrichedTm.relevantPapers.length > 0
-                  ? enrichedTm.relevantPapers.slice(0, 4)
                   : undefined,
             }));
 
@@ -2663,7 +2693,6 @@ export function DayframeApp() {
       return;
     }
 
-    // Attach Task Model ID, auto-matched papers, and email context onto created blocks before writing to Calendar.app
     const enrichedCreated = createdBlocks.map((b) => ({
       ...b,
       taskModelId: upserted.taskModel.id,
@@ -2671,10 +2700,6 @@ export function DayframeApp() {
       subtasks:
         upserted.taskModel.immediateTodos.length > 0
           ? upserted.taskModel.immediateTodos
-          : undefined,
-      relevantPapers:
-        upserted.taskModel.relevantPapers.length > 0
-          ? upserted.taskModel.relevantPapers.slice(0, 4)
           : undefined,
     }));
 
@@ -2686,15 +2711,36 @@ export function DayframeApp() {
     showToast(planNote);
   };
 
-  // Syncs updated block details (notes, checklist, papers, title, alarms) back to macOS Calendar.app
-  const persistBlockUpdateToCalendar = async (
+  // Saves private EventAugmentation to ~/.dayframe/event-augmentations.json,
+  // and ONLY updates Calendar.app if the block is a solo 0-attendee Dayframe-owned block!
+  const saveAugmentationAndSyncSoloOnly = async (
     updated: CalendarBlock,
     alarmMinutesBefore?: number
   ) => {
+    const key = getStableEventKey(updated);
+    const nextAugMap = {
+      ...eventAugmentationsRef.current,
+      [key]: extractAugmentationFromBlock(
+        updated,
+        eventAugmentationsRef.current[key]
+      ),
+    };
+    eventAugmentationsRef.current = nextAugMap;
+    setEventAugmentations(nextAugMap);
     setBlocks((prev) =>
       prev.map((b) => (b.id === updated.id ? updated : b))
     );
+
+    if (macBridgeState.paired && macPairingToken) {
+      void saveMacEventAugmentations({
+        pairingToken: macPairingToken,
+        augmentations: nextAugMap,
+      });
+    }
+
+    // HARD GUARD: Never touch shared or external calendar events in Calendar.app!
     if (
+      !isProtectedCalendarInvite(updated) &&
       updated.syncedToExternalCalendar &&
       updated.externalEventId &&
       macBridgeState.paired &&
@@ -2709,9 +2755,145 @@ export function DayframeApp() {
     }
   };
 
-  const handlePullEventContextAndPapers = async (
+  const handleApproveStagedCandidate = async (
     blockId: string,
-    customQuestion?: string
+    cand: StagedCandidateAddition
+  ) => {
+    const target = blocks.find((b) => b.id === blockId);
+    if (!target) return;
+
+    const remainingStaged = (target.stagedCandidates ?? []).filter(
+      (c) => c.id !== cand.id
+    );
+
+    if (cand.kind === "solo-prep-slot" && cand.proposedSlot) {
+      if (!writeCalendarRef.current) {
+        setScopeDialogOpen(true);
+        showToast("Choose your personal UMich calendar first.");
+        return;
+      }
+      const soloPrep: CalendarBlock = {
+        id: `solo-prep-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        title: cand.proposedSlot.sessionTitle,
+        kind: "prep",
+        status: "confirmed",
+        dateKey: cand.proposedSlot.dateKey,
+        startMinutes: cand.proposedSlot.startMinutes,
+        durationMinutes: cand.proposedSlot.durationMinutes,
+        gutMinutes: cand.proposedSlot.durationMinutes,
+        linkedMeetingId: target.id,
+        taskModelId: target.taskModelId,
+        calendarId: writeCalendarRef.current,
+        calendarTitle: settings.writableCalendarTitle,
+        isDayframeCreated: true,
+        attendeeCount: 0,
+        sourceLabel: `Solo Prep (${target.title})`,
+        rationale: `Solo prep block for "${target.title}" (0 attendees — original invite untouched).`,
+        confidence: 1,
+      };
+
+      const written = await pushBlockToExternalCalendar(soloPrep);
+      const updatedTarget: CalendarBlock = {
+        ...target,
+        stagedCandidates: remainingStaged,
+      };
+      const key = getStableEventKey(updatedTarget);
+      const nextAugMap = {
+        ...eventAugmentationsRef.current,
+        [key]: extractAugmentationFromBlock(
+          updatedTarget,
+          eventAugmentationsRef.current[key]
+        ),
+      };
+      eventAugmentationsRef.current = nextAugMap;
+      setEventAugmentations(nextAugMap);
+      if (macBridgeState.paired && macPairingToken) {
+        void saveMacEventAugmentations({
+          pairingToken: macPairingToken,
+          augmentations: nextAugMap,
+        });
+      }
+
+      setBlocks((prev) =>
+        [
+          ...prev.map((b) => (b.id === target.id ? updatedTarget : b)),
+          written,
+        ].sort(
+          (a, b) =>
+            a.dateKey.localeCompare(b.dateKey) ||
+            a.startMinutes - b.startMinutes
+        )
+      );
+      showToast(
+        `Added solo prep block "${written.title}" onto ${settings.writableCalendarTitle}`
+      );
+      return;
+    }
+
+    if (cand.kind === "paper") {
+      const nextPaper: RelevantPaperRef = {
+        id: `pap-${Date.now()}`,
+        title: cand.title,
+        authorsOrVenue: cand.authorsOrVenue,
+        pathOrUrl: cand.pathOrUrl,
+        source: cand.pathOrUrl?.startsWith("/") ? "local-pdf" : "mail-or-slack",
+      };
+      await saveAugmentationAndSyncSoloOnly({
+        ...target,
+        relevantPapers: [...(target.relevantPapers ?? []), nextPaper],
+        stagedCandidates: remainingStaged,
+      });
+      showToast(`Attached "${cand.title}" to private augmentation`);
+      return;
+    }
+
+    if (cand.kind === "subtask") {
+      const nextTodo: EventSubtask = {
+        id: `sub-${Date.now()}`,
+        text: cand.title,
+        done: false,
+        source: "Confirmed",
+      };
+      await saveAugmentationAndSyncSoloOnly({
+        ...target,
+        subtasks: [...(target.subtasks ?? []), nextTodo],
+        stagedCandidates: remainingStaged,
+      });
+      showToast("Added to private checklist");
+      return;
+    }
+
+    if (cand.kind === "context-note") {
+      const combined = [target.notes, cand.detail || cand.title]
+        .filter(Boolean)
+        .join("\n\n")
+        .slice(0, 2600);
+      await saveAugmentationAndSyncSoloOnly({
+        ...target,
+        notes: combined,
+        stagedCandidates: remainingStaged,
+      });
+      showToast("Saved context to private notes");
+    }
+  };
+
+  const handleDismissStagedCandidate = (
+    blockId: string,
+    candidateId: string
+  ) => {
+    const target = blocks.find((b) => b.id === blockId);
+    if (!target) return;
+    void saveAugmentationAndSyncSoloOnly({
+      ...target,
+      stagedCandidates: (target.stagedCandidates ?? []).filter(
+        (c) => c.id !== candidateId
+      ),
+    });
+  };
+
+  const handleSearchEventCandidates = async (
+    blockId: string,
+    scope: "context" | "papers"
   ) => {
     const target = blocks.find((b) => b.id === blockId);
     if (!target) return;
@@ -2719,23 +2901,93 @@ export function DayframeApp() {
     setIsEnrichingEvent(true);
     try {
       const keywords = extractDistinctiveKeywords(target.title);
-      const searchQuery =
-        keywords.join(" ") || target.title.slice(0, 50);
+      const searchQuery = keywords.join(" ") || target.title.slice(0, 50);
 
-      const [matchedEmails, localPapers] =
+      if (scope === "papers") {
+        let localPapers =
+          macBridgeState.paired && macPairingToken
+            ? await searchLocalMacPapers({
+                pairingToken: macPairingToken,
+                query: searchQuery,
+              })
+            : [];
+
+        if (settings.valenEnabled && localPapers.length > 0) {
+          const reranked = await rerankContextItemsWithValen({
+            eventTitle: target.title,
+            eventNotes: target.notes,
+            emails: [],
+            papers: localPapers,
+            modelId: settings.valenModelId,
+            port: settings.valenPort,
+            macPairingToken,
+          });
+          if (reranked?.usedValen) {
+            localPapers = reranked.papers;
+          }
+        }
+
+        const existingTitles = new Set(
+          (target.relevantPapers ?? []).map((p) => p.title.toLowerCase())
+        );
+        const newPaperCandidates: StagedCandidateAddition[] = localPapers
+          .filter((p) => !existingTitles.has(p.title.toLowerCase()))
+          .map((p, idx) => ({
+            id: `cand-pdf-${Date.now()}-${idx}`,
+            kind: "paper",
+            title: p.title,
+            pathOrUrl: p.path,
+            reason: `Matched filename in ${p.path}`,
+          }));
+
+        const reply =
+          newPaperCandidates.length > 0
+            ? `Found ${newPaperCandidates.length} local PDF candidate(s) matching "${searchQuery}". Review and click Attach above on any you want to keep.`
+            : `No local PDF filenames in ~/Documents, ~/Downloads, or ~/Desktop matched "${searchQuery}". You can attach a paper manually in the Papers tab.`;
+
+        await saveAugmentationAndSyncSoloOnly({
+          ...target,
+          stagedCandidates: [
+            ...(target.stagedCandidates ?? []),
+            ...newPaperCandidates,
+          ],
+          eventChat: [
+            ...(target.eventChat ?? []),
+            {
+              id: `ec-a-${Date.now()}`,
+              role: "assistant",
+              text: reply,
+              timestampIso: new Date().toISOString(),
+            },
+          ],
+        });
+        return;
+      }
+
+      // scope === "context": Check Mail & Slack captures ONLY (no silent paper search!)
+      let matchedEmails =
         macBridgeState.paired && macPairingToken
-          ? await Promise.all([
-              searchMacMailByQuery({
-                pairingToken: macPairingToken,
-                query: searchQuery,
-                limit: 5,
-              }),
-              searchLocalMacPapers({
-                pairingToken: macPairingToken,
-                query: searchQuery,
-              }),
-            ])
-          : [[], []];
+          ? await searchMacMailByQuery({
+              pairingToken: macPairingToken,
+              query: searchQuery,
+              limit: 5,
+            })
+          : [];
+
+      if (settings.valenEnabled && matchedEmails.length > 0) {
+        const reranked = await rerankContextItemsWithValen({
+          eventTitle: target.title,
+          eventNotes: target.notes,
+          emails: matchedEmails,
+          papers: [],
+          modelId: settings.valenModelId,
+          port: settings.valenPort,
+          macPairingToken,
+        });
+        if (reranked?.usedValen) {
+          matchedEmails = reranked.emails;
+        }
+      }
 
       const matchedCaps = matchCapturesForKeywords(keywords, captures).map(
         (c) => ({
@@ -2752,8 +3004,7 @@ export function DayframeApp() {
 
       let replyText = "";
       let digest = "";
-      let newTodoStrings: string[] = [];
-      let aiPapers: Array<{ title: string; authorsOrVenue?: string }> = [];
+      let todoStrings: string[] = [];
 
       if (gStat.reachable) {
         const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
@@ -2761,136 +3012,55 @@ export function DayframeApp() {
           model: tag,
           event: target,
           userPrompt:
-            customQuestion ||
-            "Read all matched emails, Slack/screen context, and local PDFs. Summarize what matters for this event, list immediate concrete action items, and note relevant papers.",
+            "Summarize any relevant email/Slack context for this event and suggest concrete prep/follow-up todos. Do NOT invent papers.",
           matchedEmails,
           matchedCaptures: matchedCaps,
-          localPapers,
+          localPapers: [],
           userGraph,
         });
-        if (enriched.ok) {
-          replyText = enriched.reply;
-          digest = enriched.contextDigest || "";
-          newTodoStrings = enriched.immediateTodos;
-          aiPapers = enriched.suggestedPapers;
-        } else {
-          replyText = enriched.reply;
-        }
+        replyText = enriched.reply;
+        digest = enriched.contextDigest || "";
+        todoStrings = enriched.immediateTodos;
       } else {
-        replyText = `Found ${matchedEmails.length} matching email(s), ${matchedCaps.length} screen/Slack frame(s), and ${localPapers.length} local PDF(s). (Install/start local Ollama to run Gemma 4 synthesis.)`;
+        replyText = `Found ${matchedEmails.length} related email(s) and ${matchedCaps.length} captured Slack/window frame(s).`;
       }
 
-      const existingTodos = target.subtasks ?? [];
-      const existingTodoTexts = new Set(
-        existingTodos.map((t) => t.text.toLowerCase())
-      );
-      const addedTodos: EventSubtask[] = newTodoStrings
-        .filter((t) => !existingTodoTexts.has(t.toLowerCase()))
-        .map((t, idx) => ({
-          id: `sub-${Date.now()}-${idx}`,
-          text: t,
-          done: false,
-          source: "Gemma 4 Context",
-        }));
+      const newCandidates: StagedCandidateAddition[] = [];
+      if (digest) {
+        newCandidates.push({
+          id: `cand-note-${Date.now()}`,
+          kind: "context-note",
+          title: "Save context summary to private notes",
+          detail: digest,
+        });
+      }
+      for (let i = 0; i < todoStrings.length; i++) {
+        newCandidates.push({
+          id: `cand-todo-${Date.now()}-${i}`,
+          kind: "subtask",
+          title: todoStrings[i],
+        });
+      }
 
-      const existingPapers = target.relevantPapers ?? [];
-      const existingPaperTitles = new Set(
-        existingPapers.map((p) => p.title.toLowerCase())
-      );
-      const localPaperRefs: RelevantPaperRef[] = localPapers
-        .filter((p) => !existingPaperTitles.has(p.title.toLowerCase()))
-        .map((p, idx) => ({
-          id: `lp-${Date.now()}-${idx}`,
-          title: p.title,
-          pathOrUrl: p.path,
-          source: "local-pdf",
-        }));
-      const aiPaperRefs: RelevantPaperRef[] = aiPapers
-        .filter(
-          (p) =>
-            !existingPaperTitles.has(p.title.toLowerCase()) &&
-            !localPaperRefs.some(
-              (lp) => lp.title.toLowerCase() === p.title.toLowerCase()
-            )
-        )
-        .map((p, idx) => ({
-          id: `ap-${Date.now()}-${idx}`,
-          title: p.title,
-          authorsOrVenue: p.authorsOrVenue,
-          source: "mail-or-slack",
-        }));
-
-      const emailBrief =
-        matchedEmails.length > 0
-          ? matchedEmails
-              .slice(0, 2)
-              .map((m) => `• Mail (${m.subject}): ${m.snippet.slice(0, 180)}`)
-              .join("\n")
-          : "";
-      const combinedNotes = [target.notes, digest, emailBrief]
-        .filter(Boolean)
-        .join("\n\n")
-        .slice(0, 2400);
-
-      const chatAddition: EventChatMessage[] = [
-        ...(customQuestion
-          ? [
-              {
-                id: `ec-u-${Date.now()}`,
-                role: "user" as const,
-                text: customQuestion,
-                timestampIso: new Date().toISOString(),
-              },
-            ]
-          : []),
-        {
-          id: `ec-a-${Date.now() + 1}`,
-          role: "assistant" as const,
-          text: replyText,
-          timestampIso: new Date().toISOString(),
-          actionBadge: `Linked ${matchedEmails.length} mail · ${
-            localPaperRefs.length + aiPaperRefs.length
-          } papers · ${addedTodos.length} todos`,
-        },
-      ];
-
-      const updatedBlock: CalendarBlock = {
+      await saveAugmentationAndSyncSoloOnly({
         ...target,
-        notes: combinedNotes || target.notes,
-        subtasks: [...existingTodos, ...addedTodos],
-        relevantPapers: [...existingPapers, ...localPaperRefs, ...aiPaperRefs],
-        eventChat: [...(target.eventChat ?? []), ...chatAddition],
-      };
-
-      await persistBlockUpdateToCalendar(updatedBlock);
-
-      // Also enrich matching Task-Specific Model
-      const up = upsertTaskModelFromSchedule({
-        graph: userGraph,
-        canonicalTitle: target.title,
-        typicalSessionMinutes: target.durationMinutes,
-        matchedEmails,
-        matchedPapers: localPapers,
-      });
-      setUserGraph({
-        ...up.graph,
-        taskModels: up.graph.taskModels.map((m) =>
-          m.id === up.taskModel.id
-            ? {
-                ...m,
-                summary: digest || m.summary,
-                immediateTodos: [
-                  ...m.immediateTodos,
-                  ...addedTodos.filter(
-                    (td) =>
-                      !m.immediateTodos.some(
-                        (x) => x.text.toLowerCase() === td.text.toLowerCase()
-                      )
-                  ),
-                ],
-              }
-            : m
-        ),
+        stagedCandidates: [
+          ...(target.stagedCandidates ?? []),
+          ...newCandidates,
+        ],
+        eventChat: [
+          ...(target.eventChat ?? []),
+          {
+            id: `ec-a-${Date.now() + 1}`,
+            role: "assistant",
+            text: replyText,
+            timestampIso: new Date().toISOString(),
+            actionBadge:
+              newCandidates.length > 0
+                ? `${newCandidates.length} candidate(s) ready to confirm`
+                : undefined,
+          },
+        ],
       });
     } finally {
       if (settings.unloadModelsAfterBatch) {
@@ -2908,7 +3078,11 @@ export function DayframeApp() {
     const target = blocks.find((b) => b.id === blockId);
     if (!target) return;
 
-    // 1. Model-First Path: Route with Valen-Decision-1.5 + Execute multi-action plan with Gemma 4!
+    const isReadOnlyInvite = isProtectedCalendarInvite(target);
+    const explicitlyAskedForPapers = /\b(paper|papers|pdf|pdfs|arxiv|literature)\b/i.test(
+      text
+    );
+
     setIsEnrichingEvent(true);
     try {
       const valenRoute = settings.valenEnabled
@@ -2925,46 +3099,26 @@ export function DayframeApp() {
       const keywords = extractDistinctiveKeywords(target.title);
       const searchQuery = keywords.join(" ") || target.title.slice(0, 50);
 
-      const shouldFetchContext =
-        valenRoute?.needsContextSearch !== false ||
-        valenRoute?.intent === "pull_external_context" ||
-        valenRoute?.intent === "copilot_question";
-
       let matchedEmails: ScannedEmailItem[] = [];
       let localPapers: Awaited<ReturnType<typeof searchLocalMacPapers>> = [];
 
-      if (shouldFetchContext && macBridgeState.paired && macPairingToken) {
-        const [rawEmails, rawPapers] = await Promise.all([
-          searchMacMailByQuery({
+      if (macBridgeState.paired && macPairingToken) {
+        if (
+          valenRoute?.needsContextSearch ||
+          /\b(email|emails|mail|slack|context|discuss|thread)\b/i.test(text)
+        ) {
+          matchedEmails = await searchMacMailByQuery({
             pairingToken: macPairingToken,
             query: searchQuery,
             limit: 5,
-          }),
-          searchLocalMacPapers({
+          });
+        }
+        // ONLY search PDFs when the user explicitly asks about papers/PDFs!
+        if (explicitlyAskedForPapers) {
+          localPapers = await searchLocalMacPapers({
             pairingToken: macPairingToken,
             query: searchQuery,
-          }),
-        ]);
-        matchedEmails = rawEmails;
-        localPapers = rawPapers;
-
-        if (
-          settings.valenEnabled &&
-          (rawEmails.length > 0 || rawPapers.length > 0)
-        ) {
-          const reranked = await rerankContextItemsWithValen({
-            eventTitle: target.title,
-            eventNotes: target.notes,
-            emails: rawEmails,
-            papers: rawPapers,
-            modelId: settings.valenModelId,
-            port: settings.valenPort,
-            macPairingToken,
           });
-          if (reranked?.usedValen) {
-            matchedEmails = reranked.emails;
-            localPapers = reranked.papers;
-          }
         }
       }
 
@@ -2996,23 +3150,17 @@ export function DayframeApp() {
         });
 
         if (turn.ok) {
-          let workingBlocks = [...blocks];
-          const badges: string[] = [];
+          const newCandidates: StagedCandidateAddition[] = [];
 
-          // A. Schedule any requested prep/work blocks around this event
+          // A. Stage proposed solo prep/work slots for explicit user confirmation!
           if (turn.sessionsToSchedule.length > 0) {
-            if (!writeCalendarRef.current) {
-              setScopeDialogOpen(true);
-              showToast("Choose your personal UMich calendar first.");
-              return;
-            }
-            const placed = placeCompiledSessionsOntoCalendar({
+            const previewPlacement = placeCompiledSessionsOntoCalendar({
               canonicalTitle: target.title,
               sessions: turn.sessionsToSchedule,
               linkedMeetingId: target.id,
               taskModelId: target.taskModelId,
-              sourceLabel: `Event Chat (${target.title})`,
-              blocks: workingBlocks,
+              sourceLabel: `Solo Prep (${target.title})`,
+              blocks,
               rules,
               settings: {
                 ...settings,
@@ -3020,52 +3168,51 @@ export function DayframeApp() {
               },
               todayKey,
             });
-            const written: CalendarBlock[] = [];
-            for (const c of placed.created) {
-              written.push(await pushBlockToExternalCalendar(c));
-            }
-            workingBlocks = placed.blocks.map(
-              (b) => written.find((w) => w.id === b.id) ?? b
-            );
-            if (written.length > 0) {
-              badges.push(`Scheduled ${written.length} block(s)`);
+            for (const c of previewPlacement.created) {
+              newCandidates.push({
+                id: `cand-slot-${c.id}`,
+                kind: "solo-prep-slot",
+                title: c.title,
+                reason: "Solo block (0 attendees) — original invite is untouched",
+                proposedSlot: {
+                  sessionTitle: c.title,
+                  dateKey: c.dateKey,
+                  startMinutes: c.startMinutes,
+                  durationMinutes: c.durationMinutes,
+                },
+              });
             }
           }
 
-          // B. Apply updates to the target event itself (subtasks, papers, reminders, notes, rename, resize)
-          const existingTodos = target.subtasks ?? [];
-          const newSubs: EventSubtask[] = turn.subtasksToAdd
-            .filter(
-              (t) =>
-                !existingTodos.some(
-                  (ex) => ex.text.toLowerCase() === t.toLowerCase()
-                )
-            )
-            .map((t, i) => ({
-              id: `sub-${Date.now()}-${i}`,
-              text: t,
-              done: false,
-              source: "Gemma 4",
-            }));
-          if (newSubs.length > 0) badges.push(`+${newSubs.length} todo(s)`);
+          // B. Stage todos, notes, and (only if explicitly requested!) papers as confirmable candidates
+          for (let i = 0; i < turn.subtasksToAdd.length; i++) {
+            newCandidates.push({
+              id: `cand-sub-${Date.now()}-${i}`,
+              kind: "subtask",
+              title: turn.subtasksToAdd[i],
+            });
+          }
 
-          const existingPapers = target.relevantPapers ?? [];
-          const newPaperRefs: RelevantPaperRef[] = turn.papersToAttach
-            .filter(
-              (p) =>
-                !existingPapers.some(
-                  (ex) => ex.title.toLowerCase() === p.title.toLowerCase()
-                )
-            )
-            .map((p, i) => ({
-              id: `pap-${Date.now()}-${i}`,
-              title: p.title,
-              authorsOrVenue: p.authorsOrVenue,
-              pathOrUrl: p.pathOrUrl,
-              source: p.pathOrUrl?.startsWith("/") ? "local-pdf" : "mail-or-slack",
-            }));
-          if (newPaperRefs.length > 0) {
-            badges.push(`+${newPaperRefs.length} paper(s)`);
+          if (turn.notesDigestToAppend) {
+            newCandidates.push({
+              id: `cand-note-${Date.now()}`,
+              kind: "context-note",
+              title: "Save synthesized context to private notes",
+              detail: turn.notesDigestToAppend,
+            });
+          }
+
+          if (explicitlyAskedForPapers) {
+            for (let i = 0; i < turn.papersToAttach.length; i++) {
+              const p = turn.papersToAttach[i];
+              newCandidates.push({
+                id: `cand-pap-${Date.now()}-${i}`,
+                kind: "paper",
+                title: p.title,
+                authorsOrVenue: p.authorsOrVenue,
+                pathOrUrl: p.pathOrUrl,
+              });
+            }
           }
 
           const newReminders = turn.remindersToAdd.map((r, i) => ({
@@ -3073,42 +3220,21 @@ export function DayframeApp() {
             text: r.text,
             leadMinutes: r.leadMinutes,
           }));
-          if (newReminders.length > 0) {
-            badges.push(`Alert ${newReminders[0].leadMinutes}m before`);
-          }
 
-          const nextNotes = [target.notes, turn.notesDigestToAppend]
-            .filter(Boolean)
-            .join("\n\n")
-            .slice(0, 2600);
-
-          let nextDateKey = target.dateKey;
-          let nextStart = target.startMinutes;
-          const nextDur = turn.resizeMinutesTo ?? target.durationMinutes;
-          if (turn.moveToDateKey && turn.moveToDateKey !== target.dateKey) {
-            const slot = findOpenSlot({
-              dateKey: turn.moveToDateKey,
-              durationMinutes: nextDur,
-              blocks: workingBlocks.filter((b) => b.id !== target.id),
-              rules,
-              settings,
-            });
-            nextDateKey = turn.moveToDateKey;
-            if (slot !== null) nextStart = slot;
-            badges.push(`Moved → ${nextDateKey}`);
-          }
-
+          // Never mutate title/duration/date of a protected external/shared invite!
           const updatedTarget: CalendarBlock = {
             ...target,
-            title: turn.renameTitleTo || target.title,
-            userEditedTitle: Boolean(turn.renameTitleTo) || target.userEditedTitle,
-            dateKey: nextDateKey,
-            startMinutes: nextStart,
-            durationMinutes: nextDur,
-            notes: nextNotes || target.notes,
-            subtasks: [...existingTodos, ...newSubs],
-            relevantPapers: [...existingPapers, ...newPaperRefs],
+            title: !isReadOnlyInvite && turn.renameTitleTo
+              ? turn.renameTitleTo
+              : target.title,
+            durationMinutes: !isReadOnlyInvite && turn.resizeMinutesTo
+              ? turn.resizeMinutesTo
+              : target.durationMinutes,
             reminders: [...(target.reminders ?? []), ...newReminders],
+            stagedCandidates: [
+              ...(target.stagedCandidates ?? []),
+              ...newCandidates,
+            ],
             eventChat: [
               ...(target.eventChat ?? []),
               {
@@ -3120,36 +3246,25 @@ export function DayframeApp() {
               {
                 id: `ec-a-${Date.now() + 1}`,
                 role: "assistant",
-                text: turn.reply,
+                text:
+                  newCandidates.length > 0
+                    ? `${turn.reply}\n\n(Staged ${newCandidates.length} item${
+                        newCandidates.length === 1 ? "" : "s"
+                      } above — click Confirm / Attach to apply.)`
+                    : turn.reply,
                 timestampIso: new Date().toISOString(),
-                actionBadge: badges.length > 0 ? badges.join(" · ") : undefined,
+                actionBadge:
+                  newCandidates.length > 0
+                    ? `Awaiting confirmation (${newCandidates.length})`
+                    : undefined,
               },
             ],
           };
 
-          setBlocks(
-            workingBlocks
-              .map((b) => (b.id === target.id ? updatedTarget : b))
-              .sort(
-                (a, b) =>
-                  a.dateKey.localeCompare(b.dateKey) ||
-                  a.startMinutes - b.startMinutes
-              )
+          await saveAugmentationAndSyncSoloOnly(
+            updatedTarget,
+            !isReadOnlyInvite ? newReminders[0]?.leadMinutes : undefined
           );
-
-          if (
-            updatedTarget.syncedToExternalCalendar &&
-            updatedTarget.externalEventId &&
-            macBridgeState.paired &&
-            macPairingToken
-          ) {
-            await updateBlockOnMacCalendar({
-              pairingToken: macPairingToken,
-              eventId: updatedTarget.externalEventId,
-              block: updatedTarget,
-              alarmMinutesBefore: newReminders[0]?.leadMinutes,
-            });
-          }
           return;
         }
       }
@@ -3164,43 +3279,10 @@ export function DayframeApp() {
       setIsEnrichingEvent(false);
     }
 
-    // 2. Offline Fallback Heuristic (used only when local Ollama is unreachable)
+    // Offline Fallback Heuristic (also stages prep slots for confirmation rather than auto-writing!)
     const intent = parseEventChatCommand(text);
-    const appendChatPair = async (
-      base: CalendarBlock,
-      reply: string,
-      actionBadge?: string,
-      alarmMins?: number
-    ) => {
-      const next: CalendarBlock = {
-        ...base,
-        eventChat: [
-          ...(base.eventChat ?? []),
-          {
-            id: `ec-u-${Date.now()}`,
-            role: "user",
-            text,
-            timestampIso: new Date().toISOString(),
-          },
-          {
-            id: `ec-a-${Date.now() + 1}`,
-            role: "assistant",
-            text: reply,
-            timestampIso: new Date().toISOString(),
-            actionBadge,
-          },
-        ],
-      };
-      await persistBlockUpdateToCalendar(next, alarmMins);
-    };
-
     if (intent.kind === "schedule-blocks-for-event") {
-      if (!writeCalendarRef.current) {
-        setScopeDialogOpen(true);
-        showToast("Choose your personal UMich calendar first.");
-        return;
-      }
-      const res = scheduleBlocksForTargetEvent({
+      const preview = scheduleBlocksForTargetEvent({
         targetEvent: target,
         count: intent.count,
         durationMinutesEach: intent.durationMinutesEach,
@@ -3213,46 +3295,53 @@ export function DayframeApp() {
         },
         todayKey,
       });
-
-      const written: CalendarBlock[] = [];
-      for (const blk of res.created) {
-        written.push(await pushBlockToExternalCalendar(blk));
-      }
-
-      const nextChat: EventChatMessage[] = [
-        ...(target.eventChat ?? []),
-        {
-          id: `ec-u-${Date.now()}`,
-          role: "user",
-          text,
-          timestampIso: new Date().toISOString(),
-        },
-        {
-          id: `ec-a-${Date.now() + 1}`,
-          role: "assistant",
-          text: res.note,
-          timestampIso: new Date().toISOString(),
-          actionBadge:
-            written.length > 0
-              ? `Scheduled ${written.length} block(s)`
-              : undefined,
-        },
-      ];
-
-      setBlocks(
-        res.blocks.map((b) => {
-          const w = written.find((x) => x.id === b.id);
-          if (w) return w;
-          if (b.id === target.id) return { ...b, eventChat: nextChat };
-          return b;
+      const slotCandidates: StagedCandidateAddition[] = preview.created.map(
+        (c) => ({
+          id: `cand-fb-${c.id}`,
+          kind: "solo-prep-slot",
+          title: c.title,
+          reason: "Solo block (0 attendees) — original invite is untouched",
+          proposedSlot: {
+            sessionTitle: c.title,
+            dateKey: c.dateKey,
+            startMinutes: c.startMinutes,
+            durationMinutes: c.durationMinutes,
+          },
         })
       );
-      showToast(res.note);
+      await saveAugmentationAndSyncSoloOnly({
+        ...target,
+        stagedCandidates: [
+          ...(target.stagedCandidates ?? []),
+          ...slotCandidates,
+        ],
+        eventChat: [
+          ...(target.eventChat ?? []),
+          {
+            id: `ec-u-${Date.now()}`,
+            role: "user",
+            text,
+            timestampIso: new Date().toISOString(),
+          },
+          {
+            id: `ec-a-${Date.now() + 1}`,
+            role: "assistant",
+            text:
+              slotCandidates.length > 0
+                ? `Proposed ${slotCandidates.length} solo prep slot(s) above — click "Add Solo Block" to place on your UMich calendar.`
+                : preview.note,
+            timestampIso: new Date().toISOString(),
+          },
+        ],
+      });
       return;
     }
 
     if (intent.kind === "pull-context-and-papers") {
-      await handlePullEventContextAndPapers(blockId, text);
+      await handleSearchEventCandidates(
+        blockId,
+        explicitlyAskedForPapers ? "papers" : "context"
+      );
       return;
     }
 
@@ -3262,73 +3351,29 @@ export function DayframeApp() {
         text: intent.todoText,
         done: false,
       };
-      await appendChatPair(
-        { ...target, subtasks: [...(target.subtasks ?? []), sub] },
-        `Added "${intent.todoText}" to this block's checklist and synced to Calendar.app.`,
-        "Todo added"
-      );
+      await saveAugmentationAndSyncSoloOnly({
+        ...target,
+        subtasks: [...(target.subtasks ?? []), sub],
+        eventChat: [
+          ...(target.eventChat ?? []),
+          {
+            id: `ec-u-${Date.now()}`,
+            role: "user",
+            text,
+            timestampIso: new Date().toISOString(),
+          },
+          {
+            id: `ec-a-${Date.now() + 1}`,
+            role: "assistant",
+            text: `Saved "${intent.todoText}" to private checklist (invite untouched).`,
+            timestampIso: new Date().toISOString(),
+          },
+        ],
+      });
       return;
     }
 
-    if (intent.kind === "add-reminder") {
-      const lead = intent.leadMinutes ?? 30;
-      const rem = {
-        id: `rem-${Date.now()}`,
-        text: intent.reminderText,
-        leadMinutes: lead,
-      };
-      await appendChatPair(
-        { ...target, reminders: [...(target.reminders ?? []), rem] },
-        `Set reminder ${lead}m before: "${intent.reminderText}".`,
-        `Alert ${lead}m before`,
-        lead
-      );
-      return;
-    }
-
-    if (intent.kind === "add-paper") {
-      const paper: RelevantPaperRef = {
-        id: `pap-${Date.now()}`,
-        title: intent.paperTitle,
-        pathOrUrl: intent.url,
-        source: "manual",
-      };
-      await appendChatPair(
-        {
-          ...target,
-          relevantPapers: [...(target.relevantPapers ?? []), paper],
-        },
-        `Attached paper "${intent.paperTitle}" to this event.`,
-        "Paper attached"
-      );
-      return;
-    }
-
-    if (intent.kind === "rename-event") {
-      await appendChatPair(
-        { ...target, title: intent.newTitle, userEditedTitle: true },
-        `Renamed event to "${intent.newTitle}".`,
-        "Renamed"
-      );
-      return;
-    }
-
-    if (intent.kind === "resize-event") {
-      await appendChatPair(
-        { ...target, durationMinutes: intent.durationMinutes },
-        `Resized block to ${formatDuration(intent.durationMinutes)}.`,
-        `Resized → ${formatDuration(intent.durationMinutes)}`
-      );
-      return;
-    }
-
-    if (intent.kind === "move-event-days") {
-      handleShiftBlockDate(blockId, intent.deltaDays);
-      return;
-    }
-
-    // Default: full Gemma 4 contextual co-pilot question
-    await handlePullEventContextAndPapers(blockId, intent.prompt);
+    await handleSearchEventCandidates(blockId, "context");
   };
 
   const handleInduceModelsNow = async () => {
@@ -3921,6 +3966,11 @@ export function DayframeApp() {
       {(() => {
         const activeBlock =
           blocks.find((b) => b.id === selectedBlockId) ?? null;
+        const activeLinkedPreps = activeBlock
+          ? blocks.filter(
+              (b) => b.kind === "prep" && b.linkedMeetingId === activeBlock.id
+            )
+          : [];
         const activeCapture = activeBlock?.sourceCaptureId
           ? (captures.find((c) => c.id === activeBlock.sourceCaptureId) ?? null)
           : null;
@@ -3934,18 +3984,21 @@ export function DayframeApp() {
           <EventWorkspaceDialog
             todayKey={todayKey}
             block={activeBlock}
+            linkedPrepBlocks={activeLinkedPreps}
             linkedTaskModel={activeTm}
             linkedCapture={activeCapture}
             isBusyEnriching={isEnrichingEvent}
             onClose={() => setSelectedBlockId(null)}
             onSendEventChat={handleSendEventChat}
-            onPullContextAndPapers={(id) =>
-              handlePullEventContextAndPapers(id)
+            onSearchCandidates={(id, scope) =>
+              handleSearchEventCandidates(id, scope)
             }
+            onApproveStagedCandidate={handleApproveStagedCandidate}
+            onDismissStagedCandidate={handleDismissStagedCandidate}
             onRenameEvent={(id, newTitle) => {
               const found = blocks.find((b) => b.id === id);
-              if (!found) return;
-              void persistBlockUpdateToCalendar({
+              if (!found || isProtectedCalendarInvite(found)) return;
+              void saveAugmentationAndSyncSoloOnly({
                 ...found,
                 title: newTitle,
                 userEditedTitle: true,
@@ -3954,8 +4007,11 @@ export function DayframeApp() {
             onSaveEventNotes={(id, nextNotes) => {
               const found = blocks.find((b) => b.id === id);
               if (!found) return;
-              void persistBlockUpdateToCalendar({ ...found, notes: nextNotes });
-              showToast("Saved notes & synced to Calendar.app");
+              void saveAugmentationAndSyncSoloOnly({
+                ...found,
+                notes: nextNotes,
+              });
+              showToast("Saved to private augmentation inside Dayframe");
             }}
             onToggleSubtask={(id, subId) => {
               const found = blocks.find((b) => b.id === id);
@@ -3963,7 +4019,7 @@ export function DayframeApp() {
               const nextSubs = (found.subtasks ?? []).map((s) =>
                 s.id === subId ? { ...s, done: !s.done } : s
               );
-              void persistBlockUpdateToCalendar({
+              void saveAugmentationAndSyncSoloOnly({
                 ...found,
                 subtasks: nextSubs,
               });
@@ -3975,7 +4031,7 @@ export function DayframeApp() {
                 ...(found.subtasks ?? []),
                 { id: `sub-${Date.now()}`, text, done: false },
               ];
-              void persistBlockUpdateToCalendar({
+              void saveAugmentationAndSyncSoloOnly({
                 ...found,
                 subtasks: nextSubs,
               });
@@ -3986,7 +4042,7 @@ export function DayframeApp() {
               const nextSubs = (found.subtasks ?? []).filter(
                 (s) => s.id !== subId
               );
-              void persistBlockUpdateToCalendar({
+              void saveAugmentationAndSyncSoloOnly({
                 ...found,
                 subtasks: nextSubs,
               });
@@ -4003,7 +4059,7 @@ export function DayframeApp() {
                   source: "manual",
                 },
               ];
-              void persistBlockUpdateToCalendar({
+              void saveAugmentationAndSyncSoloOnly({
                 ...found,
                 relevantPapers: nextPapers,
               });
@@ -4014,7 +4070,7 @@ export function DayframeApp() {
               const nextPapers = (found.relevantPapers ?? []).filter(
                 (p) => p.id !== paperId
               );
-              void persistBlockUpdateToCalendar({
+              void saveAugmentationAndSyncSoloOnly({
                 ...found,
                 relevantPapers: nextPapers,
               });
@@ -4032,12 +4088,13 @@ export function DayframeApp() {
                 ...(found.reminders ?? []),
                 { id: `rem-${Date.now()}`, text, leadMinutes },
               ];
-              void persistBlockUpdateToCalendar(
+              void saveAugmentationAndSyncSoloOnly(
                 { ...found, reminders: nextRems },
-                leadMinutes
+                !isProtectedCalendarInvite(found) ? leadMinutes : undefined
               );
-              showToast(`Added ${leadMinutes}m alert on Calendar.app`);
+              showToast("Saved private reminder inside Dayframe");
             }}
+            onSelectLinkedBlock={(id) => setSelectedBlockId(id)}
             onToggleBlockDone={(id, actual) =>
               void handleToggleBlockDone(id, actual)
             }

@@ -108,6 +108,26 @@ if !granted {
     exit(0)
 }
 
+func isSoloDayframeOwnedEvent(_ ev: EKEvent) -> Bool {
+    // HARD INVARIANT: NEVER touch any event that has attendees or another organizer!
+    if ev.hasAttendees { return false }
+    if let atts = ev.attendees, !atts.isEmpty { return false }
+    if let org = ev.organizer, !org.isCurrentUser { return false }
+
+    let title = ev.title ?? ""
+    let notes = ev.notes ?? ""
+    let hasDayframeMarker =
+        title.hasPrefix("[Prep] ") ||
+        title.hasPrefix("[Task] ") ||
+        title.hasPrefix("[Focus] ") ||
+        title.hasPrefix("[Solo Hold] ") ||
+        title.hasPrefix("✓ [") ||
+        notes.contains("Scheduled offline by Dayframe") ||
+        notes.contains("Scheduled by Dayframe")
+
+    return hasDayframeMarker
+}
+
 let action = payload.action ?? "scan"
 
 if action == "update" {
@@ -118,6 +138,14 @@ if action == "update" {
     }
     guard ev.calendar?.allowsContentModifications == true else {
         emitJson(["ok": false, "error": "Calendar event is read-only."])
+        exit(0)
+    }
+    guard isSoloDayframeOwnedEvent(ev) else {
+        emitJson([
+            "ok": false,
+            "blockedSharedOrExternal": true,
+            "error": "Blocked: Dayframe never edits shared or external calendar invites. Notes and prep stay inside Dayframe's internal augmentation."
+        ])
         exit(0)
     }
     if let newTitle = payload.title, !newTitle.isEmpty {
@@ -142,6 +170,14 @@ if action == "delete" {
     guard let id = payload.eventId, !id.isEmpty,
           let ev = store.event(withIdentifier: id) else {
         emitJson(["ok": false, "error": "Calendar event was not found."])
+        exit(0)
+    }
+    guard isSoloDayframeOwnedEvent(ev) else {
+        emitJson([
+            "ok": false,
+            "blockedSharedOrExternal": true,
+            "error": "Blocked: Dayframe never deletes shared or external calendar events."
+        ])
         exit(0)
     }
     do {

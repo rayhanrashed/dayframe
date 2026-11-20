@@ -1,6 +1,7 @@
 import {
   CalendarBlock,
   CapturedContextWindow,
+  EventAugmentation,
   LocalPaperHit,
   MacCalendarDescriptor,
   ModelLifecycleState,
@@ -688,6 +689,45 @@ export function formatRichCalendarNotes(block: CalendarBlock): string {
   return sections.join("\n\n").slice(0, 3200);
 }
 
+export async function loadMacEventAugmentations(
+  pairingToken: string
+): Promise<Record<string, EventAugmentation>> {
+  if (!pairingToken.trim()) return {};
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/augmentations`, {
+      headers: { Authorization: `Bearer ${pairingToken.trim()}` },
+    });
+    if (!res.ok) return {};
+    const data = (await res.json()) as {
+      ok?: boolean;
+      augmentations?: Record<string, EventAugmentation>;
+    };
+    return data.augmentations ?? {};
+  } catch {
+    return {};
+  }
+}
+
+export async function saveMacEventAugmentations(params: {
+  pairingToken: string;
+  augmentations: Record<string, EventAugmentation>;
+}): Promise<boolean> {
+  if (!params.pairingToken.trim()) return false;
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/augmentations/save`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ augmentations: params.augmentations }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function updateBlockOnMacCalendar(params: {
   pairingToken: string;
   eventId: string;
@@ -696,6 +736,15 @@ export async function updateBlockOnMacCalendar(params: {
 }): Promise<{ ok: boolean; error?: string }> {
   const { pairingToken, eventId, block, alarmMinutesBefore } = params;
   if (!pairingToken.trim() || !eventId) return { ok: false };
+
+  // HARD CLIENT INVARIANT: Never edit any event with attendees or any non-Dayframe external invite!
+  if ((block.attendeeCount ?? 0) > 0 || !block.isDayframeCreated) {
+    return {
+      ok: false,
+      error:
+        "Blocked: Shared and external calendar events are never modified in Calendar.app.",
+    };
+  }
 
   const baseTitle = block.title
     .replace(/^(✓\s+|\[Done\]\s+)/i, "")

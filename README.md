@@ -13,10 +13,10 @@ All inference and system access run locally over `127.0.0.1` without external AP
   - Estimates are scaled by a calibration multiplier (`gut estimate × multiplier`), which updates as you mark blocks done and record actual time taken.
   - Protects daily buffers, morning hours, weekends, and user-specified busy/travel date ranges.
   - Unfinished blocks from earlier today or past days can be moved forward into open slots in one action.
-- **Per-Event Chat & Context Workspace**:
-  - Click any event on the timeline to chat with that specific event (for example, `"add two one-hour blocks to prepare for this from today until the meeting"`).
-  - Pull related emails from Apple Mail, recent Slack/window captures, and matching local PDFs (`~/Documents`, `~/Downloads`, `~/Desktop` via Spotlight `mdfind`) into the event.
-  - Maintain a sub-checklist, notes, relevant papers, and native macOS Calendar alerts (`EKAlarm`), synced back to the `Calendar.app` entry.
+- **Per-Event Chat & Private Internal Augmentation**:
+  - Shared and external calendar events are strictly read-only in `Calendar.app` (never edited or deleted, so attendees never receive modified invite notifications).
+  - Notes, checklists, approved papers, reminders, and chat history for meetings are stored privately inside `~/.dayframe/event-augmentations.json` and overlaid onto calendar events inside Dayframe.
+  - Proposed solo preparation blocks, candidate PDFs, and suggested todos are staged for explicit confirmation before anything is attached or written as a solo block onto your target calendar.
 - **User and Task Models**:
   - Maintains persistent models for ongoing projects/tasks (linking related calendar blocks, emails, captures, papers, and immediate next steps) and higher-level strivings, drawing on hierarchical activity modeling ([StanfordHCI/striving-cocreation](https://github.com/StanfordHCI/striving-cocreation)).
   - Supports inline rename, merge, reassign, and remove operations; edits are stored as constraints for subsequent model runs.

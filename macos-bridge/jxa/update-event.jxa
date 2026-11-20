@@ -7,6 +7,28 @@ function readStdinJson() {
   return str ? JSON.parse(str) : {};
 }
 
+function isSoloDayframeOwned(ev) {
+  if (Boolean(ev.hasAttendees)) return false;
+  try {
+    if (ev.attendees && ev.attendees.count > 0) return false;
+  } catch (_e) {}
+  try {
+    if (ev.organizer && !Boolean(ev.organizer.isCurrentUser)) return false;
+  } catch (_o) {}
+
+  const title = ev.title ? String(ev.title.js) : "";
+  const notes = ev.notes ? String(ev.notes.js) : "";
+  return (
+    title.startsWith("[Prep] ") ||
+    title.startsWith("[Task] ") ||
+    title.startsWith("[Focus] ") ||
+    title.startsWith("[Solo Hold] ") ||
+    title.startsWith("✓ [") ||
+    notes.includes("Scheduled offline by Dayframe") ||
+    notes.includes("Scheduled by Dayframe")
+  );
+}
+
 function run() {
   const input = readStdinJson();
   const store = $.EKEventStore.alloc.init;
@@ -23,6 +45,14 @@ function run() {
   }
   if (ev.calendar && !Boolean(ev.calendar.allowsContentModifications)) {
     return JSON.stringify({ ok: false, error: "Calendar event is read-only." });
+  }
+  if (!isSoloDayframeOwned(ev)) {
+    return JSON.stringify({
+      ok: false,
+      blockedSharedOrExternal: true,
+      error:
+        "Blocked: Dayframe never modifies shared or external calendar invites.",
+    });
   }
   if (input.title) {
     ev.title = String(input.title);

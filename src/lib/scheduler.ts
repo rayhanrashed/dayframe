@@ -18,7 +18,7 @@ export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   batchExecutionMode: "scheduled-batches",
   batchWindowMinutes: [9 * 60 + 30, 13 * 60 + 30, 17 * 60 + 30],
   unloadModelsAfterBatch: true,
-  confirmationPolicy: "auto-high-confidence",
+  confirmationPolicy: "ask-often",
   calendarSource: "none",
   captureEngine: "macos-native",
   readCalendarIds: [],

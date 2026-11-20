@@ -62,6 +62,39 @@ export interface EventChatMessage {
   actionBadge?: string;
 }
 
+export interface StagedCandidateAddition {
+  id: string;
+  kind: "paper" | "subtask" | "context-note" | "solo-prep-slot";
+  title: string;
+  detail?: string;
+  reason?: string;
+  pathOrUrl?: string;
+  authorsOrVenue?: string;
+  leadMinutes?: number;
+  proposedSlot?: {
+    sessionTitle: string;
+    dateKey: string;
+    startMinutes: number;
+    durationMinutes: number;
+  };
+}
+
+/**
+ * Private Dayframe-only overlay augmenting a Calendar event without ever mutating
+ * shared/multi-person invites in Calendar.app (stored locally in ~/.dayframe/event-augmentations.json).
+ */
+export interface EventAugmentation {
+  eventKey: string;
+  customDisplayTitle?: string;
+  privateNotes: string;
+  subtasks: EventSubtask[];
+  approvedPapers: RelevantPaperRef[];
+  privateReminders: EventReminderItem[];
+  stagedCandidates: StagedCandidateAddition[];
+  eventChat: EventChatMessage[];
+  updatedAtIso: string;
+}
+
 export interface CalendarBlock {
   id: string;
   title: string;
@@ -90,6 +123,7 @@ export interface CalendarBlock {
   subtasks?: EventSubtask[];
   reminders?: EventReminderItem[];
   relevantPapers?: RelevantPaperRef[];
+  stagedCandidates?: StagedCandidateAddition[];
   eventChat?: EventChatMessage[];
   attendeeCount?: number;
   attendeeNames?: string[];

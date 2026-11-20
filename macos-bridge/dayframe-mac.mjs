@@ -15,6 +15,7 @@ const TOKEN_FILE = path.join(os.homedir(), ".dayframe-bridge-token");
 const QUEUE_DIR = path.join(DAYFRAME_HOME, "capture-queue");
 const MODELS_DIR = path.join(DAYFRAME_HOME, "models");
 const COLLECTOR_CONFIG_FILE = path.join(DAYFRAME_HOME, "collector-config.json");
+const AUGMENTATIONS_FILE = path.join(DAYFRAME_HOME, "event-augmentations.json");
 const ANDROID_SYNC_DIR = path.join(os.homedir(), "Pictures", "Dayframe-Android");
 
 const PRIVATE_APP_BLOCKLIST = new Set([
@@ -1305,14 +1306,85 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/api/augmentations") {
+      try {
+        if (fs.existsSync(AUGMENTATIONS_FILE)) {
+          const parsed = JSON.parse(fs.readFileSync(AUGMENTATIONS_FILE, "utf8"));
+          sendJson(req, res, 200, {
+            ok: true,
+            augmentations:
+              parsed && typeof parsed === "object" ? parsed : {},
+          });
+        } else {
+          sendJson(req, res, 200, { ok: true, augmentations: {} });
+        }
+      } catch {
+        sendJson(req, res, 200, { ok: true, augmentations: {} });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/augmentations/save") {
+      const body = await readJsonBody(req);
+      const map =
+        body.augmentations && typeof body.augmentations === "object"
+          ? body.augmentations
+          : {};
+      try {
+        fs.writeFileSync(AUGMENTATIONS_FILE, JSON.stringify(map, null, 2), {
+          mode: 0o600,
+        });
+        sendJson(req, res, 200, { ok: true });
+      } catch (err) {
+        sendJson(req, res, 500, {
+          ok: false,
+          error: err instanceof Error ? err.message : "Failed saving augmentations",
+        });
+      }
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/context/local-papers") {
       const body = await readJsonBody(req);
+      const GENERIC_WORDS = new Set([
+        "prep",
+        "task",
+        "week",
+        "with",
+        "meeting",
+        "sync",
+        "call",
+        "chat",
+        "group",
+        "weekly",
+        "biweekly",
+        "daily",
+        "check",
+        "discussion",
+        "update",
+        "project",
+        "research",
+        "lab",
+        "team",
+        "office",
+        "hours",
+        "prof",
+        "advisor",
+        "paper",
+        "papers",
+        "review",
+        "draft",
+        "slides",
+        "session",
+        "block",
+      ]);
+
       const rawTerms = String(body.query || "")
         .toLowerCase()
         .replace(/[^a-z0-9\s-]/g, " ")
         .split(/\s+/)
-        .filter((t) => t.length >= 3 && !["prep", "task", "week", "with", "meeting", "sync", "call"].includes(t))
-        .slice(0, 4);
+        .filter((t) => t.length >= 3 && !GENERIC_WORDS.has(t))
+        .slice(0, 5);
 
       if (process.platform !== "darwin" || rawTerms.length === 0) {
         sendJson(req, res, 200, { ok: true, papers: [] });
@@ -1325,10 +1397,14 @@ const server = http.createServer(async (req, res) => {
         path.join(os.homedir(), "Desktop"),
       ].filter((d) => fs.existsSync(d));
 
-      // Safe Spotlight query using strict alphanumeric tokens only
+      // Strict title/filename matching (never noisy full-body OR matching!)
+      const joinOp = rawTerms.length <= 2 ? " && " : " || ";
       const termClauses = rawTerms
-        .map((t) => `(kMDItemDisplayName == "*${t}*"cd || kMDItemTextContent == "*${t}*"cd)`)
-        .join(" || ");
+        .map(
+          (t) =>
+            `(kMDItemDisplayName == "*${t}*"cd || kMDItemTitle == "*${t}*"cd)`
+        )
+        .join(joinOp);
       const mdfindExpr = `kMDItemContentType == "com.adobe.pdf" && (${termClauses})`;
       const args = [];
       for (const root of searchRoots) {
@@ -1343,22 +1419,36 @@ const server = http.createServer(async (req, res) => {
             .split("\n")
             .map((l) => l.trim())
             .filter(Boolean)
-            .filter((p) => !p.includes("/node_modules/") && !p.includes("/.Trash/"))
-            .slice(0, 8);
-          const items = [];
+            .filter(
+              (p) => !p.includes("/node_modules/") && !p.includes("/.Trash/")
+            );
+
+          const scored = [];
           for (const p of paths) {
             try {
               const st = fs.statSync(p);
               const base = path.basename(p);
-              items.push({
-                title: base.replace(/\.pdf$/i, "").replace(/[_-]+/g, " "),
+              const cleanTitle = base
+                .replace(/\.pdf$/i, "")
+                .replace(/[_-]+/g, " ");
+              const lowerName = cleanTitle.toLowerCase();
+              let hits = 0;
+              for (const t of rawTerms) {
+                if (lowerName.includes(t)) hits++;
+              }
+              const minHits = rawTerms.length >= 3 ? 2 : 1;
+              if (hits < minHits) continue;
+              scored.push({
+                title: cleanTitle,
                 filename: base,
                 path: p,
                 modifiedIso: st.mtime.toISOString(),
+                hits,
               });
             } catch {}
           }
-          resolve(items);
+          scored.sort((a, b) => b.hits - a.hits);
+          resolve(scored.slice(0, 6).map(({ hits: _h, ...rest }) => rest));
         });
       });
 

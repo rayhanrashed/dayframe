@@ -7,6 +7,28 @@ function readStdinJson() {
   return str ? JSON.parse(str) : {};
 }
 
+function isSoloDayframeOwned(ev) {
+  if (Boolean(ev.hasAttendees)) return false;
+  try {
+    if (ev.attendees && ev.attendees.count > 0) return false;
+  } catch (_e) {}
+  try {
+    if (ev.organizer && !Boolean(ev.organizer.isCurrentUser)) return false;
+  } catch (_o) {}
+
+  const title = ev.title ? String(ev.title.js) : "";
+  const notes = ev.notes ? String(ev.notes.js) : "";
+  return (
+    title.startsWith("[Prep] ") ||
+    title.startsWith("[Task] ") ||
+    title.startsWith("[Focus] ") ||
+    title.startsWith("[Solo Hold] ") ||
+    title.startsWith("✓ [") ||
+    notes.includes("Scheduled offline by Dayframe") ||
+    notes.includes("Scheduled by Dayframe")
+  );
+}
+
 function run() {
   const input = readStdinJson();
   const store = $.EKEventStore.alloc.init;
@@ -24,12 +46,20 @@ function run() {
   if (!ev) {
     return JSON.stringify({ ok: false, error: "Calendar event was not found." });
   }
+  if (!isSoloDayframeOwned(ev)) {
+    return JSON.stringify({
+      ok: false,
+      blockedSharedOrExternal: true,
+      error:
+        "Blocked: Dayframe never deletes shared or external calendar invites.",
+    });
+  }
   const errRef = Ref();
   const removed = store.removeEventSpanCommitError(ev, 0, true, errRef);
   if (!removed) {
     return JSON.stringify({
       ok: false,
-      error: "Could not remove the previous calendar block.",
+      error: "Could not remove the calendar block.",
     });
   }
   return JSON.stringify({ ok: true });

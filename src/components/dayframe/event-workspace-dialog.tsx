@@ -16,8 +16,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   CalendarBlock,
   ScreenshotCapture,
+  StagedCandidateAddition,
   TaskSpecificModel,
 } from "@/lib/types";
+import { isProtectedCalendarInvite } from "@/lib/event-augmentations";
 import {
   formatDateKeyLabel,
   formatDuration,
@@ -27,11 +29,12 @@ import {
   ArrowRight,
   Bell,
   BookOpen,
+  CalendarPlus,
   Check,
-  CheckCircle2,
   ExternalLink,
   FileText,
   ListTodo,
+  Lock,
   Loader2,
   MessageSquare,
   Minus,
@@ -40,17 +43,27 @@ import {
   Send,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
 
 interface EventWorkspaceDialogProps {
   todayKey: string;
   block: CalendarBlock | null;
+  linkedPrepBlocks: CalendarBlock[];
   linkedTaskModel?: TaskSpecificModel;
   linkedCapture: ScreenshotCapture | null;
   isBusyEnriching: boolean;
   onClose: () => void;
   onSendEventChat: (blockId: string, text: string) => Promise<void>;
-  onPullContextAndPapers: (blockId: string) => Promise<void>;
+  onSearchCandidates: (
+    blockId: string,
+    scope: "context" | "papers"
+  ) => Promise<void>;
+  onApproveStagedCandidate: (
+    blockId: string,
+    candidate: StagedCandidateAddition
+  ) => Promise<void>;
+  onDismissStagedCandidate: (blockId: string, candidateId: string) => void;
   onRenameEvent: (blockId: string, newTitle: string) => void;
   onSaveEventNotes: (blockId: string, notes: string) => void;
   onToggleSubtask: (blockId: string, subtaskId: string) => void;
@@ -60,6 +73,7 @@ interface EventWorkspaceDialogProps {
   onRemovePaper: (blockId: string, paperId: string) => void;
   onOpenLocalPaper: (pathOrUrl: string) => void;
   onAddReminder: (blockId: string, text: string, leadMinutes: number) => void;
+  onSelectLinkedBlock: (blockId: string) => void;
   onToggleBlockDone: (id: string, actualMinutesOverride?: number) => void;
   onAdjustBlockDuration: (
     id: string,
@@ -73,20 +87,23 @@ interface EventWorkspaceDialogProps {
 }
 
 const EVENT_CHAT_CHIPS = [
-  "Add two 1-hour blocks to prepare for this from today until the meeting",
-  "Read context from my email, Slack, and local papers",
-  "Remind me 30m before to review notes",
+  "Propose a 30m solo prep slot before this meeting",
+  "Propose two 1-hour prep blocks between today and this meeting",
+  "Check related emails & Slack messages (ask before adding)",
 ];
 
 export function EventWorkspaceDialog({
   todayKey,
   block,
+  linkedPrepBlocks,
   linkedTaskModel,
   linkedCapture,
   isBusyEnriching,
   onClose,
   onSendEventChat,
-  onPullContextAndPapers,
+  onSearchCandidates,
+  onApproveStagedCandidate,
+  onDismissStagedCandidate,
   onRenameEvent,
   onSaveEventNotes,
   onToggleSubtask,
@@ -96,6 +113,7 @@ export function EventWorkspaceDialog({
   onRemovePaper,
   onOpenLocalPaper,
   onAddReminder,
+  onSelectLinkedBlock,
   onToggleBlockDone,
   onAdjustBlockDuration,
   onConfirmAndSyncBlock,
@@ -125,9 +143,11 @@ export function EventWorkspaceDialog({
 
   if (!block) return null;
 
+  const isReadOnlyInvite = isProtectedCalendarInvite(block);
   const subtasks = block.subtasks ?? [];
   const papers = block.relevantPapers ?? [];
   const reminders = block.reminders ?? [];
+  const staged = block.stagedCandidates ?? [];
   const chatHistory = block.eventChat ?? [];
 
   const handleChatSubmit = async (e: React.FormEvent) => {
@@ -159,20 +179,27 @@ export function EventWorkspaceDialog({
                 {block.calendarTitle}
               </Badge>
             )}
+            {isReadOnlyInvite ? (
+              <Badge
+                variant="outline"
+                className="gap-1 border-sky-500/40 bg-sky-500/10 text-[10px] text-sky-900 dark:text-sky-200"
+              >
+                <Lock className="size-2.5" />
+                Calendar Invite Read-Only • Augmented Privately in Dayframe
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="text-[10px]">
+                Solo Dayframe Block
+              </Badge>
+            )}
             {linkedTaskModel && (
               <Badge variant="outline" className="text-[10px]">
                 Model: {linkedTaskModel.canonicalTitle}
               </Badge>
             )}
-            {block.syncedToExternalCalendar && (
-              <Badge variant="outline" className="gap-1 text-[10px]">
-                <CheckCircle2 className="size-3 text-emerald-500" />
-                Synced
-              </Badge>
-            )}
           </div>
 
-          {editingTitle ? (
+          {editingTitle && !isReadOnlyInvite ? (
             <form
               className="mt-1.5 flex items-center gap-1.5"
               onSubmit={(e) => {
@@ -196,12 +223,12 @@ export function EventWorkspaceDialog({
           ) : (
             <div className="flex items-center gap-2 pt-1">
               <DialogTitle className="text-base">{block.title}</DialogTitle>
-              {!block.occupiesTimeOnly && (
+              {!isReadOnlyInvite && (
                 <button
                   type="button"
                   onClick={() => setEditingTitle(true)}
                   className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  title="Edit standard event title"
+                  title="Rename solo block"
                 >
                   <Pencil className="size-3.5" />
                 </button>
@@ -210,12 +237,110 @@ export function EventWorkspaceDialog({
           )}
 
           <DialogDescription className="text-xs">
-            {block.rationale}
+            {isReadOnlyInvite
+              ? "This calendar invite is never modified in Calendar.app and never emails attendees. Any prep slots are created as separate solo blocks on your UMich calendar, and notes/todos/papers stay strictly inside Dayframe."
+              : block.rationale}
             {block.attendeeNames && block.attendeeNames.length > 0
-              ? ` • Attendees: ${block.attendeeNames.slice(0, 5).join(", ")}`
+              ? ` • Attendees: ${block.attendeeNames.slice(0, 6).join(", ")}`
               : ""}
           </DialogDescription>
         </DialogHeader>
+
+        {/* Linked Solo Prep Blocks Strip */}
+        {linkedPrepBlocks.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 rounded-xl border bg-emerald-500/[0.06] px-3 py-2 text-xs">
+            <span className="font-medium">Solo Prep Scheduled:</span>
+            {linkedPrepBlocks.map((pb) => (
+              <button
+                key={pb.id}
+                type="button"
+                onClick={() => onSelectLinkedBlock(pb.id)}
+                className="rounded-md border bg-background px-2 py-0.5 text-[11px] hover:bg-muted"
+              >
+                {pb.dateKey} {formatMinutesToTime(pb.startMinutes)} (
+                {formatDuration(pb.durationMinutes)})
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Staged Candidates Require Explicit User Confirmation Before Anything Is Added! */}
+        {staged.length > 0 && (
+          <div className="space-y-2 rounded-xl border border-amber-500/45 bg-amber-500/[0.07] p-3 text-xs">
+            <div className="font-semibold">
+              Confirm Before Adding ({staged.length} candidate
+              {staged.length === 1 ? "" : "s"})
+            </div>
+            <div className="max-h-44 space-y-1.5 overflow-y-auto pr-0.5">
+              {staged.map((cand) => (
+                <div
+                  key={cand.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-background px-2.5 py-2"
+                >
+                  <div className="min-w-0 flex-1 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-1.5 font-medium">
+                      <Badge variant="outline" className="text-[9.5px]">
+                        {cand.kind === "solo-prep-slot"
+                          ? "Solo Prep Block (0 attendees)"
+                          : cand.kind === "paper"
+                            ? "Candidate Paper"
+                            : cand.kind === "subtask"
+                              ? "Suggested Todo"
+                              : "Context Note"}
+                      </Badge>
+                      <span className="truncate">{cand.title}</span>
+                    </div>
+                    {cand.proposedSlot && (
+                      <div className="font-mono text-[10.5px] text-muted-foreground">
+                        {formatDateKeyLabel(cand.proposedSlot.dateKey, todayKey)}{" "}
+                        • {formatMinutesToTime(cand.proposedSlot.startMinutes)}{" "}
+                        ({formatDuration(cand.proposedSlot.durationMinutes)}) on
+                        your UMich calendar
+                      </div>
+                    )}
+                    {(cand.detail || cand.reason || cand.pathOrUrl) && (
+                      <div className="line-clamp-2 text-[10.5px] text-muted-foreground">
+                        {cand.detail || cand.reason || cand.pathOrUrl}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      size="xs"
+                      onClick={() =>
+                        void onApproveStagedCandidate(block.id, cand)
+                      }
+                      className="gap-1"
+                    >
+                      {cand.kind === "solo-prep-slot" ? (
+                        <>
+                          <CalendarPlus className="size-3" />
+                          Add Solo Block
+                        </>
+                      ) : (
+                        <>
+                          <Check className="size-3" />
+                          Attach
+                        </>
+                      )}
+                    </Button>
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      onClick={() =>
+                        onDismissStagedCandidate(block.id, cand.id)
+                      }
+                      title="Dismiss candidate"
+                    >
+                      <X className="size-3" />
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <Tabs defaultValue="chat" className="w-full text-xs">
           <TabsList className="grid w-full grid-cols-3">
@@ -225,7 +350,7 @@ export function EventWorkspaceDialog({
             </TabsTrigger>
             <TabsTrigger value="details" className="gap-1.5 text-xs">
               <ListTodo className="size-3.5" />
-              Todos &amp; Details ({subtasks.length})
+              Private Todos &amp; Notes ({subtasks.length})
             </TabsTrigger>
             <TabsTrigger value="papers" className="gap-1.5 text-xs">
               <BookOpen className="size-3.5" />
@@ -237,29 +362,40 @@ export function EventWorkspaceDialog({
           <TabsContent value="chat" className="mt-3 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/30 px-3 py-2">
               <span className="text-[11px] text-muted-foreground">
-                Ask to schedule prep blocks, pull Email/Slack/PDF context, add todos, or resize.
+                Proposals appear above for your confirmation before anything is added.
               </span>
-              <Button
-                size="xs"
-                variant="secondary"
-                disabled={isBusyEnriching}
-                onClick={() => void onPullContextAndPapers(block.id)}
-                className="gap-1 shrink-0"
-              >
-                {isBusyEnriching ? (
-                  <Loader2 className="size-3 animate-spin" />
-                ) : (
-                  <Sparkles className="size-3" />
-                )}
-                Pull Context &amp; Papers
-              </Button>
+              <div className="flex items-center gap-1.5">
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={isBusyEnriching}
+                  onClick={() => void onSearchCandidates(block.id, "context")}
+                  className="gap-1"
+                >
+                  {isBusyEnriching ? (
+                    <Loader2 className="size-3 animate-spin" />
+                  ) : (
+                    <Sparkles className="size-3" />
+                  )}
+                  Check Mail/Slack
+                </Button>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={isBusyEnriching}
+                  onClick={() => void onSearchCandidates(block.id, "papers")}
+                >
+                  Find Candidate PDFs
+                </Button>
+              </div>
             </div>
 
-            <div className="max-h-56 space-y-2 overflow-y-auto rounded-xl border bg-background p-3">
+            <div className="max-h-52 space-y-2 overflow-y-auto rounded-xl border bg-background p-3">
               {chatHistory.length === 0 ? (
                 <div className="space-y-2 py-3 text-center text-[11px] text-muted-foreground">
                   <p>
-                    Chat directly with <strong>{block.title}</strong>. Try a prompt below or type your own instruction:
+                    Ask to schedule solo prep blocks or check context for{" "}
+                    <strong>{block.title}</strong>:
                   </p>
                   <div className="flex flex-wrap justify-center gap-1.5 pt-1">
                     {EVENT_CHAT_CHIPS.map((chip) => (
@@ -296,11 +432,14 @@ export function EventWorkspaceDialog({
               )}
             </div>
 
-            <form onSubmit={(e) => void handleChatSubmit(e)} className="flex gap-1.5">
+            <form
+              onSubmit={(e) => void handleChatSubmit(e)}
+              className="flex gap-1.5"
+            >
               <Input
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                placeholder='e.g. "add two one-hour blocks to prepare for this anytime from today until the meeting"'
+                placeholder='e.g. "add a 30 minute prepare slot for this" or "what did we discuss in email?"'
                 className="flex-1 text-xs"
                 disabled={isBusyEnriching}
               />
@@ -320,11 +459,11 @@ export function EventWorkspaceDialog({
             </form>
           </TabsContent>
 
-          {/* TAB 2: Immediate To-Dos (Sub-Checklist) & Synced Event Details */}
+          {/* TAB 2: Private Internal Checklist & Private Augmentation Notes */}
           <TabsContent value="details" className="mt-3 space-y-3">
             <div className="space-y-2 rounded-xl border p-3">
               <div className="font-semibold">
-                Immediate To-Dos Inside This Block
+                Private To-Dos (Stored Only in Dayframe)
               </div>
               <form
                 className="flex gap-1.5"
@@ -338,7 +477,7 @@ export function EventWorkspaceDialog({
                 <Input
                   value={newTodo}
                   onChange={(e) => setNewTodo(e.target.value)}
-                  placeholder="Add concrete step for this session..."
+                  placeholder="Add a prep or follow-up item..."
                   className="h-7 flex-1 text-xs"
                 />
                 <Button type="submit" size="xs" disabled={!newTodo.trim()}>
@@ -348,7 +487,7 @@ export function EventWorkspaceDialog({
 
               {subtasks.length === 0 ? (
                 <p className="py-2 text-[11px] text-muted-foreground">
-                  No checklist items yet. Click &ldquo;Pull Context &amp; Papers&rdquo; in Chat to extract immediate steps from your emails/Slack, or add one above.
+                  No private todos yet.
                 </p>
               ) : (
                 <div className="space-y-1.5 pt-1">
@@ -396,20 +535,20 @@ export function EventWorkspaceDialog({
               <div className="flex items-center justify-between">
                 <span className="flex items-center gap-1.5 font-semibold">
                   <FileText className="size-3.5" />
-                  Event Context &amp; Notes (Synced to Calendar.app)
+                  Private Augmentation Notes (Never Sent to Invitees)
                 </span>
                 <Button
                   size="xs"
                   variant="outline"
                   onClick={() => onSaveEventNotes(block.id, notesDraft)}
                 >
-                  Save Notes
+                  Save Private Notes
                 </Button>
               </div>
               <Textarea
                 value={notesDraft}
                 onChange={(e) => setNotesDraft(e.target.value)}
-                placeholder="Context from emails, Slack threads, agenda links, or notes..."
+                placeholder="Your private meeting context, talking points, or summary..."
                 className="min-h-24 text-xs"
               />
             </div>
@@ -429,20 +568,20 @@ export function EventWorkspaceDialog({
             )}
           </TabsContent>
 
-          {/* TAB 3: Relevant Papers & Native Calendar Reminders */}
+          {/* TAB 3: Approved Papers & Private Reminders */}
           <TabsContent value="papers" className="mt-3 space-y-3">
             <div className="space-y-2 rounded-xl border p-3">
               <div className="flex items-center justify-between">
                 <span className="font-semibold">
-                  Relevant Papers, PDFs &amp; Links
+                  Approved Papers &amp; Links (Private in Dayframe)
                 </span>
                 <Button
                   size="xs"
-                  variant="ghost"
+                  variant="outline"
                   disabled={isBusyEnriching}
-                  onClick={() => void onPullContextAndPapers(block.id)}
+                  onClick={() => void onSearchCandidates(block.id, "papers")}
                 >
-                  Scan Local PDFs
+                  Search Candidate PDFs
                 </Button>
               </div>
 
@@ -463,13 +602,13 @@ export function EventWorkspaceDialog({
                 <Input
                   value={newPaperTitle}
                   onChange={(e) => setNewPaperTitle(e.target.value)}
-                  placeholder="Paper title or doc name..."
+                  placeholder="Add paper title manually..."
                   className="h-7 min-w-[160px] flex-1 text-xs"
                 />
                 <Input
                   value={newPaperUrl}
                   onChange={(e) => setNewPaperUrl(e.target.value)}
-                  placeholder="arXiv URL or ~/Documents/... path (optional)"
+                  placeholder="arXiv URL or local path (optional)"
                   className="h-7 min-w-[160px] flex-1 text-xs"
                 />
                 <Button type="submit" size="xs" disabled={!newPaperTitle.trim()}>
@@ -479,7 +618,7 @@ export function EventWorkspaceDialog({
 
               {papers.length === 0 ? (
                 <p className="py-2 text-[11px] text-muted-foreground">
-                  No papers attached yet. Click &ldquo;Scan Local PDFs&rdquo; to find matching PDFs in your Mac&apos;s Documents/Downloads, or attach a title/URL above.
+                  No papers attached. Papers are never auto-attached — attach manually above or click &ldquo;Search Candidate PDFs&rdquo; to review candidates first.
                 </p>
               ) : (
                 <div className="space-y-1.5 pt-1">
@@ -530,7 +669,7 @@ export function EventWorkspaceDialog({
             <div className="space-y-2 rounded-xl border p-3">
               <div className="flex items-center gap-1.5 font-semibold">
                 <Bell className="size-3.5" />
-                Event Reminders (Adds Native macOS Calendar Alert)
+                Private Local Reminders
               </div>
               <form
                 className="flex flex-wrap gap-1.5"
@@ -548,7 +687,7 @@ export function EventWorkspaceDialog({
                 <Input
                   value={reminderText}
                   onChange={(e) => setReminderText(e.target.value)}
-                  placeholder="e.g. Send draft slides before call..."
+                  placeholder="e.g. Review section 3 before joining..."
                   className="h-7 flex-1 text-xs"
                 />
                 <Input
@@ -563,7 +702,7 @@ export function EventWorkspaceDialog({
                   min before
                 </span>
                 <Button type="submit" size="xs" disabled={!reminderText.trim()}>
-                  Add Alert
+                  Save Reminder
                 </Button>
               </form>
 
@@ -584,9 +723,9 @@ export function EventWorkspaceDialog({
           </TabsContent>
         </Tabs>
 
-        {/* Bottom Footer: Done Calibration + Slot Controls */}
-        <div className="space-y-2.5 border-t pt-3 text-xs">
-          {block.isDayframeCreated && (
+        {/* Bottom Footer: Only Solo Dayframe Blocks Can Be Resized/Moved/Deleted! */}
+        {!isReadOnlyInvite && (
+          <div className="space-y-2.5 border-t pt-3 text-xs">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-emerald-500/[0.06] px-3 py-2">
               <span className="font-medium">Complete &amp; Calibrate:</span>
               <div className="flex flex-wrap gap-1.5">
@@ -643,62 +782,52 @@ export function EventWorkspaceDialog({
                 )}
               </div>
             </div>
-          )}
 
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-1.5">
-              {!block.occupiesTimeOnly && (
-                <>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={block.durationMinutes <= 15}
-                    onClick={() =>
-                      onAdjustBlockDuration(block.id, -15, true)
-                    }
-                  >
-                    <Minus className="size-3" /> 15m
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    onClick={() =>
-                      onAdjustBlockDuration(block.id, 15, true)
-                    }
-                  >
-                    <Plus className="size-3" /> 15m
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    onClick={() => onMoveBlockToNextSlot(block.id)}
-                    className="gap-1"
-                  >
-                    Next Slot <ArrowRight className="size-3" />
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    onClick={() => onShiftBlockDate(block.id, 1)}
-                  >
-                    +1 Day
-                  </Button>
-                </>
-              )}
-              {!block.syncedToExternalCalendar && !block.occupiesTimeOnly && (
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <Button
                   size="xs"
-                  onClick={() => {
-                    onConfirmAndSyncBlock(block.id);
-                    onClose();
-                  }}
+                  variant="outline"
+                  disabled={block.durationMinutes <= 15}
+                  onClick={() => onAdjustBlockDuration(block.id, -15, true)}
                 >
-                  Write to Calendar
+                  <Minus className="size-3" /> 15m
                 </Button>
-              )}
-            </div>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => onAdjustBlockDuration(block.id, 15, true)}
+                >
+                  <Plus className="size-3" /> 15m
+                </Button>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => onMoveBlockToNextSlot(block.id)}
+                  className="gap-1"
+                >
+                  Next Slot <ArrowRight className="size-3" />
+                </Button>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => onShiftBlockDate(block.id, 1)}
+                >
+                  +1 Day
+                </Button>
+                {!block.syncedToExternalCalendar && (
+                  <Button
+                    size="xs"
+                    onClick={() => {
+                      onConfirmAndSyncBlock(block.id);
+                      onClose();
+                    }}
+                  >
+                    Write Solo Block to Calendar
+                  </Button>
+                )}
+              </div>
 
-            {!block.occupiesTimeOnly && (
               <Button
                 size="icon-xs"
                 variant="destructive"
@@ -706,13 +835,13 @@ export function EventWorkspaceDialog({
                   onDeleteBlock(block.id);
                   onClose();
                 }}
-                title="Delete block"
+                title="Delete solo block"
               >
                 <Trash2 className="size-3" />
               </Button>
-            )}
+            </div>
           </div>
-        </div>
+        )}
       </DialogContent>
     </Dialog>
   );
