@@ -1234,6 +1234,651 @@ Return ONLY valid JSON:
   }
 }
 
+function buildUpcomingDateReference(todayDateKey: string, days = 21): string {
+  const entries: string[] = [];
+  for (let d = 0; d < days; d++) {
+    const dk = addDaysToDateKey(todayDateKey, d);
+    const [y, m, day] = dk.split("-").map(Number);
+    const dt = new Date(y, (m || 1) - 1, day || 1, 12, 0, 0, 0);
+    const dow = dt.toLocaleDateString("en-US", { weekday: "short" });
+    entries.push(`${dk}(${dow})`);
+  }
+  return entries.join(", ");
+}
+
+/**
+ * Model-First NL Schedule Compiler:
+ * Compiles open-ended natural-language scheduling requests (e.g., "aiim fellowship. 2 hours each week
+ * for the next two weeks", "1h Tuesday morning and 90m Thursday afternoon on CHI rebuttal",
+ * "prepare fellowship statement by Dec 5") into canonical naming + exact window-bounded sessions,
+ * without relying on enumerating brittle regexes.
+ */
+export async function compileNaturalScheduleWithGemma4(params: {
+  model: string;
+  rawInput: string;
+  fallbackGutMinutes: number;
+  applyMultiplier: boolean;
+  calibrationMultiplier: number;
+  explicitDeadlineDateKey?: string;
+  todayDateKey: string;
+  userGraph: UserModelGraph;
+  matchedEmails: ScannedEmailItem[];
+  localPapers: LocalPaperHit[];
+  valenIntentHint?: string;
+}): Promise<{
+  ok: boolean;
+  canonicalTitle: string;
+  matchedTaskModelId: string | null;
+  cadenceNote?: string;
+  deadlineDateKey?: string;
+  immediateSubtasks: string[];
+  sessions: Array<{
+    sessionTitle: string;
+    durationMinutes: number;
+    earliestDateKey: string;
+    latestDateKey: string;
+    preferredTimeOfDay: "morning" | "afternoon" | "any";
+  }>;
+  latencyMs: number;
+}> {
+  const {
+    model,
+    rawInput,
+    fallbackGutMinutes,
+    applyMultiplier,
+    calibrationMultiplier,
+    explicitDeadlineDateKey,
+    todayDateKey,
+    userGraph,
+    matchedEmails,
+    localPapers,
+    valenIntentHint,
+  } = params;
+  const t0 = performance.now();
+
+  const dateMap = buildUpcomingDateReference(todayDateKey, 28);
+  const existingModels = userGraph.taskModels.slice(0, 12).map((m) => ({
+    id: m.id,
+    canonicalTitle: m.canonicalTitle,
+    userEdited: Boolean(m.userEdited),
+    summary: m.summary,
+  }));
+
+  const prompt = `You are Dayframe's structured natural-language calendar compiler running locally on macOS.
+Today is ${todayDateKey}. Upcoming calendar reference:
+${dateMap}
+
+User Profile: ${userGraph.profile.roleAndAffiliation} | ${userGraph.profile.activeDomains}
+Existing Task-Specific Models (reuse exact canonicalTitle and id if this request belongs to one!):
+${JSON.stringify(existingModels)}
+${valenIntentHint ? `Stage-1 Valen Router Hint: ${valenIntentHint}` : ""}
+
+Matched Local Emails:
+${JSON.stringify(matchedEmails.slice(0, 3).map((e) => ({ subject: e.subject, from: e.sender, snippet: e.snippet.slice(0, 220) })))}
+Matched Local PDFs:
+${JSON.stringify(localPapers.slice(0, 4).map((p) => p.title))}
+
+User's Raw Input:
+"${rawInput}"
+Fallback duration if user did NOT state any duration in text: ${fallbackGutMinutes} minutes.
+Explicit deadline picker (if set): ${explicitDeadlineDateKey || "none"}.
+Calibration multiplier (apply ONLY when user gives a rough total estimate rather than explicit block sizes like "two 1-hour blocks" or "2 hours each week"): ×${applyMultiplier ? calibrationMultiplier : 1}.
+
+Compile the user's request into a clean canonical project/task name and concrete 30-90 minute calendar sessions:
+1. "canonicalTitle": Standard, concise title stripped of scheduling phrasing (e.g., "aiim fellowship. 2 hours each week for the next two weeks." -> "AIIM Fellowship", preserving acronyms like AIIM, NSF, CHI, UIST, ICML, NeurIPS, PhD, UMich). NEVER copy scheduling instructions into the title!
+2. "sessions":
+   - If the user asks for weekly cadence (e.g., "2 hours each week for the next 2 weeks"), emit sessions in Week 1 [today..today+6] and Week 2 [today+7..today+13] (splitting >90m/week into 60-90m blocks, e.g., "AIIM Fellowship — Wk 1 (1/2)").
+   - If the user names specific days/times of day (e.g., "Tuesday morning and Thursday afternoon"), set earliestDateKey=latestDateKey to those exact YYYY-MM-DD dates from the calendar reference above!
+   - If it is a multi-hour deadline project (>=3h total), start Session 1 as scoping/planning and backtrack before the deadline.
+   - If it is a single task, emit 1 session with [todayDateKey .. latestDateKey].
+3. "immediateSubtasks": Extract 1-3 concrete immediate action items if matched emails/input reveal next steps (otherwise []).
+
+Return ONLY valid JSON:
+{
+  "canonicalTitle": string,
+  "matchedTaskModelId": string | null,
+  "cadenceNote": string | null,
+  "deadlineDateKey": string | null,
+  "immediateSubtasks": string[],
+  "sessions": [
+    {
+      "sessionTitle": string,
+      "durationMinutes": number,
+      "earliestDateKey": string,
+      "latestDateKey": string,
+      "preferredTimeOfDay": "morning" | "afternoon" | "any"
+    }
+  ]
+}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        stream: false,
+        keep_alive: 0,
+        format: "json",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      return {
+        ok: false,
+        canonicalTitle: "",
+        matchedTaskModelId: null,
+        immediateSubtasks: [],
+        sessions: [],
+        latencyMs,
+      };
+    }
+
+    const body = (await res.json()) as { message?: { content?: string } };
+    const parsed = JSON.parse(body.message?.content ?? "{}") as {
+      canonicalTitle?: string;
+      matchedTaskModelId?: string | null;
+      cadenceNote?: string | null;
+      deadlineDateKey?: string | null;
+      immediateSubtasks?: unknown[];
+      sessions?: Array<Record<string, unknown>>;
+    };
+
+    const canonicalTitle = String(parsed.canonicalTitle || "").trim();
+    const sessions = (parsed.sessions ?? [])
+      .filter((s) => Number(s.durationMinutes || 0) >= 15)
+      .slice(0, 24)
+      .map((s) => ({
+        sessionTitle:
+          String(s.sessionTitle || canonicalTitle || "Focus Session")
+            .trim()
+            .slice(0, 110),
+        durationMinutes: Math.max(
+          15,
+          Math.min(
+            180,
+            Math.round((Number(s.durationMinutes) || 60) / 15) * 15
+          )
+        ),
+        earliestDateKey:
+          typeof s.earliestDateKey === "string" &&
+          /^\d{4}-\d{2}-\d{2}$/.test(s.earliestDateKey)
+            ? s.earliestDateKey
+            : todayDateKey,
+        latestDateKey:
+          typeof s.latestDateKey === "string" &&
+          /^\d{4}-\d{2}-\d{2}$/.test(s.latestDateKey)
+            ? s.latestDateKey
+            : explicitDeadlineDateKey || addDaysToDateKey(todayDateKey, 14),
+        preferredTimeOfDay:
+          s.preferredTimeOfDay === "morning" ||
+          s.preferredTimeOfDay === "afternoon"
+            ? (s.preferredTimeOfDay as "morning" | "afternoon")
+            : ("any" as const),
+      }));
+
+    if (!canonicalTitle || sessions.length === 0) {
+      return {
+        ok: false,
+        canonicalTitle: "",
+        matchedTaskModelId: null,
+        immediateSubtasks: [],
+        sessions: [],
+        latencyMs,
+      };
+    }
+
+    return {
+      ok: true,
+      canonicalTitle,
+      matchedTaskModelId:
+        typeof parsed.matchedTaskModelId === "string" &&
+        parsed.matchedTaskModelId
+          ? parsed.matchedTaskModelId
+          : null,
+      cadenceNote: parsed.cadenceNote
+        ? String(parsed.cadenceNote).slice(0, 90)
+        : undefined,
+      deadlineDateKey:
+        typeof parsed.deadlineDateKey === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(parsed.deadlineDateKey)
+          ? parsed.deadlineDateKey
+          : explicitDeadlineDateKey,
+      immediateSubtasks: Array.isArray(parsed.immediateSubtasks)
+        ? parsed.immediateSubtasks
+            .map((t) => String(t || "").trim().slice(0, 120))
+            .filter(Boolean)
+            .slice(0, 5)
+        : [],
+      sessions,
+      latencyMs,
+    };
+  } catch {
+    return {
+      ok: false,
+      canonicalTitle: "",
+      matchedTaskModelId: null,
+      immediateSubtasks: [],
+      sessions: [],
+      latencyMs: Math.round(performance.now() - t0),
+    };
+  }
+}
+
+/**
+ * Unified Multi-Action Per-Event Co-Pilot Compiler:
+ * Interprets arbitrary natural-language instructions inside a Calendar Event's chat
+ * (e.g., "add two 1-hour blocks to prepare for this from today until the meeting, pull email context,
+ * and remind me 30m before") into structured actions executed in a single pass.
+ */
+export async function executeEventChatTurnWithGemma4(params: {
+  model: string;
+  event: CalendarBlock;
+  userMessage: string;
+  todayDateKey: string;
+  valenIntentHint?: string;
+  matchedEmails: ScannedEmailItem[];
+  matchedCaptures: Array<{ app: string; title: string; summary: string }>;
+  localPapers: LocalPaperHit[];
+  userGraph: UserModelGraph;
+}): Promise<{
+  ok: boolean;
+  reply: string;
+  renameTitleTo?: string;
+  resizeMinutesTo?: number;
+  moveToDateKey?: string;
+  sessionsToSchedule: Array<{
+    sessionTitle: string;
+    durationMinutes: number;
+    earliestDateKey: string;
+    latestDateKey: string;
+    mustFinishBeforeMinutes?: number;
+    preferredTimeOfDay: "morning" | "afternoon" | "any";
+    kind: "prep" | "deep-work" | "follow-up";
+  }>;
+  subtasksToAdd: string[];
+  remindersToAdd: Array<{ text: string; leadMinutes: number }>;
+  papersToAttach: Array<{
+    title: string;
+    authorsOrVenue?: string;
+    pathOrUrl?: string;
+  }>;
+  notesDigestToAppend?: string;
+  latencyMs: number;
+}> {
+  const {
+    model,
+    event,
+    userMessage,
+    todayDateKey,
+    valenIntentHint,
+    matchedEmails,
+    matchedCaptures,
+    localPapers,
+    userGraph,
+  } = params;
+  const t0 = performance.now();
+  const dateMap = buildUpcomingDateReference(todayDateKey, 21);
+
+  const prompt = `You are Dayframe's structured Event Co-Pilot embedded inside a specific macOS calendar event.
+Today is ${todayDateKey}. Upcoming dates: ${dateMap}
+${valenIntentHint ? `Stage-1 Valen Intent Router: ${valenIntentHint}` : ""}
+
+Target Calendar Event:
+- Title: "${event.title}"
+- Scheduled: ${event.dateKey} at ${formatMinutesToTime(event.startMinutes)} (startMinutes=${event.startMinutes}, duration=${event.durationMinutes}m)
+- Attendees: ${(event.attendeeNames ?? []).join(", ") || "Solo"}
+- Current Notes: ${event.notes || event.rationale || "(None)"}
+- Current Todos: ${(event.subtasks ?? []).map((t) => t.text).join("; ") || "(None)"}
+
+Matched Local Emails:
+${JSON.stringify(matchedEmails.slice(0, 4).map((m) => ({ from: m.sender, subject: m.subject, snippet: m.snippet.slice(0, 280) })))}
+Matched Slack / Screen Captures:
+${JSON.stringify(matchedCaptures.slice(0, 5))}
+Matched Local PDFs on Mac:
+${JSON.stringify(localPapers.slice(0, 5).map((p) => ({ title: p.title, path: p.path })))}
+User Profile: ${userGraph.profile.roleAndAffiliation} | ${userGraph.profile.activeDomains}
+
+User's Message in Event Chat:
+"${userMessage}"
+
+Translate the user's message into concrete structured actions on or around this event:
+- If the user asks to schedule prep or work blocks (e.g. "add two one-hour blocks to prepare for this anytime from today until the meeting time"), populate "sessionsToSchedule" with exact count, durationMinutes, [earliestDateKey .. latestDateKey] (set latestDateKey="${event.dateKey}" and mustFinishBeforeMinutes=${Math.max(480, event.startMinutes - 15)} when before the meeting!), and clean titles like "Prep: ${event.title} (1/2)".
+- If the user asks to read context / emails / Slack / papers, synthesize key details in "notesDigestToAppend", extract concrete next actions in "subtasksToAdd", and include relevant local PDFs (preserving their exact "path" in pathOrUrl!) or scholarly papers in "papersToAttach".
+- Populate "renameTitleTo", "resizeMinutesTo", "moveToDateKey", or "remindersToAdd" ONLY if requested.
+- Write a direct, factual "reply" summarizing what you did or answering the user's question.
+
+Return ONLY valid JSON:
+{
+  "reply": string,
+  "renameTitleTo": string | null,
+  "resizeMinutesTo": number | null,
+  "moveToDateKey": string | null,
+  "sessionsToSchedule": [
+    {
+      "sessionTitle": string,
+      "durationMinutes": number,
+      "earliestDateKey": string,
+      "latestDateKey": string,
+      "mustFinishBeforeMinutes": number | null,
+      "preferredTimeOfDay": "morning" | "afternoon" | "any",
+      "kind": "prep" | "deep-work" | "follow-up"
+    }
+  ],
+  "subtasksToAdd": string[],
+  "remindersToAdd": [{ "text": string, "leadMinutes": number }],
+  "papersToAttach": [{ "title": string, "authorsOrVenue": string | null, "pathOrUrl": string | null }],
+  "notesDigestToAppend": string | null
+}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 35000);
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        stream: false,
+        keep_alive: 0,
+        format: "json",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      return {
+        ok: false,
+        reply: "",
+        sessionsToSchedule: [],
+        subtasksToAdd: [],
+        remindersToAdd: [],
+        papersToAttach: [],
+        latencyMs,
+      };
+    }
+
+    const body = (await res.json()) as { message?: { content?: string } };
+    const parsed = JSON.parse(body.message?.content ?? "{}") as Record<
+      string,
+      unknown
+    >;
+
+    const sessionsRaw = Array.isArray(parsed.sessionsToSchedule)
+      ? (parsed.sessionsToSchedule as Array<Record<string, unknown>>)
+      : [];
+
+    const sessionsToSchedule = sessionsRaw
+      .filter((s) => Number(s.durationMinutes || 0) >= 15)
+      .slice(0, 12)
+      .map((s) => ({
+        sessionTitle: String(s.sessionTitle || `Prep: ${event.title}`)
+          .trim()
+          .slice(0, 110),
+        durationMinutes: Math.max(
+          15,
+          Math.min(
+            180,
+            Math.round((Number(s.durationMinutes) || 60) / 15) * 15
+          )
+        ),
+        earliestDateKey:
+          typeof s.earliestDateKey === "string" &&
+          /^\d{4}-\d{2}-\d{2}$/.test(s.earliestDateKey)
+            ? s.earliestDateKey
+            : todayDateKey,
+        latestDateKey:
+          typeof s.latestDateKey === "string" &&
+          /^\d{4}-\d{2}-\d{2}$/.test(s.latestDateKey)
+            ? s.latestDateKey
+            : event.dateKey >= todayDateKey
+              ? event.dateKey
+              : addDaysToDateKey(todayDateKey, 7),
+        mustFinishBeforeMinutes:
+          typeof s.mustFinishBeforeMinutes === "number"
+            ? s.mustFinishBeforeMinutes
+            : undefined,
+        preferredTimeOfDay:
+          s.preferredTimeOfDay === "morning" ||
+          s.preferredTimeOfDay === "afternoon"
+            ? (s.preferredTimeOfDay as "morning" | "afternoon")
+            : ("any" as const),
+        kind:
+          s.kind === "deep-work" || s.kind === "follow-up"
+            ? (s.kind as "deep-work" | "follow-up")
+            : ("prep" as const),
+      }));
+
+    return {
+      ok: true,
+      reply: String(parsed.reply || "Done.").slice(0, 700),
+      renameTitleTo:
+        typeof parsed.renameTitleTo === "string" && parsed.renameTitleTo.trim()
+          ? parsed.renameTitleTo.trim().slice(0, 120)
+          : undefined,
+      resizeMinutesTo:
+        typeof parsed.resizeMinutesTo === "number" &&
+        parsed.resizeMinutesTo >= 15
+          ? Math.min(240, Math.round(parsed.resizeMinutesTo / 15) * 15)
+          : undefined,
+      moveToDateKey:
+        typeof parsed.moveToDateKey === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(parsed.moveToDateKey)
+          ? parsed.moveToDateKey
+          : undefined,
+      sessionsToSchedule,
+      subtasksToAdd: Array.isArray(parsed.subtasksToAdd)
+        ? parsed.subtasksToAdd
+            .map((t) => String(t || "").trim().slice(0, 120))
+            .filter(Boolean)
+            .slice(0, 6)
+        : [],
+      remindersToAdd: Array.isArray(parsed.remindersToAdd)
+        ? (parsed.remindersToAdd as Array<Record<string, unknown>>)
+            .filter((r) => typeof r.text === "string" && r.text.trim())
+            .map((r) => ({
+              text: String(r.text).trim().slice(0, 120),
+              leadMinutes: Math.max(
+                5,
+                Math.min(1440, Number(r.leadMinutes) || 30)
+              ),
+            }))
+            .slice(0, 4)
+        : [],
+      papersToAttach: Array.isArray(parsed.papersToAttach)
+        ? (parsed.papersToAttach as Array<Record<string, unknown>>)
+            .filter((p) => typeof p.title === "string" && p.title.trim())
+            .map((p) => ({
+              title: String(p.title).trim().slice(0, 140),
+              authorsOrVenue:
+                typeof p.authorsOrVenue === "string" && p.authorsOrVenue.trim()
+                  ? p.authorsOrVenue.trim().slice(0, 90)
+                  : undefined,
+              pathOrUrl:
+                typeof p.pathOrUrl === "string" && p.pathOrUrl.trim()
+                  ? p.pathOrUrl.trim()
+                  : undefined,
+            }))
+            .slice(0, 6)
+        : [],
+      notesDigestToAppend:
+        typeof parsed.notesDigestToAppend === "string" &&
+        parsed.notesDigestToAppend.trim()
+          ? parsed.notesDigestToAppend.trim().slice(0, 600)
+          : undefined,
+      latencyMs,
+    };
+  } catch {
+    return {
+      ok: false,
+      reply: "",
+      sessionsToSchedule: [],
+      subtasksToAdd: [],
+      remindersToAdd: [],
+      papersToAttach: [],
+      latencyMs: Math.round(performance.now() - t0),
+    };
+  }
+}
+
+/**
+ * Structured Standing-Rule & Preference Compiler for the Coach chat:
+ * Replaces brittle keyword regexes when local Gemma 4 is reachable.
+ */
+export async function compileFeedbackRuleWithGemma4(params: {
+  model: string;
+  userText: string;
+  currentSettings: OrganizerSettings;
+}): Promise<{
+  ok: boolean;
+  reply: string;
+  actionSummary: string;
+  settingsPatch?: Partial<OrganizerSettings>;
+  newRule?: Omit<StandingRule, "id">;
+} | null> {
+  const prompt = `You are Dayframe's preference & rule compiler.
+Current settings: workday=${params.currentSettings.workdayStartMinutes}..${params.currentSettings.workdayEndMinutes} mins from midnight, dailyBufferMinutes=${params.currentSettings.dailyBufferMinutes}, calibrationMultiplier=${params.currentSettings.calibrationMultiplier}, protectWeekends=${params.currentSettings.protectWeekends}, notAMorningPersonUntilMinutes=${params.currentSettings.notAMorningPersonUntilMinutes}.
+
+User preference statement: "${params.userText}"
+
+Convert this into structured settingsPatch and/or a StandingRule:
+- Protected window times are minutes from midnight (e.g. 9:00 AM = 540, 12:00 PM = 720, 4:00 PM = 960, 5:30 PM = 1050).
+- Rule categories: "prep-time" | "duration-calibration" | "availability" | "ignore-pattern" | "auto-confirm".
+
+Return ONLY valid JSON:
+{
+  "reply": string,
+  "actionSummary": string,
+  "settingsPatch": {
+    "calibrationMultiplier": number | null,
+    "dailyBufferMinutes": number | null,
+    "protectWeekends": boolean | null,
+    "notAMorningPersonUntilMinutes": number | null,
+    "intervalMinutes": number | null
+  },
+  "newRule": {
+    "title": string,
+    "description": string,
+    "category": "prep-time" | "duration-calibration" | "availability" | "ignore-pattern" | "auto-confirm",
+    "triggerPattern": string | null,
+    "prepDurationMinutes": number | null,
+    "minLeadMinutesBeforeMeeting": number | null,
+    "fixedMinutesOverride": number | null,
+    "protectedWindow": { "startMinutes": number, "endMinutes": number, "label": string } | null
+  } | null
+}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: params.model,
+        stream: false,
+        keep_alive: 0,
+        format: "json",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const body = (await res.json()) as { message?: { content?: string } };
+    const parsed = JSON.parse(body.message?.content ?? "{}") as Record<
+      string,
+      unknown
+    >;
+
+    const sp = (parsed.settingsPatch ?? {}) as Record<string, unknown>;
+    const settingsPatch: Partial<OrganizerSettings> = {};
+    if (typeof sp.calibrationMultiplier === "number" && sp.calibrationMultiplier >= 0.75) {
+      settingsPatch.calibrationMultiplier = sp.calibrationMultiplier;
+    }
+    if (typeof sp.dailyBufferMinutes === "number" && sp.dailyBufferMinutes >= 0) {
+      settingsPatch.dailyBufferMinutes = sp.dailyBufferMinutes;
+    }
+    if (typeof sp.protectWeekends === "boolean") {
+      settingsPatch.protectWeekends = sp.protectWeekends;
+    }
+    if (typeof sp.notAMorningPersonUntilMinutes === "number") {
+      settingsPatch.notAMorningPersonUntilMinutes = sp.notAMorningPersonUntilMinutes;
+    }
+    if (typeof sp.intervalMinutes === "number" && sp.intervalMinutes >= 1) {
+      settingsPatch.intervalMinutes = Math.min(30, sp.intervalMinutes);
+    }
+
+    let newRule: Omit<StandingRule, "id"> | undefined;
+    if (parsed.newRule && typeof parsed.newRule === "object") {
+      const nr = parsed.newRule as Record<string, unknown>;
+      if (typeof nr.title === "string" && nr.title.trim()) {
+        const pw =
+          nr.protectedWindow && typeof nr.protectedWindow === "object"
+            ? (nr.protectedWindow as Record<string, unknown>)
+            : null;
+        newRule = {
+          title: nr.title.trim().slice(0, 90),
+          description: String(nr.description || nr.title).slice(0, 200),
+          category:
+            nr.category === "prep-time" ||
+            nr.category === "duration-calibration" ||
+            nr.category === "ignore-pattern" ||
+            nr.category === "auto-confirm"
+              ? nr.category
+              : "availability",
+          enabled: true,
+          triggerPattern:
+            typeof nr.triggerPattern === "string" && nr.triggerPattern.trim()
+              ? nr.triggerPattern.trim()
+              : undefined,
+          prepDurationMinutes:
+            typeof nr.prepDurationMinutes === "number"
+              ? nr.prepDurationMinutes
+              : undefined,
+          minLeadMinutesBeforeMeeting:
+            typeof nr.minLeadMinutesBeforeMeeting === "number"
+              ? nr.minLeadMinutesBeforeMeeting
+              : undefined,
+          fixedMinutesOverride:
+            typeof nr.fixedMinutesOverride === "number"
+              ? nr.fixedMinutesOverride
+              : undefined,
+          protectedWindow:
+            pw &&
+            typeof pw.startMinutes === "number" &&
+            typeof pw.endMinutes === "number"
+              ? {
+                  startMinutes: pw.startMinutes,
+                  endMinutes: pw.endMinutes,
+                  label: String(pw.label || "Protected"),
+                }
+              : undefined,
+          createdFromFeedback: true,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      reply: String(parsed.reply || "Saved your preference.").slice(0, 400),
+      actionSummary: String(parsed.actionSummary || "Updated rule").slice(0, 90),
+      settingsPatch:
+        Object.keys(settingsPatch).length > 0 ? settingsPatch : undefined,
+      newRule,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function computeCanvasLuminanceSignature(
   ctx: CanvasRenderingContext2D,
   width: number,

@@ -20,9 +20,10 @@ All inference and system access run locally over `127.0.0.1` without external AP
 - **User and Task Models**:
   - Maintains persistent models for ongoing projects/tasks (linking related calendar blocks, emails, captures, papers, and immediate next steps) and higher-level strivings, drawing on hierarchical activity modeling ([StanfordHCI/striving-cocreation](https://github.com/StanfordHCI/striving-cocreation)).
   - Supports inline rename, merge, reassign, and remove operations; edits are stored as constraints for subsequent model runs.
-- **On-Demand Model Execution**:
-  - Screen and window captures queue to `~/.dayframe/capture-queue/` without keeping models in memory.
-  - Local models (`Gemma 4` via Ollama on `127.0.0.1:11434`, and optionally `Valen-Decision-1.5` GGUF on `127.0.0.1:43823`) wake during scheduled batch sweeps or explicit actions, then unload (`keep_alive: 0`) when finished.
+- **Two-Model Division of Labor + Deterministic Slot Solver**:
+  - `Valen-Decision-1.5` (optional local GGUF server on `127.0.0.1:43823`): single-pass `predicate`/`choice`/`score`/`bbox` router for screenshot triage, utterance intent routing, calendar event role classification, Task-Model entity matching, and Mail/PDF relevance filtering.
+  - `Gemma 4` (local Ollama on `127.0.0.1:11434`): compiles open-ended natural-language scheduling requests, multi-action per-event chat instructions, and preference updates into structured session specs; deterministic heuristics provide live input previews and offline fallback, and a constraint solver places sessions into conflict-free slots.
+  - Screen and window captures queue to `~/.dayframe/capture-queue/` without keeping models in memory; models wake on demand or during scheduled batch sweeps, then unload (`keep_alive: 0`).
 
 ## Requirements
 

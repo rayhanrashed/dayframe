@@ -1,4 +1,9 @@
-import { ScannedEmailItem } from "./types";
+import {
+  CalendarBlock,
+  LocalPaperHit,
+  ScannedEmailItem,
+  TaskSpecificModel,
+} from "./types";
 
 const MAC_BRIDGE_BASE = "http://127.0.0.1:43822";
 
@@ -525,3 +530,402 @@ export async function evaluateMeetingPrepNeedWithValen(params: {
     recommendedPrepMinutes: Number(bucketAns?.choice) || 60,
   };
 }
+
+export interface ValenUtteranceRoute {
+  intent:
+    | "schedule_single_block"
+    | "schedule_multi_or_cadence"
+    | "pull_external_context"
+    | "modify_event_artifacts"
+    | "update_global_rule"
+    | "copilot_question";
+  intentConfidence: number;
+  needsGemmaCompiler: boolean;
+  needsContextSearch: boolean;
+  latencyMs: number;
+}
+
+/**
+ * System-1 NL Router: Routes any natural-language user input in 1 forward pass (0 output tokens),
+ * deciding intent category, whether Gemma 4's structured compiler is needed, and whether to pull Mail/PDF context.
+ */
+export async function routeUserUtteranceWithValen(params: {
+  text: string;
+  surface: "composer" | "event-chat" | "coach";
+  eventContextTitle?: string;
+  modelId: string;
+  port: number;
+  macPairingToken?: string;
+}): Promise<ValenUtteranceRoute | null> {
+  const contextLine = params.eventContextTitle
+    ? `Surface: ${params.surface} (inside event "${params.eventContextTitle}")\nUser input: "${params.text}"`
+    : `Surface: ${params.surface}\nUser input: "${params.text}"`;
+
+  const res = await postValenDecisions({
+    port: params.port,
+    macPairingToken: params.macPairingToken,
+    timeoutMs: 3500,
+    payload: {
+      model: params.modelId || "valen",
+      input: contextLine,
+      questions: [
+        {
+          name: "intent",
+          type: "choice",
+          instructions: "Classify what the user wants Dayframe to do.",
+          choices: [
+            {
+              value: "schedule_single_block",
+              description: "Schedule one simple standalone task or time block",
+            },
+            {
+              value: "schedule_multi_or_cadence",
+              description:
+                "Schedule multiple blocks, a weekly cadence, prep sessions before a meeting, or a multi-part deadline",
+            },
+            {
+              value: "pull_external_context",
+              description:
+                "Search or attach context from emails, Slack messages, or relevant papers/PDFs",
+            },
+            {
+              value: "modify_event_artifacts",
+              description:
+                "Add a checklist todo, reminder alert, paper, note, rename, resize, or move an existing event",
+            },
+            {
+              value: "update_global_rule",
+              description:
+                "Change a standing scheduling rule, duration habit, buffer, or working hours preference",
+            },
+            {
+              value: "copilot_question",
+              description:
+                "Ask an open question, brainstorm, or summarize status",
+            },
+          ],
+        },
+        {
+          name: "needs_gemma_compiler",
+          type: "predicate",
+          instructions:
+            "The user input contains natural phrasing, temporal constraints, multiple steps, or implicit naming that benefits from full LLM structured parsing rather than a literal title string.",
+        },
+        {
+          name: "needs_context_search",
+          type: "predicate",
+          instructions:
+            "Fulfilling this request benefits from checking related emails, Slack messages, or local PDF papers.",
+        },
+      ],
+    },
+  });
+
+  if (!res.ok || !res.data?.answers) return null;
+  const byName = new Map(res.data.answers.map((a) => [a.name, a]));
+  const rawIntent = byName.get("intent")?.choice;
+  const validIntents = new Set([
+    "schedule_single_block",
+    "schedule_multi_or_cadence",
+    "pull_external_context",
+    "modify_event_artifacts",
+    "update_global_rule",
+    "copilot_question",
+  ]);
+  const intent = validIntents.has(String(rawIntent))
+    ? (rawIntent as ValenUtteranceRoute["intent"])
+    : "schedule_multi_or_cadence";
+
+  return {
+    intent,
+    intentConfidence: byName.get("intent")?.confidence ?? 0.7,
+    needsGemmaCompiler:
+      (byName.get("needs_gemma_compiler")?.probability ?? 1) >= 0.35,
+    needsContextSearch:
+      (byName.get("needs_context_search")?.probability ?? 0.5) >= 0.45,
+    latencyMs: res.latencyMs,
+  };
+}
+
+/**
+ * Semantic Event-Role Classifier: Replaces relying only on static chore word lists
+ * when Valen is active — classifies each calendar entry semantically in 1 forward pass.
+ */
+export async function classifyCalendarEventsWithValen(params: {
+  blocks: CalendarBlock[];
+  modelId: string;
+  port: number;
+  macPairingToken?: string;
+}): Promise<
+  Map<
+    string,
+    {
+      role:
+        | "substantive_meeting_needing_prep"
+        | "routine_meeting_no_prep"
+        | "personal_chore_or_life_routine"
+        | "solo_work_block";
+      prepUrgency: number;
+    }
+  > | null
+> {
+  const out = new Map<
+    string,
+    {
+      role:
+        | "substantive_meeting_needing_prep"
+        | "routine_meeting_no_prep"
+        | "personal_chore_or_life_routine"
+        | "solo_work_block";
+      prepUrgency: number;
+    }
+  >();
+
+  let anyOk = false;
+  for (const blk of params.blocks.slice(0, 24)) {
+    if (blk.isDayframeCreated || blk.occupiesTimeOnly) continue;
+    const desc = `Title: "${blk.title}" | Duration: ${blk.durationMinutes}m | Attendees: ${
+      blk.attendeeCount ?? 0
+    } | Video call: ${Boolean(blk.hasVideoLink)} | Calendar: "${
+      blk.calendarTitle || ""
+    }" | Notes: "${(blk.notes || "").slice(0, 180)}"`;
+
+    const res = await postValenDecisions({
+      port: params.port,
+      macPairingToken: params.macPairingToken,
+      timeoutMs: 3500,
+      payload: {
+        model: params.modelId || "valen",
+        input: desc,
+        questions: [
+          {
+            name: "role",
+            type: "choice",
+            instructions: "Classify what kind of calendar entry this is.",
+            choices: [
+              {
+                value: "substantive_meeting_needing_prep",
+                description:
+                  "A multi-person meeting, advisor/committee/client review, talk, or interview that warrants advance preparation",
+              },
+              {
+                value: "routine_meeting_no_prep",
+                description:
+                  "A casual sync, daily standup, social coffee, or passive seminar needing no dedicated prep block",
+              },
+              {
+                value: "personal_chore_or_life_routine",
+                description:
+                  "A household chore, cleaning, meal, workout, commute, medical errand, or personal reminder",
+              },
+              {
+                value: "solo_work_block",
+                description: "Already a solo focus/task block on the user's calendar",
+              },
+            ],
+          },
+          {
+            name: "prep_urgency",
+            type: "score",
+            instructions: "How strongly does this entry warrant advance prep?",
+            levels: [
+              { label: "0", description: "None (chore, solo block, or casual)" },
+              { label: "1", description: "Optional light skim" },
+              { label: "2", description: "Recommended 30-45m prep" },
+              { label: "3", description: "High-stakes 60-90m prep" },
+            ],
+          },
+        ],
+      },
+    });
+
+    if (!res.ok || !res.data?.answers) {
+      if (!anyOk) return null;
+      continue;
+    }
+    anyOk = true;
+    const roleAns = res.data.answers.find((a) => a.name === "role")?.choice;
+    const scoreAns =
+      res.data.answers.find((a) => a.name === "prep_urgency")?.score ?? 0;
+    const validRoles = new Set([
+      "substantive_meeting_needing_prep",
+      "routine_meeting_no_prep",
+      "personal_chore_or_life_routine",
+      "solo_work_block",
+    ]);
+    out.set(blk.id, {
+      role: validRoles.has(String(roleAns))
+        ? (roleAns as
+            | "substantive_meeting_needing_prep"
+            | "routine_meeting_no_prep"
+            | "personal_chore_or_life_routine"
+            | "solo_work_block")
+        : "routine_meeting_no_prep",
+      prepUrgency: scoreAns,
+    });
+  }
+
+  return anyOk ? out : null;
+}
+
+/**
+ * Semantic Entity Resolution (Tempo propose-and-reconcile):
+ * Matches a new task, email, or paper to an existing TaskSpecificModel even when surface words differ
+ * (e.g., "UMich AI in Medicine Scholars" <-> "AIIM Fellowship").
+ */
+export async function matchTaskModelWithValen(params: {
+  candidateTitle: string;
+  candidateContext?: string;
+  taskModels: TaskSpecificModel[];
+  modelId: string;
+  port: number;
+  macPairingToken?: string;
+}): Promise<{ matchedModelId: string | null; confidence: number } | null> {
+  const { candidateTitle, candidateContext, taskModels } = params;
+  if (taskModels.length === 0) return null;
+
+  const choices = [
+    ...taskModels.slice(0, 10).map((m) => ({
+      value: m.id,
+      description: `${m.canonicalTitle} — ${m.summary.slice(0, 100)}`,
+    })),
+    {
+      value: "__NEW__",
+      description: "Distinct new project or task not covered by any existing model above",
+    },
+  ];
+
+  const res = await postValenDecisions({
+    port: params.port,
+    macPairingToken: params.macPairingToken,
+    timeoutMs: 3500,
+    payload: {
+      model: params.modelId || "valen",
+      input: `Candidate item: "${candidateTitle}"${
+        candidateContext ? `\nContext: ${candidateContext.slice(0, 240)}` : ""
+      }`,
+      questions: [
+        {
+          name: "best_model",
+          type: "choice",
+          instructions:
+            "Select which existing Task-Specific Model this item belongs to, or __NEW__ if none.",
+          choices,
+        },
+        {
+          name: "same_activity",
+          type: "predicate",
+          instructions:
+            "This item is genuinely part of one of the listed ongoing projects rather than a separate topic.",
+        },
+      ],
+    },
+  });
+
+  if (!res.ok || !res.data?.answers) return null;
+  const choiceAns = res.data.answers.find((a) => a.name === "best_model");
+  const sameProb =
+    res.data.answers.find((a) => a.name === "same_activity")?.probability ?? 0;
+
+  if (
+    !choiceAns?.choice ||
+    choiceAns.choice === "__NEW__" ||
+    sameProb < 0.5
+  ) {
+    return { matchedModelId: null, confidence: 1 - sameProb };
+  }
+
+  return {
+    matchedModelId: choiceAns.choice,
+    confidence: Math.max(choiceAns.confidence ?? 0, sameProb),
+  };
+}
+
+/**
+ * Semantic Context Reranker: Filters candidate Spotlight PDFs and Mail messages
+ * via Valen predicate scoring so noisy keyword collisions don't attach to an event.
+ */
+export async function rerankContextItemsWithValen(params: {
+  eventTitle: string;
+  eventNotes?: string;
+  emails: ScannedEmailItem[];
+  papers: LocalPaperHit[];
+  modelId: string;
+  port: number;
+  macPairingToken?: string;
+}): Promise<{
+  usedValen: boolean;
+  emails: ScannedEmailItem[];
+  papers: LocalPaperHit[];
+} | null> {
+  const { eventTitle, eventNotes, emails, papers, modelId, port, macPairingToken } =
+    params;
+  if (emails.length === 0 && papers.length === 0) {
+    return { usedValen: false, emails: [], papers: [] };
+  }
+
+  const keptEmails: ScannedEmailItem[] = [];
+  const keptPapers: LocalPaperHit[] = [];
+  let anyOk = false;
+
+  for (const em of emails) {
+    const res = await postValenDecisions({
+      port,
+      macPairingToken,
+      timeoutMs: 3000,
+      payload: {
+        model: modelId || "valen",
+        input: `Target Event: "${eventTitle}" (${(eventNotes || "").slice(0, 120)})\nCandidate Email: From ${em.sender} | Subject: "${em.subject}" | Snippet: ${em.snippet.slice(0, 220)}`,
+        questions: [
+          {
+            name: "relevant",
+            type: "predicate",
+            instructions:
+              "This email contains context, instructions, links, or background directly relevant to the target event.",
+          },
+        ],
+      },
+    });
+    if (!res.ok || !res.data?.answers?.[0]) {
+      if (!anyOk) return null;
+      keptEmails.push(em);
+      continue;
+    }
+    anyOk = true;
+    if ((res.data.answers[0].probability ?? 0) >= 0.45) {
+      keptEmails.push(em);
+    }
+  }
+
+  for (const pap of papers) {
+    const res = await postValenDecisions({
+      port,
+      macPairingToken,
+      timeoutMs: 3000,
+      payload: {
+        model: modelId || "valen",
+        input: `Target Event: "${eventTitle}" (${(eventNotes || "").slice(0, 120)})\nCandidate PDF File: "${pap.title}" (${pap.filename})`,
+        questions: [
+          {
+            name: "relevant_pdf",
+            type: "predicate",
+            instructions:
+              "This PDF paper or document is topically relevant to preparing for or working on the target event.",
+          },
+        ],
+      },
+    });
+    if (!res.ok || !res.data?.answers?.[0]) {
+      if (!anyOk) return null;
+      keptPapers.push(pap);
+      continue;
+    }
+    anyOk = true;
+    if ((res.data.answers[0].probability ?? 0) >= 0.45) {
+      keptPapers.push(pap);
+    }
+  }
+
+  return { usedValen: anyOk, emails: keptEmails, papers: keptPapers };
+}
+

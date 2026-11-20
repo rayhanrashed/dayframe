@@ -46,7 +46,10 @@ import {
 import {
   analyzeScreenshotWithGemma4,
   chatAndEnrichEventWithGemma4,
+  compileFeedbackRuleWithGemma4,
+  compileNaturalScheduleWithGemma4,
   decomposeGoalWithGemma4,
+  executeEventChatTurnWithGemma4,
   induceUserAndTaskModelsWithGemma4,
   LocalGemmaStatus,
   planHolisticCalendarWithGemma4,
@@ -55,14 +58,19 @@ import {
   unloadGemmaModelImmediately,
 } from "@/lib/gemma-client";
 import {
+  classifyCalendarEventsWithValen,
   cropImageToValenBbox,
   filterInboxEmailsWithValen,
+  matchTaskModelWithValen,
   probeValenRuntime,
+  rerankContextItemsWithValen,
+  routeUserUtteranceWithValen,
   runValenScreenshotGate,
   VALEN_MODEL_CATALOG,
   ValenRuntimeStatus,
 } from "@/lib/valen-decision";
 import {
+  placeCompiledSessionsOntoCalendar,
   pullNextFutureTaskIntoToday,
   scheduleBlocksForTargetEvent,
   scheduleTaskOntoCalendar,
@@ -721,9 +729,77 @@ export function DayframeApp() {
       const fetchedEmails = mailRes.messages;
       setScannedEmails(fetchedEmails);
 
-      const eligibleMeetings = fetchedCalendarBlocks.filter(
-        isEligibleRealMeetingForPrep
-      );
+      const valenSpec =
+        VALEN_MODEL_CATALOG.find((v) => v.id === settings.valenModelId) ??
+        VALEN_MODEL_CATALOG[0];
+
+      // Phase 1: Valen classifies calendar event roles semantically + screens Mail newsletters, then stops immediately
+      let candidateEmails = fetchedEmails;
+      let valenRoles: Awaited<
+        ReturnType<typeof classifyCalendarEventsWithValen>
+      > = null;
+
+      if (
+        settings.valenEnabled &&
+        (fetchedCalendarBlocks.length > 0 || fetchedEmails.length > 0)
+      ) {
+        setModelLifecycle((prev) => ({ ...prev, activePhase: "waking-valen" }));
+        await wakeValenViaMacDaemon({
+          pairingToken: macPairingToken,
+          port: settings.valenPort,
+          ggufFile: valenSpec.ggufFile,
+        });
+        setModelLifecycle((prev) => ({
+          ...prev,
+          activePhase: "screening-valen",
+        }));
+
+        if (fetchedCalendarBlocks.length > 0) {
+          valenRoles = await classifyCalendarEventsWithValen({
+            blocks: fetchedCalendarBlocks,
+            modelId: settings.valenModelId,
+            port: settings.valenPort,
+            macPairingToken,
+          });
+        }
+
+        if (fetchedEmails.length > 0) {
+          const emailGate = await filterInboxEmailsWithValen({
+            emails: fetchedEmails,
+            modelId: settings.valenModelId,
+            port: settings.valenPort,
+            threshold: settings.valenSignalThreshold,
+            macPairingToken,
+          });
+          if (emailGate.usedValen) {
+            candidateEmails = emailGate.keptEmails;
+            appendLog({
+              stage: "valen-gate",
+              title: `Valen screened ${fetchedEmails.length} Mail messages`,
+              detail: `Filtered ${emailGate.droppedCount} newsletters/FYI alerts; forwarded ${candidateEmails.length} to Gemma 4.`,
+              modelUsed: settings.valenModelId,
+              latencyMs: emailGate.totalLatencyMs,
+            });
+          }
+        }
+
+        if (settings.unloadModelsAfterBatch) {
+          await stopValenViaMacDaemon(macPairingToken);
+        }
+      }
+
+      const eligibleMeetings = fetchedCalendarBlocks.filter((blk) => {
+        if (!isEligibleRealMeetingForPrep(blk)) return false;
+        const vRole = valenRoles?.get(blk.id);
+        if (
+          vRole &&
+          (vRole.role === "personal_chore_or_life_routine" ||
+            vRole.role === "solo_work_block")
+        ) {
+          return false;
+        }
+        return true;
+      });
       const skippedChoreCount = Math.max(
         0,
         fetchedCalendarBlocks.length - eligibleMeetings.length
@@ -737,47 +813,6 @@ export function DayframeApp() {
               : ""
           }`
       );
-
-      const valenSpec =
-        VALEN_MODEL_CATALOG.find((v) => v.id === settings.valenModelId) ??
-        VALEN_MODEL_CATALOG[0];
-
-      // Phase 1 (Optional): Valen screens Apple Mail newsletters, then stops immediately
-      let candidateEmails = fetchedEmails;
-      if (settings.valenEnabled && fetchedEmails.length > 0) {
-        setModelLifecycle((prev) => ({ ...prev, activePhase: "waking-valen" }));
-        await wakeValenViaMacDaemon({
-          pairingToken: macPairingToken,
-          port: settings.valenPort,
-          ggufFile: valenSpec.ggufFile,
-        });
-        setModelLifecycle((prev) => ({
-          ...prev,
-          activePhase: "screening-valen",
-        }));
-
-        const emailGate = await filterInboxEmailsWithValen({
-          emails: fetchedEmails,
-          modelId: settings.valenModelId,
-          port: settings.valenPort,
-          threshold: settings.valenSignalThreshold,
-          macPairingToken,
-        });
-        if (emailGate.usedValen) {
-          candidateEmails = emailGate.keptEmails;
-          appendLog({
-            stage: "valen-gate",
-            title: `Valen screened ${fetchedEmails.length} Mail messages`,
-            detail: `Filtered ${emailGate.droppedCount} newsletters/FYI alerts; forwarded ${candidateEmails.length} to Gemma 4.`,
-            modelUsed: settings.valenModelId,
-            latencyMs: emailGate.totalLatencyMs,
-          });
-        }
-
-        if (settings.unloadModelsAfterBatch) {
-          await stopValenViaMacDaemon(macPairingToken);
-        }
-      }
 
       // Start ONLY from real existing calendar events + explicit keyword rules (NO blind recurring chore prep!)
       let workingBlocks = reconcilePrepBlocks(
@@ -1876,11 +1911,7 @@ export function DayframeApp() {
     );
   };
 
-  const handleSendFeedback = (text: string) => {
-    const res = applyUserRuleFeedback({ text, blocks, rules, settings });
-    setBlocks(res.blocks);
-    setRules(res.rules);
-    setSettings(res.settings);
+  const handleSendFeedback = async (text: string) => {
     setMessages((prev) => [
       ...prev,
       {
@@ -1889,6 +1920,66 @@ export function DayframeApp() {
         text,
         timestampIso: new Date().toISOString(),
       },
+    ]);
+
+    try {
+      if (macBridgeState.paired && macPairingToken) {
+        await wakeOllamaViaMacDaemon(macPairingToken);
+      }
+      const gStat = await probeLocalGemma(settings.gemmaModel);
+      if (gStat.reachable) {
+        const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+        const compiled = await compileFeedbackRuleWithGemma4({
+          model: tag,
+          userText: text,
+          currentSettings: settings,
+        });
+        if (compiled?.ok) {
+          const nextSettings = compiled.settingsPatch
+            ? { ...settings, ...compiled.settingsPatch }
+            : settings;
+          const nextRules = compiled.newRule
+            ? [
+                { ...compiled.newRule, id: `rule-ai-${Date.now()}` },
+                ...rules,
+              ]
+            : rules;
+          setSettings(nextSettings);
+          setRules(nextRules);
+          setBlocks((prev) =>
+            reconcilePrepBlocks(prev, nextRules, nextSettings, todayKey)
+          );
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `a-${Date.now() + 1}`,
+              role: "assistant",
+              text: compiled.reply,
+              timestampIso: new Date().toISOString(),
+              appliedActionSummary: compiled.actionSummary,
+            },
+          ]);
+          showToast(compiled.actionSummary);
+          return;
+        }
+      }
+    } finally {
+      if (settings.unloadModelsAfterBatch) {
+        await sleepAllModelsViaMacDaemon({
+          pairingToken: macPairingToken,
+          gemmaModel: settings.gemmaModel,
+        });
+        await unloadGemmaModelImmediately(settings.gemmaModel);
+      }
+    }
+
+    // Offline fallback heuristic
+    const res = applyUserRuleFeedback({ text, blocks, rules, settings });
+    setBlocks(res.blocks);
+    setRules(res.rules);
+    setSettings(res.settings);
+    setMessages((prev) => [
+      ...prev,
       {
         id: `a-${Date.now() + 1}`,
         role: "assistant",
@@ -1897,11 +1988,6 @@ export function DayframeApp() {
         appliedActionSummary: res.actionSummary,
       },
     ]);
-    appendLog({
-      stage: "feedback",
-      title: "Applied user feedback rule",
-      detail: res.actionSummary,
-    });
     showToast(res.actionSummary);
   };
 
@@ -2249,14 +2335,26 @@ export function DayframeApp() {
       todayKey,
     });
 
-    // Automatically search local Mail & local PDFs for matching context on creation!
-    const [matchedEmails, matchedPapers] =
+    // Stage 1 (Valen Router + Semantic Task-Model Matcher + Context Reranker when active)
+    const wordCount = task.title.trim().split(/\s+/).length;
+    let valenRoute: Awaited<ReturnType<typeof routeUserUtteranceWithValen>> = null;
+    if (settings.valenEnabled && wordCount >= 3) {
+      valenRoute = await routeUserUtteranceWithValen({
+        text: task.title,
+        surface: "composer",
+        modelId: settings.valenModelId,
+        port: settings.valenPort,
+        macPairingToken,
+      });
+    }
+
+    const [rawMatchedEmails, rawMatchedPapers] =
       macBridgeState.paired && macPairingToken
         ? await Promise.all([
             searchMacMailByQuery({
               pairingToken: macPairingToken,
               query: parsed.canonicalTitle,
-              limit: 4,
+              limit: 5,
             }),
             searchLocalMacPapers({
               pairingToken: macPairingToken,
@@ -2264,6 +2362,176 @@ export function DayframeApp() {
             }),
           ])
         : [[], []];
+
+    let matchedEmails = rawMatchedEmails;
+    let matchedPapers = rawMatchedPapers;
+    if (
+      settings.valenEnabled &&
+      (rawMatchedEmails.length > 0 || rawMatchedPapers.length > 0)
+    ) {
+      const reranked = await rerankContextItemsWithValen({
+        eventTitle: parsed.canonicalTitle,
+        emails: rawMatchedEmails,
+        papers: rawMatchedPapers,
+        modelId: settings.valenModelId,
+        port: settings.valenPort,
+        macPairingToken,
+      });
+      if (reranked?.usedValen) {
+        matchedEmails = reranked.emails;
+        matchedPapers = reranked.papers;
+      }
+    }
+
+    // Use Gemma 4's structured NL compiler whenever the input has natural-language phrasing,
+    // Valen flags complexity, or the user clicked Smart Breakdown!
+    const shouldUseGemmaCompiler =
+      Boolean(task.useGemmaBreakdown) ||
+      Boolean(valenRoute?.needsGemmaCompiler) ||
+      wordCount >= 4;
+
+    if (shouldUseGemmaCompiler) {
+      setDecomposingWithAi(true);
+      try {
+        if (macBridgeState.paired && macPairingToken) {
+          await wakeOllamaViaMacDaemon(macPairingToken);
+        }
+        const gStat = await probeLocalGemma(settings.gemmaModel);
+        if (gStat.reachable) {
+          const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+          const compiled = await compileNaturalScheduleWithGemma4({
+            model: tag,
+            rawInput: task.title,
+            fallbackGutMinutes: task.gutMinutes,
+            applyMultiplier: task.applyMultiplier,
+            calibrationMultiplier: settings.calibrationMultiplier,
+            explicitDeadlineDateKey: task.deadlineDateKey,
+            todayDateKey: todayKey,
+            userGraph,
+            matchedEmails,
+            localPapers: matchedPapers,
+            valenIntentHint: valenRoute?.intent,
+          });
+
+          if (compiled.ok && compiled.sessions.length > 0) {
+            // Optional Valen semantic Task-Model check if Gemma didn't pin an existing ID
+            let resolvedTmTitle = compiled.canonicalTitle;
+            if (!compiled.matchedTaskModelId && settings.valenEnabled && userGraph.taskModels.length > 0) {
+              const vMatch = await matchTaskModelWithValen({
+                candidateTitle: compiled.canonicalTitle,
+                candidateContext: task.title,
+                taskModels: userGraph.taskModels,
+                modelId: settings.valenModelId,
+                port: settings.valenPort,
+                macPairingToken,
+              });
+              const foundTm = vMatch?.matchedModelId
+                ? userGraph.taskModels.find((m) => m.id === vMatch.matchedModelId)
+                : undefined;
+              if (foundTm) resolvedTmTitle = foundTm.canonicalTitle;
+            } else if (compiled.matchedTaskModelId) {
+              const foundTm = userGraph.taskModels.find(
+                (m) => m.id === compiled.matchedTaskModelId
+              );
+              if (foundTm) resolvedTmTitle = foundTm.canonicalTitle;
+            }
+
+            const up = upsertTaskModelFromSchedule({
+              graph: userGraph,
+              canonicalTitle: resolvedTmTitle,
+              cadenceNote: compiled.cadenceNote,
+              deadlineDateKey: compiled.deadlineDateKey,
+              typicalSessionMinutes: compiled.sessions[0].durationMinutes,
+              matchedEmails,
+              matchedPapers,
+            });
+            const aiTodos: EventSubtask[] = compiled.immediateSubtasks.map(
+              (t, idx) => ({
+                id: `ai-sub-${Date.now()}-${idx}`,
+                text: t,
+                done: false,
+                source: "Gemma 4",
+              })
+            );
+            const enrichedTm = {
+              ...up.taskModel,
+              immediateTodos: [
+                ...up.taskModel.immediateTodos,
+                ...aiTodos.filter(
+                  (td) =>
+                    !up.taskModel.immediateTodos.some(
+                      (x) => x.text.toLowerCase() === td.text.toLowerCase()
+                    )
+                ),
+              ],
+            };
+            setUserGraph({
+              ...up.graph,
+              taskModels: up.graph.taskModels.map((m) =>
+                m.id === enrichedTm.id ? enrichedTm : m
+              ),
+            });
+
+            const autoNotes =
+              matchedEmails.length > 0
+                ? `Related Mail: "${matchedEmails[0].subject}" (${matchedEmails[0].sender})\n${matchedEmails[0].snippet.slice(0, 260)}`
+                : undefined;
+
+            const placed = placeCompiledSessionsOntoCalendar({
+              canonicalTitle: enrichedTm.canonicalTitle,
+              sessions: compiled.sessions,
+              taskModelId: enrichedTm.id,
+              deadlineDateKey: compiled.deadlineDateKey,
+              notes: autoNotes,
+              blocks,
+              rules,
+              settings: {
+                ...settings,
+                writableCalendarId: writeCalendarRef.current,
+              },
+              todayKey,
+            });
+
+            setScarcityWarning(placed.scarcityWarning ?? null);
+            if (placed.created.length === 0) {
+              showToast(placed.note);
+              return;
+            }
+
+            const withArtifacts = placed.created.map((b) => ({
+              ...b,
+              subtasks:
+                enrichedTm.immediateTodos.length > 0
+                  ? enrichedTm.immediateTodos
+                  : undefined,
+              relevantPapers:
+                enrichedTm.relevantPapers.length > 0
+                  ? enrichedTm.relevantPapers.slice(0, 4)
+                  : undefined,
+            }));
+
+            const written: CalendarBlock[] = [];
+            for (const block of withArtifacts) {
+              written.push(await pushBlockToExternalCalendar(block));
+            }
+            setBlocks(
+              placed.blocks.map((b) => written.find((w) => w.id === b.id) ?? b)
+            );
+            showToast(placed.note);
+            return;
+          }
+        }
+      } finally {
+        if (settings.unloadModelsAfterBatch) {
+          await sleepAllModelsViaMacDaemon({
+            pairingToken: macPairingToken,
+            gemmaModel: settings.gemmaModel,
+          });
+          await unloadGemmaModelImmediately(settings.gemmaModel);
+        }
+        setDecomposingWithAi(false);
+      }
+    }
 
     const cadenceNote =
       parsed.mode === "weekly-cadence" && parsed.weeklyCadence
@@ -2640,6 +2908,263 @@ export function DayframeApp() {
     const target = blocks.find((b) => b.id === blockId);
     if (!target) return;
 
+    // 1. Model-First Path: Route with Valen-Decision-1.5 + Execute multi-action plan with Gemma 4!
+    setIsEnrichingEvent(true);
+    try {
+      const valenRoute = settings.valenEnabled
+        ? await routeUserUtteranceWithValen({
+            text,
+            surface: "event-chat",
+            eventContextTitle: target.title,
+            modelId: settings.valenModelId,
+            port: settings.valenPort,
+            macPairingToken,
+          })
+        : null;
+
+      const keywords = extractDistinctiveKeywords(target.title);
+      const searchQuery = keywords.join(" ") || target.title.slice(0, 50);
+
+      const shouldFetchContext =
+        valenRoute?.needsContextSearch !== false ||
+        valenRoute?.intent === "pull_external_context" ||
+        valenRoute?.intent === "copilot_question";
+
+      let matchedEmails: ScannedEmailItem[] = [];
+      let localPapers: Awaited<ReturnType<typeof searchLocalMacPapers>> = [];
+
+      if (shouldFetchContext && macBridgeState.paired && macPairingToken) {
+        const [rawEmails, rawPapers] = await Promise.all([
+          searchMacMailByQuery({
+            pairingToken: macPairingToken,
+            query: searchQuery,
+            limit: 5,
+          }),
+          searchLocalMacPapers({
+            pairingToken: macPairingToken,
+            query: searchQuery,
+          }),
+        ]);
+        matchedEmails = rawEmails;
+        localPapers = rawPapers;
+
+        if (
+          settings.valenEnabled &&
+          (rawEmails.length > 0 || rawPapers.length > 0)
+        ) {
+          const reranked = await rerankContextItemsWithValen({
+            eventTitle: target.title,
+            eventNotes: target.notes,
+            emails: rawEmails,
+            papers: rawPapers,
+            modelId: settings.valenModelId,
+            port: settings.valenPort,
+            macPairingToken,
+          });
+          if (reranked?.usedValen) {
+            matchedEmails = reranked.emails;
+            localPapers = reranked.papers;
+          }
+        }
+      }
+
+      const matchedCaps = matchCapturesForKeywords(keywords, captures).map(
+        (c) => ({
+          app: c.appName,
+          title: c.windowTitle,
+          summary: c.summaryText,
+        })
+      );
+
+      if (macBridgeState.paired && macPairingToken) {
+        await wakeOllamaViaMacDaemon(macPairingToken);
+      }
+      const gStat = await probeLocalGemma(settings.gemmaModel);
+
+      if (gStat.reachable) {
+        const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+        const turn = await executeEventChatTurnWithGemma4({
+          model: tag,
+          event: target,
+          userMessage: text,
+          todayDateKey: todayKey,
+          valenIntentHint: valenRoute?.intent,
+          matchedEmails,
+          matchedCaptures: matchedCaps,
+          localPapers,
+          userGraph,
+        });
+
+        if (turn.ok) {
+          let workingBlocks = [...blocks];
+          const badges: string[] = [];
+
+          // A. Schedule any requested prep/work blocks around this event
+          if (turn.sessionsToSchedule.length > 0) {
+            if (!writeCalendarRef.current) {
+              setScopeDialogOpen(true);
+              showToast("Choose your personal UMich calendar first.");
+              return;
+            }
+            const placed = placeCompiledSessionsOntoCalendar({
+              canonicalTitle: target.title,
+              sessions: turn.sessionsToSchedule,
+              linkedMeetingId: target.id,
+              taskModelId: target.taskModelId,
+              sourceLabel: `Event Chat (${target.title})`,
+              blocks: workingBlocks,
+              rules,
+              settings: {
+                ...settings,
+                writableCalendarId: writeCalendarRef.current,
+              },
+              todayKey,
+            });
+            const written: CalendarBlock[] = [];
+            for (const c of placed.created) {
+              written.push(await pushBlockToExternalCalendar(c));
+            }
+            workingBlocks = placed.blocks.map(
+              (b) => written.find((w) => w.id === b.id) ?? b
+            );
+            if (written.length > 0) {
+              badges.push(`Scheduled ${written.length} block(s)`);
+            }
+          }
+
+          // B. Apply updates to the target event itself (subtasks, papers, reminders, notes, rename, resize)
+          const existingTodos = target.subtasks ?? [];
+          const newSubs: EventSubtask[] = turn.subtasksToAdd
+            .filter(
+              (t) =>
+                !existingTodos.some(
+                  (ex) => ex.text.toLowerCase() === t.toLowerCase()
+                )
+            )
+            .map((t, i) => ({
+              id: `sub-${Date.now()}-${i}`,
+              text: t,
+              done: false,
+              source: "Gemma 4",
+            }));
+          if (newSubs.length > 0) badges.push(`+${newSubs.length} todo(s)`);
+
+          const existingPapers = target.relevantPapers ?? [];
+          const newPaperRefs: RelevantPaperRef[] = turn.papersToAttach
+            .filter(
+              (p) =>
+                !existingPapers.some(
+                  (ex) => ex.title.toLowerCase() === p.title.toLowerCase()
+                )
+            )
+            .map((p, i) => ({
+              id: `pap-${Date.now()}-${i}`,
+              title: p.title,
+              authorsOrVenue: p.authorsOrVenue,
+              pathOrUrl: p.pathOrUrl,
+              source: p.pathOrUrl?.startsWith("/") ? "local-pdf" : "mail-or-slack",
+            }));
+          if (newPaperRefs.length > 0) {
+            badges.push(`+${newPaperRefs.length} paper(s)`);
+          }
+
+          const newReminders = turn.remindersToAdd.map((r, i) => ({
+            id: `rem-${Date.now()}-${i}`,
+            text: r.text,
+            leadMinutes: r.leadMinutes,
+          }));
+          if (newReminders.length > 0) {
+            badges.push(`Alert ${newReminders[0].leadMinutes}m before`);
+          }
+
+          const nextNotes = [target.notes, turn.notesDigestToAppend]
+            .filter(Boolean)
+            .join("\n\n")
+            .slice(0, 2600);
+
+          let nextDateKey = target.dateKey;
+          let nextStart = target.startMinutes;
+          const nextDur = turn.resizeMinutesTo ?? target.durationMinutes;
+          if (turn.moveToDateKey && turn.moveToDateKey !== target.dateKey) {
+            const slot = findOpenSlot({
+              dateKey: turn.moveToDateKey,
+              durationMinutes: nextDur,
+              blocks: workingBlocks.filter((b) => b.id !== target.id),
+              rules,
+              settings,
+            });
+            nextDateKey = turn.moveToDateKey;
+            if (slot !== null) nextStart = slot;
+            badges.push(`Moved → ${nextDateKey}`);
+          }
+
+          const updatedTarget: CalendarBlock = {
+            ...target,
+            title: turn.renameTitleTo || target.title,
+            userEditedTitle: Boolean(turn.renameTitleTo) || target.userEditedTitle,
+            dateKey: nextDateKey,
+            startMinutes: nextStart,
+            durationMinutes: nextDur,
+            notes: nextNotes || target.notes,
+            subtasks: [...existingTodos, ...newSubs],
+            relevantPapers: [...existingPapers, ...newPaperRefs],
+            reminders: [...(target.reminders ?? []), ...newReminders],
+            eventChat: [
+              ...(target.eventChat ?? []),
+              {
+                id: `ec-u-${Date.now()}`,
+                role: "user",
+                text,
+                timestampIso: new Date().toISOString(),
+              },
+              {
+                id: `ec-a-${Date.now() + 1}`,
+                role: "assistant",
+                text: turn.reply,
+                timestampIso: new Date().toISOString(),
+                actionBadge: badges.length > 0 ? badges.join(" · ") : undefined,
+              },
+            ],
+          };
+
+          setBlocks(
+            workingBlocks
+              .map((b) => (b.id === target.id ? updatedTarget : b))
+              .sort(
+                (a, b) =>
+                  a.dateKey.localeCompare(b.dateKey) ||
+                  a.startMinutes - b.startMinutes
+              )
+          );
+
+          if (
+            updatedTarget.syncedToExternalCalendar &&
+            updatedTarget.externalEventId &&
+            macBridgeState.paired &&
+            macPairingToken
+          ) {
+            await updateBlockOnMacCalendar({
+              pairingToken: macPairingToken,
+              eventId: updatedTarget.externalEventId,
+              block: updatedTarget,
+              alarmMinutesBefore: newReminders[0]?.leadMinutes,
+            });
+          }
+          return;
+        }
+      }
+    } finally {
+      if (settings.unloadModelsAfterBatch) {
+        await sleepAllModelsViaMacDaemon({
+          pairingToken: macPairingToken,
+          gemmaModel: settings.gemmaModel,
+        });
+        await unloadGemmaModelImmediately(settings.gemmaModel);
+      }
+      setIsEnrichingEvent(false);
+    }
+
+    // 2. Offline Fallback Heuristic (used only when local Ollama is unreachable)
     const intent = parseEventChatCommand(text);
     const appendChatPair = async (
       base: CalendarBlock,

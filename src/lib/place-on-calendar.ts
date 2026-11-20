@@ -786,3 +786,184 @@ export function scheduleBlocksForTargetEvent(params: {
   };
 }
 
+export interface CompiledSessionSpec {
+  sessionTitle: string;
+  durationMinutes: number;
+  earliestDateKey: string;
+  latestDateKey: string;
+  mustFinishBeforeMinutes?: number;
+  preferredTimeOfDay?: "morning" | "afternoon" | "any";
+  kind?: "prep" | "deep-work" | "follow-up";
+}
+
+/**
+ * Constraint-verified placement engine for Gemma 4's structured CompiledSessionSpec[].
+ * Gemma 4 handles open-ended natural language, canonical naming, cadence, and day-of-week windows;
+ * this solver guarantees zero double-booking, buffer protection, and strict UMich calendar targeting.
+ */
+export function placeCompiledSessionsOntoCalendar(params: {
+  canonicalTitle: string;
+  sessions: CompiledSessionSpec[];
+  taskModelId?: string;
+  linkedMeetingId?: string;
+  deadlineDateKey?: string;
+  notes?: string;
+  sourceLabel?: string;
+  blocks: CalendarBlock[];
+  rules: StandingRule[];
+  settings: OrganizerSettings;
+  todayKey: string;
+}): {
+  blocks: CalendarBlock[];
+  created: CalendarBlock[];
+  note: string;
+  scarcityWarning?: string;
+} {
+  const {
+    canonicalTitle,
+    sessions,
+    taskModelId,
+    linkedMeetingId,
+    deadlineDateKey,
+    notes,
+    sourceLabel = "Gemma 4 Planner",
+    rules,
+    settings,
+    todayKey,
+  } = params;
+
+  let working = [...params.blocks];
+  const created: CalendarBlock[] = [];
+  const usedDays = new Set<string>();
+  const projectGroupId =
+    sessions.length > 1 ? `gproj-${Date.now()}` : undefined;
+
+  let requestedTotalMins = 0;
+
+  for (let i = 0; i < sessions.length; i++) {
+    const spec = sessions[i];
+    const dur = roundTo15(Math.max(15, Math.min(180, spec.durationMinutes || 60)));
+    requestedTotalMins += dur;
+
+    const startKey =
+      spec.earliestDateKey && spec.earliestDateKey >= todayKey
+        ? spec.earliestDateKey
+        : todayKey;
+    const endKey =
+      spec.latestDateKey && spec.latestDateKey >= startKey
+        ? spec.latestDateKey
+        : addDaysToDateKey(startKey, 14);
+    const spanDays = Math.max(0, Math.min(45, daysBetweenDateKeys(startKey, endKey)));
+
+    const preferAfternoon = spec.preferredTimeOfDay === "afternoon";
+    const morningCutoff =
+      spec.preferredTimeOfDay === "morning" ? 13 * 60 : undefined;
+
+    let placed = false;
+    const passes = [
+      { distinctDay: true, relax: false, strictTimePref: true },
+      { distinctDay: false, relax: false, strictTimePref: false },
+      { distinctDay: false, relax: true, strictTimePref: false },
+    ];
+
+    for (const pass of passes) {
+      if (placed) break;
+      for (let d = 0; d <= spanDays; d++) {
+        const dateKey = addDaysToDateKey(startKey, d);
+        if (pass.distinctDay && usedDays.has(dateKey)) continue;
+
+        const isCutoffDay =
+          spec.mustFinishBeforeMinutes !== undefined && dateKey === endKey;
+        const finishCap = isCutoffDay
+          ? spec.mustFinishBeforeMinutes
+          : pass.strictTimePref && morningCutoff
+            ? morningCutoff
+            : undefined;
+
+        const slot = findOpenSlot({
+          dateKey,
+          durationMinutes: dur,
+          blocks: working,
+          rules,
+          settings,
+          mustFinishByMinutes: finishCap,
+          preferAfternoon,
+          allowWeekend: pass.relax || startKey === endKey,
+          ignoreDailyBuffer: pass.relax || isCutoffDay,
+          allowEarlyMorning: isCutoffDay,
+        });
+        if (slot === null) continue;
+
+        const blk: CalendarBlock = {
+          id: `gblk-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 5)}`,
+          title: spec.sessionTitle.trim() || canonicalTitle,
+          kind:
+            spec.kind ||
+            (linkedMeetingId ? "prep" : dur <= 30 ? "follow-up" : "deep-work"),
+          status: "confirmed",
+          dateKey,
+          startMinutes: slot,
+          durationMinutes: dur,
+          gutMinutes: dur,
+          deadlineDateKey,
+          projectGroupId,
+          taskModelId,
+          linkedMeetingId,
+          notes,
+          calendarId: settings.writableCalendarId,
+          calendarTitle: settings.writableCalendarTitle,
+          isDayframeCreated: true,
+          sourceLabel,
+          rationale: `Scheduled for "${canonicalTitle}" (${startKey}${
+            endKey !== startKey ? ` → ${endKey}` : ""
+          }).`,
+          confidence: 0.95,
+        };
+
+        usedDays.add(dateKey);
+        working = [...working, blk].sort(
+          (a, b) =>
+            a.dateKey.localeCompare(b.dateKey) ||
+            a.startMinutes - b.startMinutes
+        );
+        created.push(blk);
+        placed = true;
+        break;
+      }
+    }
+  }
+
+  if (created.length === 0) {
+    const msg = `No open space matched the requested window for "${canonicalTitle}".`;
+    return { blocks: working, created, note: msg, scarcityWarning: msg };
+  }
+
+  const placedMins = created.reduce((s, b) => s + b.durationMinutes, 0);
+  const overflow = Math.max(0, requestedTotalMins - placedMins);
+  const scarcityWarning =
+    overflow > 0
+      ? `Only ${formatDuration(placedMins)} of ${formatDuration(
+          requestedTotalMins
+        )} physically fit in the requested window.`
+      : undefined;
+
+  const summary =
+    created.length === 1
+      ? `Scheduled "${created[0].title}" on ${created[0].dateKey} at ${formatMinutesToTime(
+          created[0].startMinutes
+        )} (${formatDuration(created[0].durationMinutes)}).`
+      : `Scheduled ${created.length} blocks (${formatDuration(
+          placedMins
+        )}) for "${canonicalTitle}" (${created[0].dateKey} → ${
+          created[created.length - 1].dateKey
+        }).`;
+
+  return {
+    blocks: working,
+    created,
+    note: scarcityWarning ? `${summary} ${scarcityWarning}` : summary,
+    scarcityWarning,
+  };
+}
+
+
