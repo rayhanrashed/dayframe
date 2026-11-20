@@ -401,31 +401,79 @@ export function KickstartWizard({
                     </Button>
                   </div>
                   {macBridgeState.paired && macCalendars.length > 0 && (
-                    <Select
-                      value={settings.writableCalendarId}
-                      onValueChange={(val) => {
-                        if (!val) return;
-                        const found = macCalendars.find((c) => c.id === val);
-                        onUpdateSettings({
-                          writableCalendarId: val,
-                          writableCalendarTitle: found?.title || "Calendar",
-                        });
-                      }}
-                    >
-                      <SelectTrigger className="w-full text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {macCalendars
-                          .filter((c) => c.allowsModify)
-                          .map((cal) => (
-                            <SelectItem key={cal.id} value={cal.id}>
-                              Write confirmed blocks to: {cal.title} (
-                              {cal.sourceTitle})
-                            </SelectItem>
-                          ))}
-                      </SelectContent>
-                    </Select>
+                    <div className="space-y-2.5">
+                      <Select
+                        value={settings.writableCalendarId || undefined}
+                        onValueChange={(val) => {
+                          if (!val) return;
+                          const found = macCalendars.find((c) => c.id === val);
+                          const nextReads = settings.readCalendarIds.includes(val)
+                            ? settings.readCalendarIds
+                            : [val, ...settings.readCalendarIds];
+                          onUpdateSettings({
+                            writableCalendarId: val,
+                            writableCalendarTitle: found?.title || "Calendar",
+                            writableCalendarSource: found?.sourceTitle || "",
+                            pinnedWriteCalendar: true,
+                            readCalendarIds: nextReads,
+                            readCalendarScopeInitialized: true,
+                          });
+                        }}
+                      >
+                        <SelectTrigger className="w-full text-xs">
+                          <SelectValue placeholder="Choose personal UMich calendar to write to" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {macCalendars
+                            .filter((c) => c.allowsModify)
+                            .map((cal) => (
+                              <SelectItem key={cal.id} value={cal.id}>
+                                Write ONLY to: {cal.title} ({cal.sourceTitle})
+                              </SelectItem>
+                            ))}
+                        </SelectContent>
+                      </Select>
+
+                      <div className="space-y-1.5 rounded-xl border bg-muted/20 p-2.5">
+                        <div className="text-[11px] font-medium">
+                          Calendars to Read / Take Meetings From (unchecked are ignored):
+                        </div>
+                        <div className="max-h-36 space-y-1 overflow-y-auto">
+                          {macCalendars.map((cal) => {
+                            const isWrite = cal.id === settings.writableCalendarId;
+                            const checked =
+                              isWrite || settings.readCalendarIds.includes(cal.id);
+                            return (
+                              <label
+                                key={cal.id}
+                                className="flex cursor-pointer items-center justify-between gap-2 rounded-md border bg-background px-2 py-1 text-[11px]"
+                              >
+                                <span className="truncate">
+                                  {cal.title} ({cal.sourceTitle})
+                                  {isWrite ? " — Write Target" : ""}
+                                </span>
+                                <Switch
+                                  checked={checked}
+                                  disabled={isWrite}
+                                  onCheckedChange={(on) => {
+                                    const current = new Set(settings.readCalendarIds);
+                                    if (on) current.add(cal.id);
+                                    else current.delete(cal.id);
+                                    if (settings.writableCalendarId) {
+                                      current.add(settings.writableCalendarId);
+                                    }
+                                    onUpdateSettings({
+                                      readCalendarIds: Array.from(current),
+                                      readCalendarScopeInitialized: true,
+                                    });
+                                  }}
+                                />
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
                   )}
                   <p className="text-[11px] text-muted-foreground">
                     Reads and writes directly via local macOS EventKit — covers iCloud, Google, and Exchange calendars already in Calendar.app with zero internet traffic from Dayframe.

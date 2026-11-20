@@ -447,6 +447,7 @@ export async function sendMacNativeNotification(params: {
 export async function scanMacCalendarEvents(params: {
   pairingToken: string;
   daysAhead?: number;
+  allowedReadCalendarIds?: string[];
 }): Promise<{
   ok: boolean;
   calendars: MacCalendarDescriptor[];
@@ -457,7 +458,7 @@ export async function scanMacCalendarEvents(params: {
   const start = new Date();
   start.setHours(0, 0, 0, 0);
   const startMs = start.getTime();
-  const endMs = startMs + (params.daysAhead ?? 7) * 24 * 60 * 60 * 1000;
+  const endMs = startMs + (params.daysAhead ?? 28) * 24 * 60 * 60 * 1000;
 
   try {
     const res = await fetch(`${MAC_BRIDGE_BASE}/api/calendar/scan`, {
@@ -480,6 +481,7 @@ export async function scanMacCalendarEvents(params: {
         startIso: string;
         endIso: string;
         isRecurring: boolean;
+        calendarId?: string;
         location?: string;
         url?: string;
         hasVideoLink?: boolean;
@@ -503,7 +505,18 @@ export async function scanMacCalendarEvents(params: {
       };
     }
 
-    const blocks: CalendarBlock[] = (data.events ?? []).map((ev, idx) => {
+    const allowedSet =
+      params.allowedReadCalendarIds && params.allowedReadCalendarIds.length > 0
+        ? new Set(params.allowedReadCalendarIds)
+        : null;
+
+    const filteredRawEvents = (data.events ?? []).filter((ev) => {
+      if (!allowedSet) return true;
+      if (!ev.calendarId) return true;
+      return allowedSet.has(ev.calendarId);
+    });
+
+    const blocks: CalendarBlock[] = filteredRawEvents.map((ev, idx) => {
       const s = new Date(ev.startIso);
       const e = new Date(ev.endIso);
       const startMinutes = s.getHours() * 60 + s.getMinutes();
@@ -512,6 +525,19 @@ export async function scanMacCalendarEvents(params: {
         15,
         Math.min(480, Math.round(rawDur / 15) * 15)
       );
+
+      const rawTitle = ev.title || "Untitled Event";
+      const isDone = rawTitle.startsWith("✓ ") || rawTitle.startsWith("[Done] ");
+      const strippedDone = rawTitle.replace(/^(✓\s+|\[Done\]\s+)/i, "");
+      const isPrep = /^\[Prep\]\s+/i.test(strippedDone);
+      const isFocus = /^\[(Focus|Task)\]\s+/i.test(strippedDone);
+      const isSolo = /^\[Solo Hold\]\s+/i.test(strippedDone);
+      const cleanTitle = strippedDone.replace(
+        /^\[(Prep|Focus|Task|Solo Hold)\]\s+/i,
+        ""
+      );
+      const dayframeCreated =
+        Boolean(ev.isDayframeCreated) || isDone || isPrep || isFocus || isSolo;
 
       const attCount = ev.attendeeCount ?? 0;
       const attNames = ev.attendeeNames ?? [];
@@ -524,28 +550,35 @@ export async function scanMacCalendarEvents(params: {
 
       return {
         id: `mac-cal-${idx}-${ev.id.slice(0, 14)}`,
-        title: ev.title,
-        kind: "meeting",
+        title: cleanTitle,
+        kind: isPrep ? "prep" : isFocus ? "deep-work" : "meeting",
         status: "confirmed",
         dateKey: toLocalDateKey(s),
         startMinutes,
         durationMinutes,
         isRecurring: ev.isRecurring,
+        isSoloHold: isSolo || undefined,
+        done: isDone || undefined,
         locationOrUrl: ev.url || ev.location || undefined,
         notes: ev.notes || undefined,
         attendeeCount: attCount,
         attendeeNames: attNames,
         organizerName: ev.organizerName || undefined,
         hasVideoLink: Boolean(ev.hasVideoLink),
+        calendarId: ev.calendarId,
         calendarTitle: ev.calendarTitle,
         calendarImmutable: Boolean(ev.calendarImmutable),
-        isDayframeCreated: Boolean(ev.isDayframeCreated),
+        isDayframeCreated: dayframeCreated,
         externalEventId: ev.id,
         syncedToExternalCalendar: true,
-        sourceLabel: `Calendar (${ev.calendarTitle})`,
-        rationale: `${attendeeSummary}${
-          ev.hasVideoLink ? " • Video call" : ""
-        }${ev.notes ? ` • Notes: ${ev.notes.slice(0, 110)}` : ""}`,
+        sourceLabel: dayframeCreated
+          ? `Dayframe (${ev.calendarTitle})`
+          : `Calendar (${ev.calendarTitle})`,
+        rationale: dayframeCreated
+          ? ev.notes?.split("\n")[0] || "Scheduled on your UMich calendar."
+          : `${attendeeSummary}${
+              ev.hasVideoLink ? " • Video call" : ""
+            }${ev.notes ? ` • Notes: ${ev.notes.slice(0, 110)}` : ""}`,
         confidence: 1,
       };
     });
@@ -613,6 +646,29 @@ export async function scanMacMailMessages(params: {
   }
 }
 
+export async function deleteBlockFromMacCalendar(params: {
+  pairingToken: string;
+  eventId: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/calendar/delete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ eventId: params.eventId }),
+    });
+    const data = (await res.json()) as { ok?: boolean; error?: string };
+    return { ok: Boolean(data.ok), error: data.error };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed removing calendar event.",
+    };
+  }
+}
+
 export async function writeBlockToMacCalendar(params: {
   pairingToken: string;
   block: CalendarBlock;
@@ -621,14 +677,19 @@ export async function writeBlockToMacCalendar(params: {
   const { pairingToken, block, calendarId } = params;
   const startMs = dateKeyAndMinutesToEpochMs(block.dateKey, block.startMinutes);
   const endMs = startMs + block.durationMinutes * 60 * 1000;
-  const prefix =
+  const baseTitle = block.title
+    .replace(/^(✓\s+|\[Done\]\s+)/i, "")
+    .replace(/^\[(Prep|Focus|Task|Solo Hold)\]\s+/i, "")
+    .trim();
+  const kindPrefix =
     block.kind === "prep"
       ? "[Prep] "
       : block.isSoloHold
         ? "[Solo Hold] "
-        : block.kind === "deep-work"
-          ? "[Focus] "
+        : block.kind === "deep-work" || block.kind === "follow-up"
+          ? "[Task] "
           : "";
+  const prefix = `${block.done ? "✓ " : ""}${kindPrefix}`;
 
   try {
     const res = await fetch(`${MAC_BRIDGE_BASE}/api/calendar/create`, {
@@ -638,7 +699,7 @@ export async function writeBlockToMacCalendar(params: {
         Authorization: `Bearer ${pairingToken.trim()}`,
       },
       body: JSON.stringify({
-        title: `${prefix}${block.title}`,
+        title: `${prefix}${baseTitle}`,
         startMs,
         endMs,
         notes: `${block.rationale}\nScheduled offline by Dayframe (${block.sourceLabel})`,

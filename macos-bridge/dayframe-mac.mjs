@@ -423,10 +423,22 @@ async function runCalendarWaterfall(action, payload) {
   }
 
   // Tier 2: Fixed JXA EventKit (checks authorizationStatusForEntityType(0) === 3 directly)
-  const jxaScript = action === "create" ? "write-event.jxa" : "read-calendars.jxa";
+  const jxaScript =
+    action === "create"
+      ? "write-event.jxa"
+      : action === "delete"
+        ? "delete-event.jxa"
+        : "read-calendars.jxa";
   const jxaRes = await runStaticJxa(jxaScript, payload);
   if (jxaRes && jxaRes.ok) {
     return jxaRes;
+  }
+
+  if (action === "delete") {
+    return {
+      ok: false,
+      error: "Could not remove the previous calendar block.",
+    };
   }
 
   // Tier 3: Calendar.app AppleEvents Automation fallback (works even if EventKit TCC is tied to another terminal app)
@@ -1218,6 +1230,18 @@ const server = http.createServer(async (req, res) => {
         startMs,
         endMs,
       });
+      sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/calendar/delete") {
+      const body = await readJsonBody(req);
+      const eventId = String(body.eventId || "").slice(0, 300);
+      if (!eventId) {
+        sendJson(req, res, 400, { ok: false, error: "Missing event id." });
+        return;
+      }
+      const result = await runCalendarWaterfall("delete", { eventId });
       sendJson(req, res, 200, result);
       return;
     }

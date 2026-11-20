@@ -18,12 +18,22 @@ export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   batchExecutionMode: "scheduled-batches",
   batchWindowMinutes: [9 * 60 + 30, 13 * 60 + 30, 17 * 60 + 30],
   unloadModelsAfterBatch: true,
-  confirmationPolicy: "ask-often",
+  confirmationPolicy: "auto-high-confidence",
   calendarSource: "none",
   captureEngine: "macos-native",
+  readCalendarIds: [],
+  readCalendarScopeInitialized: false,
   writableCalendarId: "",
-  writableCalendarTitle: "Default Calendar",
-  autoWriteToCalendar: false,
+  writableCalendarTitle: "UMich calendar not selected",
+  writableCalendarSource: "",
+  pinnedWriteCalendar: false,
+  calibrationMultiplier: 1.5,
+  dailyBufferMinutes: 60,
+  protectWeekends: true,
+  notAMorningPersonUntilMinutes: 0,
+  busyDateRanges: [],
+  timelineHorizonDays: 7,
+  autoWriteToCalendar: true,
   intervalMinutes: 5,
   skipDuplicateFrames: true,
   workdayStartMinutes: 9 * 60,
@@ -144,6 +154,7 @@ const EXPLICIT_EXTERNAL_MEETING_TITLE_REGEX =
  */
 export function isEligibleRealMeetingForPrep(block: CalendarBlock): boolean {
   if (block.kind !== "meeting") return false;
+  if (block.occupiesTimeOnly) return false;
   if (block.isDayframeCreated) return false;
   if (block.calendarImmutable) return false;
 
@@ -319,6 +330,25 @@ export function summarizeOpenWindowsForDay(params: {
     .join(", ");
 }
 
+export function isWeekendDateKey(dateKey: string): boolean {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1, 12, 0, 0, 0);
+  const dow = dt.getDay();
+  return dow === 0 || dow === 6;
+}
+
+export function getBusyRangeForDate(
+  dateKey: string,
+  settings: OrganizerSettings
+): { label: string; startDateKey: string; endDateKey: string } | null {
+  for (const r of settings.busyDateRanges ?? []) {
+    if (dateKey >= r.startDateKey && dateKey <= r.endDateKey) {
+      return r;
+    }
+  }
+  return null;
+}
+
 interface SlotQuery {
   dateKey: string;
   durationMinutes: number;
@@ -329,6 +359,10 @@ interface SlotQuery {
   mustFinishByMinutes?: number;
   preferAfternoon?: boolean;
   ignoreGap?: boolean;
+  allowWeekend?: boolean;
+  ignoreBlackout?: boolean;
+  ignoreDailyBuffer?: boolean;
+  allowEarlyMorning?: boolean;
 }
 
 export function findOpenSlot({
@@ -341,11 +375,44 @@ export function findOpenSlot({
   mustFinishByMinutes,
   preferAfternoon = false,
   ignoreGap = false,
+  allowWeekend = false,
+  ignoreBlackout = false,
+  ignoreDailyBuffer = false,
+  allowEarlyMorning = false,
 }: SlotQuery): number | null {
-  const dayStart = settings.workdayStartMinutes;
+  if (!ignoreBlackout && getBusyRangeForDate(dateKey, settings)) {
+    return null;
+  }
+  if (!allowWeekend && settings.protectWeekends && isWeekendDateKey(dateKey)) {
+    return null;
+  }
+
+  const now = new Date();
+  const realTodayKey = toLocalDateKey(now);
+  if (dateKey < realTodayKey) {
+    return null;
+  }
+
+  let dayStart = settings.workdayStartMinutes;
+  if (!allowEarlyMorning && settings.notAMorningPersonUntilMinutes > dayStart) {
+    dayStart = settings.notAMorningPersonUntilMinutes;
+  }
+  if (dateKey === realTodayKey) {
+    const nowMins = now.getHours() * 60 + now.getMinutes();
+    const roundedNow = Math.ceil((nowMins + 10) / 15) * 15;
+    dayStart = Math.max(dayStart, roundedNow);
+  }
+
+  const bufferedWorkdayEnd = ignoreDailyBuffer
+    ? settings.workdayEndMinutes
+    : Math.max(
+        dayStart,
+        settings.workdayEndMinutes - Math.max(0, settings.dailyBufferMinutes || 0)
+      );
+
   const dayEnd = mustFinishByMinutes
-    ? Math.min(settings.workdayEndMinutes, mustFinishByMinutes)
-    : settings.workdayEndMinutes;
+    ? Math.min(bufferedWorkdayEnd, mustFinishByMinutes)
+    : bufferedWorkdayEnd;
 
   if (dayEnd - dayStart < durationMinutes) return null;
 
@@ -386,6 +453,10 @@ export function findOpenSlot({
       mustFinishByMinutes,
       preferAfternoon,
       ignoreGap: true,
+      allowWeekend,
+      ignoreBlackout,
+      ignoreDailyBuffer,
+      allowEarlyMorning,
     });
   }
 
@@ -411,7 +482,8 @@ export function findOpenSlot({
 export function calibrateDuration(
   title: string,
   baseMinutes: number,
-  rules: StandingRule[]
+  rules: StandingRule[],
+  multiplier = 1
 ): { minutes: number; appliedRule?: StandingRule } {
   for (const rule of rules) {
     if (
@@ -431,7 +503,8 @@ export function calibrateDuration(
       };
     }
   }
-  return { minutes: roundTo15(baseMinutes) };
+  const scaled = baseMinutes * (multiplier > 0 ? multiplier : 1);
+  return { minutes: roundTo15(Math.max(15, Math.min(240, scaled))) };
 }
 
 /**
@@ -539,6 +612,8 @@ export function placeGemmaContextualPrepBlock(params: {
       settings,
       preferLatestBeforeMinutes: meeting.startMinutes,
       mustFinishByMinutes: meeting.startMinutes,
+      allowEarlyMorning: true,
+      ignoreDailyBuffer: true,
     });
   }
 
@@ -555,19 +630,27 @@ export function placeGemmaContextualPrepBlock(params: {
   const shouldAsk =
     settings.confirmationPolicy === "always-ask"
       ? true
-      : hasAutoConfirmRule
-        ? false
-        : askUser || settings.confirmationPolicy === "ask-often";
+      : settings.confirmationPolicy === "auto-high-confidence"
+        ? confidence < 0.72
+        : hasAutoConfirmRule
+          ? false
+          : askUser || settings.confirmationPolicy === "ask-often";
 
   const prepBlock: CalendarBlock = {
     id: `prep-${meeting.id}`,
     title: prepTitle.trim() || `Prep for ${meeting.title}`,
     kind: "prep",
-    status: shouldAsk ? "proposed" : "auto-scheduled",
+    status: shouldAsk
+      ? "proposed"
+      : settings.autoWriteToCalendar
+        ? "confirmed"
+        : "auto-scheduled",
     dateKey: chosenDateKey,
     startMinutes: chosenStart,
     durationMinutes: duration,
     linkedMeetingId: meeting.id,
+    calendarId: settings.writableCalendarId || undefined,
+    isDayframeCreated: true,
     sourceLabel: contextSources[0] || `Meeting Context (${meeting.title})`,
     rationale: contextEvidence,
     contextSources,
@@ -833,10 +916,12 @@ export function placeSignalOnCalendar(params: {
     return { updatedBlocks: blocks, deduplicated: true, askedUser: false };
   }
 
+  const rawGutMinutes = signal.estimatedMinutes || 45;
   const { minutes: calibratedMinutes, appliedRule } = calibrateDuration(
     signal.title,
-    signal.estimatedMinutes || 45,
-    rules
+    rawGutMinutes,
+    rules,
+    settings.calibrationMultiplier
   );
 
   const decision = evaluateConfirmationRequirement({
@@ -887,6 +972,8 @@ export function placeSignalOnCalendar(params: {
       locationOrUrl: signal.locationOrUrl,
       linkedMeetingId: signal.linkedMeetingId,
       sourceCaptureId,
+      calendarId: settings.writableCalendarId || undefined,
+      isDayframeCreated: true,
       sourceLabel,
       rationale: evidenceText,
       contextSources: contextSources ?? [sourceLabel],
@@ -927,7 +1014,7 @@ export function placeSignalOnCalendar(params: {
   let chosenDate = preferredDate;
   let chosenStart: number | null = null;
 
-  for (let d = 0; d < 5; d++) {
+  for (let d = 0; d < 14; d++) {
     const candidateDate = addDaysToDateKey(preferredDate, d);
     const slot = findOpenSlot({
       dateKey: candidateDate,
@@ -947,8 +1034,11 @@ export function placeSignalOnCalendar(params: {
   }
 
   if (chosenStart === null) {
-    chosenDate = preferredDate;
-    chosenStart = settings.workdayEndMinutes - calibratedMinutes;
+    chosenDate = addDaysToDateKey(toLocalDateKey(new Date()), 1);
+    chosenStart = Math.max(
+      settings.workdayStartMinutes,
+      settings.notAMorningPersonUntilMinutes || 0
+    );
   }
 
   const workBlock: CalendarBlock = {
@@ -959,14 +1049,18 @@ export function placeSignalOnCalendar(params: {
     dateKey: chosenDate,
     startMinutes: chosenStart,
     durationMinutes: calibratedMinutes,
+    gutMinutes: rawGutMinutes,
+    deadlineDateKey: signal.deadlineDateKey,
     linkedMeetingId: signal.linkedMeetingId,
     sourceCaptureId,
     ruleId: appliedRule?.id,
+    calendarId: settings.writableCalendarId || undefined,
+    isDayframeCreated: true,
     sourceLabel,
     rationale: `${evidenceText}${
       appliedRule
         ? ` • Sized to ${formatDuration(calibratedMinutes)} via "${appliedRule.title}".`
-        : ""
+        : ` • Gut ${formatDuration(rawGutMinutes)} × ${settings.calibrationMultiplier} = ${formatDuration(calibratedMinutes)}.`
     }`,
     contextSources: contextSources ?? [sourceLabel],
     confidence: signal.confidence ?? 0.78,

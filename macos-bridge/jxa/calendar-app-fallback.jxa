@@ -26,17 +26,20 @@ function run() {
         }
         if (!writable) continue;
         const cid = String(c.id ? c.id() : c.name());
-        if (input.calendarId && (cid === input.calendarId || String(c.name()) === input.calendarId)) {
+        if (
+          input.calendarId &&
+          (cid === input.calendarId || String(c.name()) === input.calendarId)
+        ) {
           targetCal = c;
           break;
         }
-        if (!targetCal) targetCal = c;
       }
 
       if (!targetCal) {
         return JSON.stringify({
           ok: false,
-          error: "No writable calendar found in Calendar.app.",
+          error:
+            "Refusing to write. The personal UMich calendar was not found, so nothing was added.",
         });
       }
 

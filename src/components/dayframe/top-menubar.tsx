@@ -86,6 +86,7 @@ interface TopMenubarProps {
   queuedAndroidCount: number;
   onOpenAndroidSync: () => void;
   onReopenSetupWizard: () => void;
+  onOpenCalendarScope?: () => void;
   pipelineLogs: PipelineLogEntry[];
 }
 
@@ -141,6 +142,7 @@ export function TopMenubar({
   queuedAndroidCount,
   onOpenAndroidSync,
   onReopenSetupWizard,
+  onOpenCalendarScope,
   pipelineLogs,
 }: TopMenubarProps) {
   const [cadenceDialogOpen, setCadenceDialogOpen] = useState(false);
@@ -175,15 +177,26 @@ export function TopMenubar({
                 <WifiOff className="size-2.5 text-emerald-600" />
                 Offline
               </Badge>
-              <Badge
-                variant={macBridgeState.paired ? "secondary" : "outline"}
-                className="gap-1 text-[10px]"
+              <button
+                type="button"
+                onClick={onOpenCalendarScope}
+                className="inline-flex"
+                title="Choose which calendars to read from and which UMich calendar to write to"
               >
-                <Laptop className="size-3" />
-                {macBridgeState.paired
-                  ? `macOS Calendar (${settings.writableCalendarTitle})`
-                  : "Mac Daemon Not Paired"}
-              </Badge>
+                <Badge
+                  variant={macBridgeState.paired ? "secondary" : "outline"}
+                  className="cursor-pointer gap-1 text-[10px] hover:opacity-85"
+                >
+                  <Laptop className="size-3" />
+                  {macBridgeState.paired
+                    ? settings.writableCalendarId
+                      ? `Write: ${settings.writableCalendarTitle} · Read: ${
+                          settings.readCalendarIds.length || 1
+                        }`
+                      : "Choose UMich calendar"
+                    : "Mac Daemon Not Paired"}
+                </Badge>
+              </button>
             </div>
             <p className="hidden text-[11px] text-muted-foreground xl:block">
               Next AI batch:{" "}

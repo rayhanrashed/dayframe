@@ -11,6 +11,7 @@ import { NightlyAndroidSheet } from "./nightly-android-sheet";
 import { useScreenCapture } from "@/hooks/use-screen-capture";
 import {
   CalendarBlock,
+  CalibrationSample,
   DiscussionMessage,
   GatekeeperStats,
   MacCalendarDescriptor,
@@ -39,6 +40,7 @@ import {
 } from "@/lib/scheduler";
 import {
   analyzeScreenshotWithGemma4,
+  decomposeGoalWithGemma4,
   LocalGemmaStatus,
   planHolisticCalendarWithGemma4,
   probeLocalGemma,
@@ -54,8 +56,21 @@ import {
   ValenRuntimeStatus,
 } from "@/lib/valen-decision";
 import {
+  pullNextFutureTaskIntoToday,
+  scheduleTaskOntoCalendar,
+  takeOverdueWorkForward,
+} from "@/lib/place-on-calendar";
+import {
+  describeCalendar,
+  isPersonalUmichCalendar,
+  pickDefaultReadCalendarIds,
+  pickPersonalUmichCalendar,
+} from "@/lib/umich-calendar";
+import { TaskComposer } from "./task-composer";
+import {
   acknowledgeMacDiskCaptures,
   captureOpenSlackAndMailWindows,
+  deleteBlockFromMacCalendar,
   configureMacBackgroundCollector,
   fetchMacAndroidFolderQueue,
   fetchMacDiskCaptureQueue,
@@ -85,6 +100,7 @@ interface PersistedWorkspaceV2 {
   messages: DiscussionMessage[];
   suggestedPrompts: SuggestedPreferencePrompt[];
   gateStats: GatekeeperStats;
+  calibrationSamples: CalibrationSample[];
   macPairingToken: string;
 }
 
@@ -145,6 +161,13 @@ export function DayframeApp() {
       reachable: false,
       paired: false,
     });
+
+  const [calibrationSamples, setCalibrationSamples] = useState<
+    CalibrationSample[]
+  >([]);
+  const [scopeDialogOpen, setScopeDialogOpen] = useState(false);
+  const [decomposingWithAi, setDecomposingWithAi] = useState(false);
+  const [scarcityWarning, setScarcityWarning] = useState<string | null>(null);
 
   const [anchorDateKey, setAnchorDateKey] = useState("");
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
@@ -233,7 +256,23 @@ export function DayframeApp() {
                 parsed.settings.calendarSource === "macos-bridge"
                   ? "macos-bridge"
                   : "none",
+              autoWriteToCalendar: true,
+              confirmationPolicy:
+                parsed.settings.confirmationPolicy === "always-ask"
+                  ? "always-ask"
+                  : "auto-high-confidence",
             };
+            if (
+              !merged.pinnedWriteCalendar &&
+              !isPersonalUmichCalendar(
+                merged.writableCalendarTitle,
+                merged.writableCalendarSource
+              )
+            ) {
+              merged.writableCalendarId = "";
+              merged.writableCalendarTitle = "UMich calendar not selected";
+              merged.writableCalendarSource = "";
+            }
             setSettings(merged);
             loadedValenPort = merged.valenPort;
             loadedValenModel = merged.valenModelId;
@@ -246,6 +285,8 @@ export function DayframeApp() {
           if (parsed.suggestedPrompts)
             setSuggestedPrompts(parsed.suggestedPrompts);
           if (parsed.gateStats) setGateStats(parsed.gateStats);
+          if (parsed.calibrationSamples)
+            setCalibrationSamples(parsed.calibrationSamples);
           if (parsed.macPairingToken) {
             loadedToken = parsed.macPairingToken;
             setMacPairingToken(parsed.macPairingToken);
@@ -294,12 +335,52 @@ export function DayframeApp() {
           calendarSource: "macos-bridge",
           captureEngine: "macos-native",
         }));
-        const life = await fetchMacModelLifecycle({
-          pairingToken: loadedToken,
-          valenPort: loadedValenPort,
-        });
+        const [life, calInit] = await Promise.all([
+          fetchMacModelLifecycle({
+            pairingToken: loadedToken,
+            valenPort: loadedValenPort,
+          }),
+          scanMacCalendarEvents({ pairingToken: loadedToken, daysAhead: 28 }),
+        ]);
         if (!cancelled && life) {
           setModelLifecycle({ ...life, activePhase: "sleeping" });
+        }
+        if (!cancelled && calInit.ok) {
+          setMacCalendars(calInit.calendars);
+          setSettings((prev) => {
+            const pinned = prev.pinnedWriteCalendar
+              ? calInit.calendars.find(
+                  (c) => c.id === prev.writableCalendarId && c.allowsModify
+                )
+              : undefined;
+            const picked = pinned || pickPersonalUmichCalendar(calInit.calendars);
+            const defaultReads = pickDefaultReadCalendarIds(
+              calInit.calendars,
+              picked?.id
+            );
+            if (!picked) {
+              return {
+                ...prev,
+                readCalendarIds: prev.readCalendarScopeInitialized
+                  ? prev.readCalendarIds
+                  : defaultReads,
+                readCalendarScopeInitialized: true,
+              };
+            }
+            const activeReads = prev.readCalendarScopeInitialized
+              ? prev.readCalendarIds.includes(picked.id)
+                ? prev.readCalendarIds
+                : [picked.id, ...prev.readCalendarIds]
+              : defaultReads;
+            return {
+              ...prev,
+              writableCalendarId: picked.id,
+              writableCalendarTitle: picked.title,
+              writableCalendarSource: picked.sourceTitle,
+              readCalendarIds: activeReads,
+              readCalendarScopeInitialized: true,
+            };
+          });
         }
       }
     });
@@ -335,6 +416,7 @@ export function DayframeApp() {
         messages,
         suggestedPrompts,
         gateStats,
+        calibrationSamples,
         macPairingToken,
       };
       localStorage.setItem(STORAGE_KEY_V3, JSON.stringify(payload));
@@ -343,6 +425,7 @@ export function DayframeApp() {
     }
   }, [
     blocks,
+    calibrationSamples,
     captures,
     gateStats,
     hydrated,
@@ -396,6 +479,62 @@ export function DayframeApp() {
     showToast("All AI models unloaded & stopped (0 MB RAM)");
   }, [appendLog, macPairingToken, settings.gemmaModel, showToast]);
 
+  const writeCalendarRef = useRef(settings.writableCalendarId);
+
+  const rememberWriteCalendar = useCallback(
+    (calendars: MacCalendarDescriptor[]) => {
+      setMacCalendars(calendars);
+      const pinned = settings.pinnedWriteCalendar
+        ? calendars.find(
+            (c) => c.id === settings.writableCalendarId && c.allowsModify
+          )
+        : undefined;
+      const picked = pinned || pickPersonalUmichCalendar(calendars);
+
+      const defaultReads = pickDefaultReadCalendarIds(
+        calendars,
+        picked?.id
+      );
+
+      if (!picked) {
+        writeCalendarRef.current = "";
+        setSettings((prev) => ({
+          ...prev,
+          writableCalendarId: "",
+          writableCalendarTitle: "UMich calendar not selected",
+          writableCalendarSource: "",
+          readCalendarIds: prev.readCalendarScopeInitialized
+            ? prev.readCalendarIds
+            : defaultReads,
+          readCalendarScopeInitialized: true,
+        }));
+        return null;
+      }
+      writeCalendarRef.current = picked.id;
+      setSettings((prev) => {
+        const activeReads = prev.readCalendarScopeInitialized
+          ? prev.readCalendarIds.includes(picked.id)
+            ? prev.readCalendarIds
+            : [picked.id, ...prev.readCalendarIds]
+          : defaultReads;
+        return {
+          ...prev,
+          writableCalendarId: picked.id,
+          writableCalendarTitle: picked.title,
+          writableCalendarSource: picked.sourceTitle,
+          readCalendarIds: activeReads,
+          readCalendarScopeInitialized: true,
+        };
+      });
+      return picked;
+    },
+    [settings.pinnedWriteCalendar, settings.writableCalendarId]
+  );
+
+  useEffect(() => {
+    writeCalendarRef.current = settings.writableCalendarId;
+  }, [settings.writableCalendarId]);
+
   const verifyAndLoadMacBridge = useCallback(async () => {
     const state = await probeMacBridge(macPairingToken);
     setMacBridgeState(state);
@@ -409,38 +548,32 @@ export function DayframeApp() {
       await syncLifecycleSnapshot(macPairingToken);
       const scan = await scanMacCalendarEvents({
         pairingToken: macPairingToken,
-        daysAhead: 7,
+        daysAhead: 28,
       });
       if (scan.ok) {
-        setMacCalendars(scan.calendars);
-        if (!settings.writableCalendarId && scan.defaultCalendarId) {
-          const def = scan.calendars.find(
-            (c) => c.id === scan.defaultCalendarId
-          );
-          setSettings((prev) => ({
-            ...prev,
-            writableCalendarId: scan.defaultCalendarId,
-            writableCalendarTitle: def?.title || "Default Calendar",
-          }));
-        }
+        const picked = rememberWriteCalendar(scan.calendars);
         showToast(
-          `Paired offline with macOS Calendar (${scan.calendars.length} calendars available)`
+          picked
+            ? `Writing only to ${describeCalendar(picked)}`
+            : "Paired. Choose your personal UMich calendar before anything is written."
         );
       }
     } else if (state.error) {
       showToast(state.error);
     }
-  }, [macPairingToken, settings.writableCalendarId, showToast, syncLifecycleSnapshot]);
+  }, [macPairingToken, rememberWriteCalendar, showToast, syncLifecycleSnapshot]);
 
   const pushBlockToExternalCalendar = useCallback(
     async (block: CalendarBlock): Promise<CalendarBlock> => {
-      if (block.syncedToExternalCalendar) return block;
+      if (block.syncedToExternalCalendar || block.occupiesTimeOnly) return block;
+      const calendarId = writeCalendarRef.current;
+      if (!calendarId) return block;
 
       if (macBridgeState.paired && macPairingToken) {
         const res = await writeBlockToMacCalendar({
           pairingToken: macPairingToken,
           block,
-          calendarId: settings.writableCalendarId,
+          calendarId,
         });
         if (res.ok) {
           appendLog({
@@ -465,7 +598,6 @@ export function DayframeApp() {
       appendLog,
       macBridgeState.paired,
       macPairingToken,
-      settings.writableCalendarId,
     ]
   );
 
@@ -504,7 +636,7 @@ export function DayframeApp() {
       }
 
       const [calRes, mailRes, winRes] = await Promise.all([
-        scanMacCalendarEvents({ pairingToken: macPairingToken, daysAhead: 7 }),
+        scanMacCalendarEvents({ pairingToken: macPairingToken, daysAhead: 28 }),
         scanMacMailMessages({ pairingToken: macPairingToken, limit: 12 }),
         captureOpenSlackAndMailWindows({
           pairingToken: macPairingToken,
@@ -526,8 +658,24 @@ export function DayframeApp() {
         };
       }
 
-      setMacCalendars(calRes.calendars);
-      const fetchedCalendarBlocks = [...calRes.blocks];
+      const writeTarget = rememberWriteCalendar(calRes.calendars);
+      const writeId = writeTarget?.id || "";
+      const activeReadIds = settings.readCalendarScopeInitialized && settings.readCalendarIds.length > 0
+        ? Array.from(new Set([...(writeId ? [writeId] : []), ...settings.readCalendarIds]))
+        : pickDefaultReadCalendarIds(calRes.calendars, writeId || undefined);
+      const activeReadSet = new Set(activeReadIds);
+
+      const fetchedCalendarBlocks = calRes.blocks
+        .filter((block) => !block.calendarId || activeReadSet.has(block.calendarId))
+        .map((block) => ({
+          ...block,
+          occupiesTimeOnly: Boolean(
+            writeId &&
+              block.calendarId &&
+              block.calendarId !== writeId &&
+              !block.isDayframeCreated
+          ),
+        }));
       const fetchedEmails = mailRes.messages;
       setScannedEmails(fetchedEmails);
 
@@ -753,13 +901,28 @@ export function DayframeApp() {
               captures: workingCaptures,
               rules,
               settings,
-              forceAskUser: true,
             });
             workingBlocks = placed.updatedBlocks;
           }
         } else if (holistic.error) {
           gemmaNote = holistic.error;
         }
+      }
+
+      if (settings.autoWriteToCalendar && writeCalendarRef.current) {
+        const written: CalendarBlock[] = [];
+        for (const block of workingBlocks) {
+          if (
+            block.isDayframeCreated &&
+            block.status === "confirmed" &&
+            !block.syncedToExternalCalendar
+          ) {
+            written.push(await pushBlockToExternalCalendar(block));
+          } else {
+            written.push(block);
+          }
+        }
+        workingBlocks = written;
       }
 
       setCaptures(workingCaptures);
@@ -821,6 +984,8 @@ export function DayframeApp() {
     appendLog,
     captures,
     macPairingToken,
+    pushBlockToExternalCalendar,
+    rememberWriteCalendar,
     rules,
     settings,
     todayKey,
@@ -1484,6 +1649,13 @@ export function DayframeApp() {
     const target = blocks.find((b) => b.id === id);
     if (!target) return;
 
+    if (target.isDayframeCreated && target.externalEventId && macPairingToken) {
+      void deleteBlockFromMacCalendar({
+        pairingToken: macPairingToken,
+        eventId: target.externalEventId,
+      });
+    }
+
     setBlocks((prev) =>
       prev.filter((b) => b.id !== id && b.linkedMeetingId !== id)
     );
@@ -1650,6 +1822,13 @@ export function DayframeApp() {
   };
 
   const handleDeleteBlock = (id: string) => {
+    const target = blocks.find((b) => b.id === id);
+    if (target?.isDayframeCreated && target.externalEventId && macPairingToken) {
+      void deleteBlockFromMacCalendar({
+        pairingToken: macPairingToken,
+        eventId: target.externalEventId,
+      });
+    }
     setBlocks((prev) =>
       prev.filter((b) => b.id !== id && b.linkedMeetingId !== id)
     );
@@ -1928,6 +2107,299 @@ export function DayframeApp() {
     }
   };
 
+  const refreshFilteredCalendarBlocks = async (
+    nextReadIds: string[],
+    nextWriteId: string
+  ) => {
+    if (!macBridgeState.paired || !macPairingToken) return;
+    const scan = await scanMacCalendarEvents({
+      pairingToken: macPairingToken,
+      daysAhead: 28,
+      allowedReadCalendarIds: nextReadIds,
+    });
+    if (!scan.ok) return;
+    setMacCalendars(scan.calendars);
+    const localUnsynced = blocks.filter(
+      (b) => b.isDayframeCreated && !b.syncedToExternalCalendar
+    );
+    const mapped = scan.blocks.map((block) => ({
+      ...block,
+      occupiesTimeOnly: Boolean(
+        nextWriteId &&
+          block.calendarId &&
+          block.calendarId !== nextWriteId &&
+          !block.isDayframeCreated
+      ),
+    }));
+    setBlocks(
+      [...mapped, ...localUnsynced].sort(
+        (a, b) =>
+          a.dateKey.localeCompare(b.dateKey) ||
+          a.startMinutes - b.startMinutes
+      )
+    );
+  };
+
+  const handlePickWriteCalendar = (calendarId: string) => {
+    const found = macCalendars.find((c) => c.id === calendarId);
+    if (!found) return;
+    writeCalendarRef.current = found.id;
+    const nextReads = settings.readCalendarIds.includes(found.id)
+      ? settings.readCalendarIds
+      : [found.id, ...settings.readCalendarIds];
+    setSettings((prev) => ({
+      ...prev,
+      writableCalendarId: found.id,
+      writableCalendarTitle: found.title,
+      writableCalendarSource: found.sourceTitle,
+      pinnedWriteCalendar: true,
+      readCalendarIds: nextReads,
+      readCalendarScopeInitialized: true,
+    }));
+    void refreshFilteredCalendarBlocks(nextReads, found.id);
+    showToast(`Pinned write target to ${describeCalendar(found)}`);
+  };
+
+  const handleToggleReadCalendar = (calendarId: string, checked: boolean) => {
+    const set = new Set(settings.readCalendarIds);
+    if (checked) set.add(calendarId);
+    else set.delete(calendarId);
+    if (settings.writableCalendarId) set.add(settings.writableCalendarId);
+    const nextReads = Array.from(set);
+    setSettings((prev) => ({
+      ...prev,
+      readCalendarIds: nextReads,
+      readCalendarScopeInitialized: true,
+    }));
+    void refreshFilteredCalendarBlocks(nextReads, settings.writableCalendarId);
+  };
+
+  const handleSelectOnlyUmichReadCalendar = () => {
+    const onlyId = settings.writableCalendarId;
+    if (!onlyId) return;
+    const nextReads = [onlyId];
+    setSettings((prev) => ({
+      ...prev,
+      readCalendarIds: nextReads,
+      readCalendarScopeInitialized: true,
+    }));
+    void refreshFilteredCalendarBlocks(nextReads, onlyId);
+    showToast(`Reading & writing exclusively on ${settings.writableCalendarTitle}`);
+  };
+
+  const handleAddTaskToCalendar = async (task: {
+    title: string;
+    gutMinutes: number;
+    applyMultiplier: boolean;
+    deadlineDateKey?: string;
+    useGemmaBreakdown?: boolean;
+  }) => {
+    if (!writeCalendarRef.current) {
+      setScopeDialogOpen(true);
+      showToast("Choose your personal UMich calendar first. Nothing was written.");
+      return;
+    }
+
+    let milestoneLabels: string[] | undefined;
+    if (task.useGemmaBreakdown) {
+      setDecomposingWithAi(true);
+      try {
+        const mult = task.applyMultiplier ? settings.calibrationMultiplier : 1;
+        const estTotal = Math.max(15, Math.round((task.gutMinutes * mult) / 15) * 15);
+        const segCount =
+          estTotal <= 90
+            ? 1
+            : estTotal >= 180
+              ? 1 + Math.ceil((estTotal - 45) / 90)
+              : Math.ceil(estTotal / 75);
+
+        if (macBridgeState.paired && macPairingToken) {
+          await wakeOllamaViaMacDaemon(macPairingToken);
+        }
+        const gStat = await probeLocalGemma(settings.gemmaModel);
+        if (gStat.reachable) {
+          const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+          const breakdown = await decomposeGoalWithGemma4({
+            model: tag,
+            goalTitle: task.title,
+            segmentCount: segCount,
+            deadlineDateKey: task.deadlineDateKey,
+          });
+          if (breakdown.ok) {
+            milestoneLabels = breakdown.milestones;
+          }
+        }
+      } finally {
+        if (settings.unloadModelsAfterBatch) {
+          await sleepAllModelsViaMacDaemon({
+            pairingToken: macPairingToken,
+            gemmaModel: settings.gemmaModel,
+          });
+          await unloadGemmaModelImmediately(settings.gemmaModel);
+        }
+        setDecomposingWithAi(false);
+      }
+    }
+
+    const plan = scheduleTaskOntoCalendar({
+      title: task.title,
+      gutMinutes: task.gutMinutes,
+      applyMultiplier: task.applyMultiplier,
+      deadlineDateKey: task.deadlineDateKey,
+      milestoneLabels,
+      blocks,
+      rules,
+      settings: {
+        ...settings,
+        writableCalendarId: writeCalendarRef.current,
+      },
+      todayKey,
+    });
+
+    if (plan.scarcityWarning) {
+      setScarcityWarning(plan.scarcityWarning);
+    } else {
+      setScarcityWarning(null);
+    }
+
+    if (plan.created.length === 0) {
+      showToast(plan.note);
+      return;
+    }
+
+    const written: CalendarBlock[] = [];
+    for (const block of plan.created) {
+      written.push(await pushBlockToExternalCalendar(block));
+    }
+    setBlocks(plan.blocks.map((b) => written.find((w) => w.id === b.id) ?? b));
+    showToast(plan.note);
+  };
+
+  const handleToggleBlockDone = async (
+    id: string,
+    actualMinutesOverride?: number
+  ) => {
+    const target = blocks.find((b) => b.id === id);
+    if (!target) return;
+
+    const nextDone = !target.done;
+    const actualMins = actualMinutesOverride ?? target.durationMinutes;
+
+    if (nextDone) {
+      const sample: CalibrationSample = {
+        id: `cal-${Date.now()}`,
+        title: target.title,
+        gutMinutes: target.gutMinutes ?? target.durationMinutes,
+        scheduledMinutes: target.durationMinutes,
+        actualMinutes: actualMins,
+        completedAtIso: new Date().toISOString(),
+      };
+      setCalibrationSamples((prev) => [sample, ...prev.slice(0, 49)]);
+    }
+
+    let updatedBlock: CalendarBlock = {
+      ...target,
+      done: nextDone,
+      completedAtIso: nextDone ? new Date().toISOString() : undefined,
+      actualMinutesTaken: nextDone ? actualMins : undefined,
+    };
+
+    if (
+      target.syncedToExternalCalendar &&
+      target.externalEventId &&
+      macBridgeState.paired &&
+      macPairingToken &&
+      writeCalendarRef.current
+    ) {
+      await deleteBlockFromMacCalendar({
+        pairingToken: macPairingToken,
+        eventId: target.externalEventId,
+      });
+      const rewritten = await writeBlockToMacCalendar({
+        pairingToken: macPairingToken,
+        block: updatedBlock,
+        calendarId: writeCalendarRef.current,
+      });
+      if (rewritten.ok) {
+        updatedBlock = {
+          ...updatedBlock,
+          externalEventId: rewritten.externalEventId,
+          syncedToExternalCalendar: true,
+        };
+      }
+    }
+
+    setBlocks((prev) => prev.map((b) => (b.id === id ? updatedBlock : b)));
+    showToast(
+      nextDone
+        ? `Done: "${target.title}" (logged ${formatDuration(actualMins)} for calibration)`
+        : `Reopened "${target.title}"`
+    );
+  };
+
+  const handleReplanOverdue = async () => {
+    const plan = takeOverdueWorkForward({
+      blocks,
+      rules,
+      settings: {
+        ...settings,
+        writableCalendarId: writeCalendarRef.current,
+      },
+      todayKey,
+    });
+    if (plan.moved.length === 0) {
+      showToast("Clean slate — 0 unfinished blocks need moving.");
+      return;
+    }
+    for (const old of blocks) {
+      if (plan.removedIds.includes(old.id) && old.externalEventId && macPairingToken) {
+        await deleteBlockFromMacCalendar({
+          pairingToken: macPairingToken,
+          eventId: old.externalEventId,
+        });
+      }
+    }
+    const written: CalendarBlock[] = [];
+    for (const block of plan.moved) {
+      written.push(await pushBlockToExternalCalendar(block));
+    }
+    setBlocks(plan.blocks.map((b) => written.find((w) => w.id === b.id) || b));
+    showToast(
+      `Re-planned ${written.length} unfinished block${
+        written.length === 1 ? "" : "s"
+      } into upcoming open space.`
+    );
+  };
+
+  const handlePullFutureTaskIntoToday = async () => {
+    const res = pullNextFutureTaskIntoToday({
+      blocks,
+      rules,
+      settings: {
+        ...settings,
+        writableCalendarId: writeCalendarRef.current,
+      },
+      todayKey,
+    });
+    if (!res.pulled) {
+      showToast("No open slot left today (or no upcoming tasks to pull forward).");
+      return;
+    }
+    if (res.oldExternalEventId && macPairingToken) {
+      await deleteBlockFromMacCalendar({
+        pairingToken: macPairingToken,
+        eventId: res.oldExternalEventId,
+      });
+    }
+    const synced = await pushBlockToExternalCalendar(res.pulled);
+    setBlocks(res.blocks.map((b) => (b.id === synced.id ? synced : b)));
+    showToast(
+      `Pulled "${synced.title}" into today at ${formatMinutesToTime(
+        synced.startMinutes
+      )}!`
+    );
+  };
+
   if (!settings.setupCompleted) {
     return (
       <KickstartWizard
@@ -1972,6 +2444,30 @@ export function DayframeApp() {
   const totalQueuedBatchCount = inMemoryQueuedMacCount + diskQueuedCount;
   const proposedBlocks = blocks.filter((b) => b.status === "proposed");
 
+  const nowDt = new Date();
+  const nowMinutesOfDay = nowDt.getHours() * 60 + nowDt.getMinutes();
+  const overdueCount = blocks.filter((b) => {
+    if (!b.isDayframeCreated || b.done || b.occupiesTimeOnly) return false;
+    if (b.kind === "meeting" && !b.isSoloHold) return false;
+    if (b.dateKey < todayKey) return true;
+    if (
+      b.dateKey === todayKey &&
+      b.startMinutes + b.durationMinutes <= nowMinutesOfDay
+    ) {
+      return true;
+    }
+    return false;
+  }).length;
+
+  const futurePullableCount = blocks.filter(
+    (b) =>
+      b.isDayframeCreated &&
+      !b.done &&
+      !b.occupiesTimeOnly &&
+      b.dateKey > todayKey &&
+      (b.kind === "deep-work" || b.kind === "follow-up")
+  ).length;
+
   return (
     <div className="min-h-screen bg-muted/20 text-foreground">
       <TopMenubar
@@ -2003,7 +2499,7 @@ export function DayframeApp() {
           void runBaselineCalendarAndMailScan().then((res) => {
             if (res.ok) {
               showToast(
-                `Synced ${res.existingCount} events & ${res.emailCount} Mail messages (${res.proposedCount} awaiting your Yes/No)`
+                `Synced ${res.existingCount} events from selected calendar(s)`
               );
             } else if (res.error) {
               showToast(res.error);
@@ -2015,6 +2511,7 @@ export function DayframeApp() {
         onReopenSetupWizard={() =>
           setSettings((prev) => ({ ...prev, setupCompleted: false }))
         }
+        onOpenCalendarScope={() => setScopeDialogOpen(true)}
         pipelineLogs={pipelineLogs}
       />
 
@@ -2034,29 +2531,61 @@ export function DayframeApp() {
         </div>
 
         <div className="order-1 space-y-4 lg:order-2 lg:col-span-6">
-          <PendingConfirmationsDeck
-            todayKey={todayKey}
-            proposedBlocks={proposedBlocks}
-            allBlocks={blocks}
-            captures={captures}
-            confirmationPolicy={settings.confirmationPolicy}
-            onChangeConfirmationPolicy={(policy) =>
-              setSettings((prev) => ({ ...prev, confirmationPolicy: policy }))
+          <TaskComposer
+            settings={settings}
+            onUpdateSettings={(patch) =>
+              setSettings((prev) => ({ ...prev, ...patch }))
             }
-            onApproveBlock={(id, alwaysRule) =>
-              void handleApproveProposedBlock(id, alwaysRule)
+            calendars={macCalendars}
+            onSelectWriteCalendar={handlePickWriteCalendar}
+            onToggleReadCalendar={handleToggleReadCalendar}
+            onSelectOnlyUmichReadCalendar={handleSelectOnlyUmichReadCalendar}
+            onRefreshCalendars={() => void verifyAndLoadMacBridge()}
+            calibrationSamples={calibrationSamples}
+            busy={isSyncingCalendar}
+            decomposingWithAi={decomposingWithAi}
+            overdueCount={overdueCount}
+            futurePullableCount={futurePullableCount}
+            scarcityWarning={scarcityWarning}
+            onDismissScarcityWarning={() => setScarcityWarning(null)}
+            scopeDialogOpen={scopeDialogOpen}
+            onScopeDialogOpenChange={setScopeDialogOpen}
+            onAddTask={(task) => void handleAddTaskToCalendar(task)}
+            onReplanOverdue={() => void handleReplanOverdue()}
+            onPullFutureTaskIntoToday={() =>
+              void handlePullFutureTaskIntoToday()
             }
-            onSkipBlock={handleSkipProposedBlock}
-            onApproveAll={() => void handleConfirmAndSyncAllAutoBlocks()}
-            onSetBlockExactDuration={handleSetBlockExactDuration}
-            onMoveBlockToNextSlot={handleMoveBlockToNextSlot}
-            onPushBlockTomorrow={(id) => handleShiftBlockDate(id, 1)}
           />
+
+          {proposedBlocks.length > 0 && (
+            <PendingConfirmationsDeck
+              todayKey={todayKey}
+              proposedBlocks={proposedBlocks}
+              allBlocks={blocks}
+              captures={captures}
+              confirmationPolicy={settings.confirmationPolicy}
+              onChangeConfirmationPolicy={(policy) =>
+                setSettings((prev) => ({ ...prev, confirmationPolicy: policy }))
+              }
+              onApproveBlock={(id, alwaysRule) =>
+                void handleApproveProposedBlock(id, alwaysRule)
+              }
+              onSkipBlock={handleSkipProposedBlock}
+              onApproveAll={() => void handleConfirmAndSyncAllAutoBlocks()}
+              onSetBlockExactDuration={handleSetBlockExactDuration}
+              onMoveBlockToNextSlot={handleMoveBlockToNextSlot}
+              onPushBlockTomorrow={(id) => handleShiftBlockDate(id, 1)}
+            />
+          )}
 
           <CalendarTimeline
             todayKey={todayKey}
             anchorDateKey={anchorDateKey}
             onChangeAnchorDateKey={setAnchorDateKey}
+            horizonDays={settings.timelineHorizonDays ?? 7}
+            onChangeHorizonDays={(days) =>
+              setSettings((prev) => ({ ...prev, timelineHorizonDays: days }))
+            }
             blocks={blocks}
             captures={captures}
             rules={rules}
@@ -2069,6 +2598,9 @@ export function DayframeApp() {
             onConfirmAndSyncAllAutoBlocks={() =>
               void handleConfirmAndSyncAllAutoBlocks()
             }
+            onToggleBlockDone={(id, actual) =>
+              void handleToggleBlockDone(id, actual)
+            }
             onAdjustBlockDuration={handleAdjustBlockDuration}
             onMoveBlockToNextSlot={handleMoveBlockToNextSlot}
             onShiftBlockDate={handleShiftBlockDate}
@@ -2078,9 +2610,7 @@ export function DayframeApp() {
                 if (!r.ok && r.error) showToast(r.error);
               });
             }}
-            onOpenSetupWizard={() =>
-              setSettings((prev) => ({ ...prev, setupCompleted: false }))
-            }
+            onOpenCalendarScope={() => setScopeDialogOpen(true)}
           />
         </div>
 

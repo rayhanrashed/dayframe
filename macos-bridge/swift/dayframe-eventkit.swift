@@ -9,6 +9,7 @@ struct RequestPayload: Decodable {
     let notes: String?
     let location: String?
     let calendarId: String?
+    let eventId: String?
 }
 
 func emitJson(_ dict: [String: Any]) {
@@ -47,7 +48,8 @@ let payload = (try? JSONDecoder().decode(RequestPayload.self, from: stdinData)) 
     title: nil,
     notes: nil,
     location: nil,
-    calendarId: nil
+    calendarId: nil,
+    eventId: nil
 )
 
 let store = EKEventStore()
@@ -106,6 +108,21 @@ if !granted {
 
 let action = payload.action ?? "scan"
 
+if action == "delete" {
+    guard let id = payload.eventId, !id.isEmpty,
+          let ev = store.event(withIdentifier: id) else {
+        emitJson(["ok": false, "error": "Calendar event was not found."])
+        exit(0)
+    }
+    do {
+        try store.remove(ev, span: .thisEvent, commit: true)
+        emitJson(["ok": true])
+    } catch {
+        emitJson(["ok": false, "error": error.localizedDescription])
+    }
+    exit(0)
+}
+
 if action == "create" {
     let startSec = (payload.startMs ?? 0) / 1000.0
     let endSec = (payload.endMs ?? 0) / 1000.0
@@ -114,15 +131,13 @@ if action == "create" {
         exit(0)
     }
 
-    var targetCal = store.defaultCalendarForNewEvents
-    if let cid = payload.calendarId, !cid.isEmpty,
-       let found = store.calendar(withIdentifier: cid),
-       found.allowsContentModifications {
-        targetCal = found
-    }
-
-    guard let cal = targetCal else {
-        emitJson(["ok": false, "error": "No writable calendar found in macOS Calendar.app."])
+    guard let cid = payload.calendarId, !cid.isEmpty,
+          let cal = store.calendar(withIdentifier: cid),
+          cal.allowsContentModifications else {
+        emitJson([
+            "ok": false,
+            "error": "Refusing to write. Dayframe only writes to the personal UMich calendar, and that calendar was not found."
+        ])
         exit(0)
     }
 

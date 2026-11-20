@@ -1,0 +1,36 @@
+ObjC.import("Foundation");
+ObjC.import("EventKit");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const store = $.EKEventStore.alloc.init;
+  const status = Number($.EKEventStore.authorizationStatusForEntityType(0));
+  if (status !== 3 && status !== 4) {
+    return JSON.stringify({
+      ok: false,
+      error: "Calendar permission is not granted.",
+    });
+  }
+  if (!input.eventId) {
+    return JSON.stringify({ ok: false, error: "Missing event id." });
+  }
+  const ev = store.eventWithIdentifier(String(input.eventId));
+  if (!ev) {
+    return JSON.stringify({ ok: false, error: "Calendar event was not found." });
+  }
+  const errRef = Ref();
+  const removed = store.removeEventSpanCommitError(ev, 0, true, errRef);
+  if (!removed) {
+    return JSON.stringify({
+      ok: false,
+      error: "Could not remove the previous calendar block.",
+    });
+  }
+  return JSON.stringify({ ok: true });
+}

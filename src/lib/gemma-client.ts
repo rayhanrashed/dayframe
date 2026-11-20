@@ -834,6 +834,73 @@ Return ONLY valid JSON with this exact structure:
   }
 }
 
+export async function decomposeGoalWithGemma4(params: {
+  model: string;
+  goalTitle: string;
+  segmentCount: number;
+  deadlineDateKey?: string;
+}): Promise<{ ok: boolean; milestones: string[]; latencyMs: number }> {
+  const { model, goalTitle, segmentCount, deadlineDateKey } = params;
+  const t0 = performance.now();
+  if (segmentCount <= 1) {
+    return { ok: true, milestones: [goalTitle], latencyMs: 0 };
+  }
+
+  const prompt = `You are Dayframe's offline local Gemma 4 time-blocking strategist.
+Break this longstanding project/goal into exactly ${segmentCount} concrete, sequential 60-90 minute calendar session titles${
+    deadlineDateKey ? ` (backtracked before deadline ${deadlineDateKey})` : ""
+  }:
+Goal: "${goalTitle}"
+
+Rules:
+- Session 1 MUST be a concrete scoping/planning/outline block ("Scope & outline requirements").
+- Middle sessions must be specific execution steps (no vague filler).
+- Final session must be review, polish, and buffer before submission.
+- Keep each label concise (3 to 7 words, without numbering prefixes).
+
+Return ONLY valid JSON:
+{
+  "milestones": string[]
+}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25000);
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        stream: false,
+        keep_alive: 0,
+        format: "json",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) return { ok: false, milestones: [], latencyMs };
+    const body = (await res.json()) as { message?: { content?: string } };
+    const parsed = JSON.parse(body.message?.content ?? "{}") as {
+      milestones?: unknown[];
+    };
+    const milestones = Array.isArray(parsed.milestones)
+      ? parsed.milestones
+          .map((m) => String(m || "").trim().slice(0, 70))
+          .filter(Boolean)
+          .slice(0, segmentCount)
+      : [];
+    return { ok: milestones.length > 0, milestones, latencyMs };
+  } catch {
+    return {
+      ok: false,
+      milestones: [],
+      latencyMs: Math.round(performance.now() - t0),
+    };
+  }
+}
+
 export function computeCanvasLuminanceSignature(
   ctx: CanvasRenderingContext2D,
   width: number,

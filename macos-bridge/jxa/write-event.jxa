@@ -49,18 +49,15 @@ function run() {
     });
   }
 
-  let targetCal = store.defaultCalendarForNewEvents;
-  if (input.calendarId) {
-    const customCal = store.calendarWithIdentifier(input.calendarId);
-    if (customCal && customCal.allowsContentModifications) {
-      targetCal = customCal;
-    }
-  }
+  const targetCal = input.calendarId
+    ? store.calendarWithIdentifier(input.calendarId)
+    : null;
 
-  if (!targetCal) {
+  if (!targetCal || !targetCal.allowsContentModifications) {
     return JSON.stringify({
       ok: false,
-      error: "No writable calendar found in macOS Calendar.app.",
+      error:
+        "Refusing to write. Dayframe only writes to the personal UMich calendar, and that calendar was not found.",
     });
   }
 
