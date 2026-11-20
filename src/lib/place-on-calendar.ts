@@ -504,3 +504,285 @@ export function computeMeasuredMultiplier(
   const clamped = Math.round(Math.max(0.75, Math.min(3.0, raw)) * 100) / 100;
   return { measured: clamped, sampleCount: samples.length };
 }
+
+/**
+ * Schedules a recurring weekly budget across N upcoming weeks with clean canonical naming!
+ * Example: "AIIM Fellowship" — 120m/week for 2 weeks -> places 2x60m (or 1x90m+30m) in Week 1 and Week 2.
+ */
+export function scheduleWeeklyCadenceOntoCalendar(params: {
+  canonicalTitle: string;
+  minutesPerWeek: number;
+  weeksCount: number;
+  taskModelId?: string;
+  notes?: string;
+  blocks: CalendarBlock[];
+  rules: StandingRule[];
+  settings: OrganizerSettings;
+  todayKey: string;
+}): {
+  blocks: CalendarBlock[];
+  created: CalendarBlock[];
+  note: string;
+} {
+  const {
+    canonicalTitle,
+    minutesPerWeek,
+    weeksCount,
+    taskModelId,
+    notes,
+    rules,
+    settings,
+    todayKey,
+  } = params;
+
+  let working = [...params.blocks];
+  const created: CalendarBlock[] = [];
+  const projectGroupId = `wkproj-${Date.now()}`;
+
+  // Break each week's budget into clean 60m-90m blocks (e.g. 120m -> two 60m blocks)
+  const weeklyChunks: number[] = [];
+  let rem = roundTo15(minutesPerWeek);
+  if (rem === 120) {
+    weeklyChunks.push(60, 60);
+  } else {
+    while (rem > 0) {
+      const sz = rem > 90 ? (rem >= 150 ? 90 : 60) : rem;
+      weeklyChunks.push(roundTo15(sz));
+      rem -= sz;
+    }
+  }
+
+  for (let w = 0; w < weeksCount; w++) {
+    const weekStartOffset = w * 7;
+    const weekEndOffset = weekStartOffset + 6;
+    const usedDaysInWeek = new Set<string>();
+
+    weeklyChunks.forEach((chunkMins, cIdx) => {
+      let placed = false;
+      for (const allowSameDay of [false, true]) {
+        if (placed) break;
+        for (let d = weekStartOffset; d <= weekEndOffset; d++) {
+          const dateKey = addDaysToDateKey(todayKey, d);
+          if (!allowSameDay && usedDaysInWeek.has(dateKey)) continue;
+
+          const slot = findOpenSlot({
+            dateKey,
+            durationMinutes: chunkMins,
+            blocks: working,
+            rules,
+            settings,
+          });
+          if (slot === null) continue;
+
+          const blockTitle =
+            weeklyChunks.length > 1
+              ? `${canonicalTitle} — Wk ${w + 1} (${cIdx + 1}/${weeklyChunks.length})`
+              : weeksCount > 1
+                ? `${canonicalTitle} — Wk ${w + 1}`
+                : canonicalTitle;
+
+          const blk: CalendarBlock = {
+            id: `wk-${Date.now()}-${w}-${cIdx}-${Math.random().toString(36).slice(2, 5)}`,
+            title: blockTitle,
+            kind: "deep-work",
+            status: "confirmed",
+            dateKey,
+            startMinutes: slot,
+            durationMinutes: chunkMins,
+            gutMinutes: chunkMins,
+            projectGroupId,
+            taskModelId,
+            notes,
+            calendarId: settings.writableCalendarId,
+            calendarTitle: settings.writableCalendarTitle,
+            isDayframeCreated: true,
+            sourceLabel: "Weekly Cadence",
+            rationale: `${formatDuration(minutesPerWeek)}/week for ${weeksCount} week${
+              weeksCount === 1 ? "" : "s"
+            } (Week ${w + 1} of ${weeksCount}).`,
+            confidence: 1,
+          };
+
+          usedDaysInWeek.add(dateKey);
+          working = [...working, blk].sort(
+            (a, b) =>
+              a.dateKey.localeCompare(b.dateKey) ||
+              a.startMinutes - b.startMinutes
+          );
+          created.push(blk);
+          placed = true;
+          break;
+        }
+      }
+    });
+  }
+
+  if (created.length === 0) {
+    return {
+      blocks: working,
+      created,
+      note: `Could not find open space over the next ${weeksCount} weeks.`,
+    };
+  }
+
+  return {
+    blocks: working,
+    created,
+    note: `Scheduled "${canonicalTitle}" (${formatDuration(
+      minutesPerWeek
+    )}/week × ${weeksCount} weeks → ${created.length} blocks) on ${
+      settings.writableCalendarTitle
+    }.`,
+  };
+}
+
+/**
+ * Schedules N blocks of M minutes specifically linked to a target event
+ * (e.g. "add two one-hour blocks to prepare for this anytime from today until the meeting time").
+ */
+export function scheduleBlocksForTargetEvent(params: {
+  targetEvent: CalendarBlock;
+  count: number;
+  durationMinutesEach: number;
+  beforeEventTime: boolean;
+  blocks: CalendarBlock[];
+  rules: StandingRule[];
+  settings: OrganizerSettings;
+  todayKey: string;
+}): {
+  blocks: CalendarBlock[];
+  created: CalendarBlock[];
+  note: string;
+} {
+  const {
+    targetEvent,
+    count,
+    durationMinutesEach,
+    beforeEventTime,
+    rules,
+    settings,
+    todayKey,
+  } = params;
+
+  const cleanParent = targetEvent.title
+    .replace(/^\[(Prep|Task|Focus|Solo Hold)\]\s+/i, "")
+    .trim();
+  let working = [...params.blocks];
+  const created: CalendarBlock[] = [];
+  const usedDays = new Set<string>();
+
+  const maxDaySpan = beforeEventTime
+    ? Math.max(0, daysBetweenDateKeys(todayKey, targetEvent.dateKey))
+    : 14;
+
+  for (let i = 0; i < count; i++) {
+    let placed = false;
+
+    // Pass 1: Spread across distinct days before the meeting; Pass 2: Allow multiple blocks on same day; Pass 3: Relax daily buffer/weekends if tight
+    const passes = [
+      { distinctDay: true, relax: false },
+      { distinctDay: false, relax: false },
+      { distinctDay: false, relax: true },
+    ];
+
+    for (const pass of passes) {
+      if (placed) break;
+      for (let d = 0; d <= maxDaySpan; d++) {
+        const dateKey = beforeEventTime
+          ? addDaysToDateKey(todayKey, d)
+          : addDaysToDateKey(
+              targetEvent.dateKey > todayKey ? targetEvent.dateKey : todayKey,
+              d
+            );
+        if (pass.distinctDay && usedDays.has(dateKey)) continue;
+
+        const isEventDay = beforeEventTime && dateKey === targetEvent.dateKey;
+        const finishCutoff = isEventDay
+          ? Math.max(settings.workdayStartMinutes, targetEvent.startMinutes - 15)
+          : undefined;
+
+        if (
+          isEventDay &&
+          finishCutoff !== undefined &&
+          finishCutoff - settings.workdayStartMinutes < durationMinutesEach
+        ) {
+          continue;
+        }
+
+        const slot = findOpenSlot({
+          dateKey,
+          durationMinutes: durationMinutesEach,
+          blocks: working,
+          rules,
+          settings,
+          mustFinishByMinutes: finishCutoff,
+          allowWeekend: pass.relax,
+          ignoreDailyBuffer: pass.relax || isEventDay,
+          allowEarlyMorning: isEventDay,
+        });
+        if (slot === null) continue;
+
+        const label =
+          count > 1
+            ? `Prep: ${cleanParent} (${i + 1}/${count})`
+            : `Prep: ${cleanParent}`;
+
+        const blk: CalendarBlock = {
+          id: `evprep-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 5)}`,
+          title: label,
+          kind: "prep",
+          status: "confirmed",
+          dateKey,
+          startMinutes: slot,
+          durationMinutes: durationMinutesEach,
+          gutMinutes: durationMinutesEach,
+          linkedMeetingId: targetEvent.id,
+          taskModelId: targetEvent.taskModelId,
+          calendarId: settings.writableCalendarId,
+          calendarTitle: settings.writableCalendarTitle,
+          isDayframeCreated: true,
+          sourceLabel: `Event Chat (${cleanParent})`,
+          rationale: `Scheduled for "${cleanParent}" (${targetEvent.dateKey} at ${formatMinutesToTime(
+            targetEvent.startMinutes
+          )}).`,
+          confidence: 1,
+        };
+
+        usedDays.add(dateKey);
+        working = [...working, blk].sort(
+          (a, b) =>
+            a.dateKey.localeCompare(b.dateKey) ||
+            a.startMinutes - b.startMinutes
+        );
+        created.push(blk);
+        placed = true;
+        break;
+      }
+    }
+  }
+
+  if (created.length === 0) {
+    return {
+      blocks: working,
+      created,
+      note: beforeEventTime
+        ? `No open ${formatDuration(durationMinutesEach)} slots available between now and "${cleanParent}" (${targetEvent.dateKey} ${formatMinutesToTime(targetEvent.startMinutes)}).`
+        : `No open ${formatDuration(durationMinutesEach)} slots found.`,
+    };
+  }
+
+  const slotSummary = created
+    .map((c) => `${c.dateKey} ${formatMinutesToTime(c.startMinutes)}`)
+    .join(", ");
+
+  return {
+    blocks: working,
+    created,
+    note: `Added ${created.length}/${count} block${
+      created.length === 1 ? "" : "s"
+    } (${formatDuration(durationMinutesEach)} each: ${slotSummary}) onto ${
+      settings.writableCalendarTitle
+    }.`,
+  };
+}
+

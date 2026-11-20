@@ -1,6 +1,7 @@
 import {
   CalendarBlock,
   CapturedContextWindow,
+  LocalPaperHit,
   MacCalendarDescriptor,
   ModelLifecycleState,
   ScannedEmailItem,
@@ -646,6 +647,171 @@ export async function scanMacMailMessages(params: {
   }
 }
 
+export function formatRichCalendarNotes(block: CalendarBlock): string {
+  const sections: string[] = [];
+  if (block.rationale) {
+    sections.push(block.rationale);
+  }
+  if (block.notes && block.notes !== block.rationale) {
+    sections.push(block.notes);
+  }
+  if (block.subtasks && block.subtasks.length > 0) {
+    sections.push(
+      "Checklist:\n" +
+        block.subtasks
+          .map((t) => `${t.done ? "[x]" : "[ ]"} ${t.text}`)
+          .join("\n")
+    );
+  }
+  if (block.reminders && block.reminders.length > 0) {
+    sections.push(
+      "Reminders:\n" +
+        block.reminders
+          .map(
+            (r) =>
+              `• ${r.text}${r.leadMinutes ? ` (${r.leadMinutes}m before)` : ""}`
+          )
+          .join("\n")
+    );
+  }
+  if (block.relevantPapers && block.relevantPapers.length > 0) {
+    sections.push(
+      "Relevant Papers & Docs:\n" +
+        block.relevantPapers
+          .map(
+            (p) => `• ${p.title}${p.pathOrUrl ? ` — ${p.pathOrUrl}` : ""}`
+          )
+          .join("\n")
+    );
+  }
+  sections.push(`Scheduled offline by Dayframe (${block.sourceLabel})`);
+  return sections.join("\n\n").slice(0, 3200);
+}
+
+export async function updateBlockOnMacCalendar(params: {
+  pairingToken: string;
+  eventId: string;
+  block: CalendarBlock;
+  alarmMinutesBefore?: number;
+}): Promise<{ ok: boolean; error?: string }> {
+  const { pairingToken, eventId, block, alarmMinutesBefore } = params;
+  if (!pairingToken.trim() || !eventId) return { ok: false };
+
+  const baseTitle = block.title
+    .replace(/^(✓\s+|\[Done\]\s+)/i, "")
+    .replace(/^\[(Prep|Focus|Task|Solo Hold)\]\s+/i, "")
+    .trim();
+  const kindPrefix = block.isDayframeCreated
+    ? block.kind === "prep"
+      ? "[Prep] "
+      : block.isSoloHold
+        ? "[Solo Hold] "
+        : block.kind === "deep-work" || block.kind === "follow-up"
+          ? "[Task] "
+          : ""
+    : "";
+  const fullTitle = block.isDayframeCreated
+    ? `${block.done ? "✓ " : ""}${kindPrefix}${baseTitle}`
+    : undefined;
+
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/calendar/update`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${pairingToken.trim()}`,
+      },
+      body: JSON.stringify({
+        eventId,
+        title: fullTitle,
+        notes: formatRichCalendarNotes(block),
+        alarmMinutesBefore,
+      }),
+    });
+    const data = (await res.json()) as { ok?: boolean; error?: string };
+    return { ok: Boolean(data.ok), error: data.error };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function searchMacMailByQuery(params: {
+  pairingToken: string;
+  query: string;
+  limit?: number;
+}): Promise<ScannedEmailItem[]> {
+  if (!params.pairingToken.trim() || !params.query.trim()) return [];
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/mail/search`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ query: params.query, limit: params.limit ?? 6 }),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      ok?: boolean;
+      messages?: Array<{
+        id: string;
+        subject: string;
+        sender: string;
+        dateIso: string;
+        snippet: string;
+      }>;
+    };
+    return (data.messages ?? []).map((m) => ({
+      ...m,
+      source: "apple-mail" as const,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function searchLocalMacPapers(params: {
+  pairingToken: string;
+  query: string;
+}): Promise<LocalPaperHit[]> {
+  if (!params.pairingToken.trim() || !params.query.trim()) return [];
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/context/local-papers`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ query: params.query }),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { ok?: boolean; papers?: LocalPaperHit[] };
+    return data.papers ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function openLocalMacFile(params: {
+  pairingToken: string;
+  path: string;
+}): Promise<boolean> {
+  if (!params.pairingToken.trim() || !params.path.trim()) return false;
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/context/open-path`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ path: params.path }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function deleteBlockFromMacCalendar(params: {
   pairingToken: string;
   eventId: string;
@@ -702,7 +868,7 @@ export async function writeBlockToMacCalendar(params: {
         title: `${prefix}${baseTitle}`,
         startMs,
         endMs,
-        notes: `${block.rationale}\nScheduled offline by Dayframe (${block.sourceLabel})`,
+        notes: formatRichCalendarNotes(block),
         location: block.locationOrUrl || "",
         calendarId: calendarId || "",
       }),

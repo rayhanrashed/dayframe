@@ -4,16 +4,8 @@ import React, { useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
   CalendarBlock,
   OrganizerSettings,
-  ScreenshotCapture,
   StandingRule,
 } from "@/lib/types";
 import {
@@ -26,21 +18,15 @@ import {
   isWeekendDateKey,
 } from "@/lib/scheduler";
 import {
-  ArrowRight,
   Calendar,
   CalendarCheck,
   Check,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Clock,
-  Minus,
-  Plus,
   RefreshCw,
   Repeat,
   ShieldCheck,
-  Sparkles,
-  Trash2,
   UserCheck,
 } from "lucide-react";
 
@@ -51,22 +37,11 @@ interface CalendarTimelineProps {
   horizonDays: 2 | 7;
   onChangeHorizonDays: (days: 2 | 7) => void;
   blocks: CalendarBlock[];
-  captures: ScreenshotCapture[];
   rules: StandingRule[];
   settings: OrganizerSettings;
-  selectedBlockId: string | null;
   onSelectBlockId: (id: string | null) => void;
-  onConfirmAndSyncBlock: (id: string) => void;
   onConfirmAndSyncAllAutoBlocks: () => void;
   onToggleBlockDone: (id: string, actualMinutesOverride?: number) => void;
-  onAdjustBlockDuration: (
-    id: string,
-    deltaMinutes: number,
-    saveRule: boolean
-  ) => void;
-  onMoveBlockToNextSlot: (id: string) => void;
-  onShiftBlockDate: (id: string, deltaDays: number) => void;
-  onDeleteBlock: (id: string) => void;
   onRunCalendarScanNow: () => void;
   onOpenCalendarScope: () => void;
 }
@@ -139,18 +114,11 @@ export function CalendarTimeline({
   horizonDays,
   onChangeHorizonDays,
   blocks,
-  captures,
   rules,
   settings,
-  selectedBlockId,
   onSelectBlockId,
-  onConfirmAndSyncBlock,
   onConfirmAndSyncAllAutoBlocks,
   onToggleBlockDone,
-  onAdjustBlockDuration,
-  onMoveBlockToNextSlot,
-  onShiftBlockDate,
-  onDeleteBlock,
   onRunCalendarScanNow,
   onOpenCalendarScope,
 }: CalendarTimelineProps) {
@@ -197,16 +165,6 @@ export function CalendarTimeline({
     settings.workdayEndMinutes,
     settings.workdayStartMinutes,
   ]);
-
-  const selectedBlock = useMemo(
-    () => blocks.find((b) => b.id === selectedBlockId) ?? null,
-    [blocks, selectedBlockId]
-  );
-
-  const linkedCapture = useMemo(() => {
-    if (!selectedBlock?.sourceCaptureId) return null;
-    return captures.find((c) => c.id === selectedBlock.sourceCaptureId) ?? null;
-  }, [captures, selectedBlock]);
 
   // Principle 7: Compute visible load & Tomorrow's preview so finite space is unmistakable
   const loadSummary = useMemo(() => {
@@ -573,6 +531,12 @@ export function CalendarTimeline({
                                     block.startMinutes + block.durationMinutes
                                   )}{" "}
                                   ({formatDuration(block.durationMinutes)})
+                                  {(block.subtasks?.length ?? 0) > 0
+                                    ? ` · ${block.subtasks!.filter((t) => !t.done).length}/${block.subtasks!.length} todos`
+                                    : ""}
+                                  {(block.relevantPapers?.length ?? 0) > 0
+                                    ? ` · ${block.relevantPapers!.length} paper${block.relevantPapers!.length === 1 ? "" : "s"}`
+                                    : ""}
                                 </p>
                               )}
                             </div>
@@ -597,241 +561,6 @@ export function CalendarTimeline({
           </div>
         </div>
       )}
-
-      {/* Block Inspector, Done State & Principle 2 Multiplier Calibration Modal */}
-      <Dialog
-        open={Boolean(selectedBlock)}
-        onOpenChange={(open) => {
-          if (!open) onSelectBlockId(null);
-        }}
-      >
-        <DialogContent className="sm:max-w-lg">
-          {selectedBlock && (
-            <>
-              <DialogHeader>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant="secondary" className="text-[10px]">
-                    {formatDateKeyLabel(selectedBlock.dateKey, todayKey)} •{" "}
-                    {formatMinutesToTime(selectedBlock.startMinutes)} (
-                    {formatDuration(selectedBlock.durationMinutes)})
-                  </Badge>
-                  {selectedBlock.calendarTitle && (
-                    <Badge variant="outline" className="text-[10px]">
-                      {selectedBlock.calendarTitle}
-                    </Badge>
-                  )}
-                  {selectedBlock.syncedToExternalCalendar && (
-                    <Badge variant="outline" className="gap-1 text-[10px]">
-                      <CheckCircle2 className="size-3 text-emerald-500" />
-                      On Calendar.app
-                    </Badge>
-                  )}
-                </div>
-                <DialogTitle className="pt-1">{selectedBlock.title}</DialogTitle>
-                <DialogDescription>{selectedBlock.rationale}</DialogDescription>
-              </DialogHeader>
-
-              <div className="space-y-3 py-1 text-xs">
-                {linkedCapture?.imageDataUrl && (
-                  <div className="space-y-1.5 rounded-xl border bg-muted/30 p-2.5">
-                    <div className="font-medium">
-                      Source ({linkedCapture.appName})
-                    </div>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={linkedCapture.imageDataUrl}
-                      alt={linkedCapture.windowTitle}
-                      className="max-h-40 w-full rounded-lg border object-cover"
-                    />
-                  </div>
-                )}
-
-                {/* Principle 2 + Principle 4: Done & Actual Time Taken */}
-                {selectedBlock.isDayframeCreated && (
-                  <div className="space-y-2 rounded-xl border bg-emerald-500/[0.06] p-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold">
-                        Done &amp; Calibrate Multiplier
-                      </span>
-                      {selectedBlock.gutMinutes && (
-                        <span className="font-mono text-[10.5px] text-muted-foreground">
-                          Gut {formatDuration(selectedBlock.gutMinutes)} →
-                          Scheduled {formatDuration(selectedBlock.durationMinutes)}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex flex-wrap gap-1.5">
-                      <Button
-                        size="xs"
-                        variant={selectedBlock.done ? "secondary" : "default"}
-                        onClick={() => {
-                          onToggleBlockDone(
-                            selectedBlock.id,
-                            selectedBlock.durationMinutes
-                          );
-                          onSelectBlockId(null);
-                        }}
-                        className="gap-1"
-                      >
-                        <Check className="size-3" />
-                        {selectedBlock.done
-                          ? "Reopen Task"
-                          : `Done (${formatDuration(selectedBlock.durationMinutes)})`}
-                      </Button>
-                      {!selectedBlock.done && (
-                        <>
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            onClick={() => {
-                              onToggleBlockDone(
-                                selectedBlock.id,
-                                Math.max(15, selectedBlock.durationMinutes - 30)
-                              );
-                              onSelectBlockId(null);
-                            }}
-                          >
-                            Done (30m faster)
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            onClick={() => {
-                              onToggleBlockDone(
-                                selectedBlock.id,
-                                selectedBlock.durationMinutes + 30
-                              );
-                              onSelectBlockId(null);
-                            }}
-                          >
-                            Done (+30m longer)
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            onClick={() => {
-                              onToggleBlockDone(
-                                selectedBlock.id,
-                                selectedBlock.durationMinutes * 2
-                              );
-                              onSelectBlockId(null);
-                            }}
-                          >
-                            Done (2× longer)
-                          </Button>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                <div className="space-y-2 rounded-xl border p-3">
-                  <div className="flex items-center justify-between">
-                    <span className="flex items-center gap-1.5 font-medium">
-                      <Clock className="size-3.5" />
-                      Resize Block Duration
-                    </span>
-                    <span className="font-mono font-semibold">
-                      {formatDuration(selectedBlock.durationMinutes)}
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      disabled={selectedBlock.durationMinutes <= 15}
-                      onClick={() =>
-                        onAdjustBlockDuration(selectedBlock.id, -15, true)
-                      }
-                      className="gap-1"
-                    >
-                      <Minus className="size-3" />
-                      15m less
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      onClick={() =>
-                        onAdjustBlockDuration(selectedBlock.id, 15, true)
-                      }
-                      className="gap-1"
-                    >
-                      <Plus className="size-3" />
-                      15m more
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      onClick={() =>
-                        onAdjustBlockDuration(selectedBlock.id, 30, true)
-                      }
-                      className="gap-1"
-                    >
-                      <Plus className="size-3" />
-                      30m more
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {!selectedBlock.syncedToExternalCalendar &&
-                      !selectedBlock.occupiesTimeOnly && (
-                        <Button
-                          size="sm"
-                          onClick={() => {
-                            onConfirmAndSyncBlock(selectedBlock.id);
-                            onSelectBlockId(null);
-                          }}
-                          className="gap-1.5"
-                        >
-                          <Sparkles className="size-3.5" />
-                          Write to UMich Calendar
-                        </Button>
-                      )}
-
-                    {!selectedBlock.occupiesTimeOnly && (
-                      <>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => onMoveBlockToNextSlot(selectedBlock.id)}
-                          className="gap-1"
-                        >
-                          Next Open Slot
-                          <ArrowRight className="size-3.5" />
-                        </Button>
-
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => onShiftBlockDate(selectedBlock.id, 1)}
-                        >
-                          Move +1 Day
-                        </Button>
-                      </>
-                    )}
-                  </div>
-
-                  {!selectedBlock.occupiesTimeOnly && (
-                    <Button
-                      size="icon-sm"
-                      variant="destructive"
-                      onClick={() => {
-                        onDeleteBlock(selectedBlock.id);
-                        onSelectBlockId(null);
-                      }}
-                      title="Remove block"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </Button>
-                  )}
-                </div>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
     </section>
   );
 }

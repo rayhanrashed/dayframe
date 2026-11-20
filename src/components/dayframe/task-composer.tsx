@@ -27,6 +27,7 @@ import {
   OrganizerSettings,
 } from "@/lib/types";
 import { computeMeasuredMultiplier } from "@/lib/place-on-calendar";
+import { parseNaturalTaskInput } from "@/lib/nl-schedule-parser";
 import { formatDuration } from "@/lib/scheduler";
 import {
   describeCalendar,
@@ -126,19 +127,42 @@ export function TaskComposer({
   );
 
   const rawGut = Number(gutMinutes) || 60;
-  const effectiveMultiplier = applyMultiplier
-    ? settings.calibrationMultiplier
-    : 1;
+  const parsedIntent = useMemo(
+    () =>
+      title.trim()
+        ? parseNaturalTaskInput({
+            rawText: title,
+            fallbackGutMinutes: rawGut,
+            explicitDeadlineDateKey: deadline || undefined,
+            todayKey: "2026-11-20",
+          })
+        : null,
+    [deadline, rawGut, title]
+  );
+
+  const effectiveMultiplier =
+    applyMultiplier && !parsedIntent?.hasExplicitDuration
+      ? settings.calibrationMultiplier
+      : 1;
+  const effectiveGut = parsedIntent?.gutMinutes ?? rawGut;
   const calibratedMins = Math.max(
     15,
-    Math.round((rawGut * effectiveMultiplier) / 15) * 15
+    Math.round((effectiveGut * effectiveMultiplier) / 15) * 15
   );
   const approxSegments =
-    calibratedMins <= 90
-      ? 1
-      : calibratedMins >= 180
-        ? 1 + Math.ceil((calibratedMins - 45) / 90)
-        : Math.ceil(calibratedMins / 75);
+    parsedIntent?.mode === "weekly-cadence"
+      ? (parsedIntent.weeklyCadence?.weeksCount ?? 2) *
+        Math.max(
+          1,
+          Math.ceil((parsedIntent.weeklyCadence?.minutesPerWeek ?? 60) / 60)
+        )
+      : parsedIntent?.mode === "explicit-block-count"
+        ? parsedIntent.explicitBlocks?.count ?? 2
+        : calibratedMins <= 90
+          ? 1
+          : calibratedMins >= 180
+            ? 1 + Math.ceil((calibratedMins - 45) / 90)
+            : Math.ceil(calibratedMins / 75);
 
   const destinationLabel = settings.writableCalendarId
     ? describeCalendar({
@@ -260,7 +284,7 @@ export function TaskComposer({
           <Input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="Everything takes time — add task, fellowship deadline, meeting prep, errand, or rest..."
+            placeholder='e.g. "AIIM fellowship. 2 hours each week for the next two weeks" or "Review UIST draft 90m"'
             className="flex-1 text-xs"
           />
           <Button
@@ -279,11 +303,34 @@ export function TaskComposer({
             ) : (
               <CalendarPlus className="size-3.5" />
             )}
-            {approxSegments > 1
-              ? `Schedule ${approxSegments} Segments (${formatDuration(calibratedMins)})`
-              : `Put ${formatDuration(calibratedMins)} on Calendar`}
+            {parsedIntent?.mode === "weekly-cadence"
+              ? `Schedule "${parsedIntent.canonicalTitle}" (${formatDuration(
+                  parsedIntent.weeklyCadence!.minutesPerWeek
+                )}/wk × ${parsedIntent.weeklyCadence!.weeksCount}w)`
+              : approxSegments > 1
+                ? `Schedule ${approxSegments} Blocks (${formatDuration(calibratedMins)})`
+                : `Put ${formatDuration(calibratedMins)} on Calendar`}
           </Button>
         </div>
+
+        {parsedIntent && parsedIntent.canonicalTitle !== title.trim() && (
+          <div className="rounded-lg border bg-muted/30 px-2.5 py-1 text-[11px] text-muted-foreground">
+            Standard title:{" "}
+            <strong className="text-foreground">
+              {parsedIntent.canonicalTitle}
+            </strong>
+            {parsedIntent.mode === "weekly-cadence" &&
+              parsedIntent.weeklyCadence &&
+              ` · ${formatDuration(
+                parsedIntent.weeklyCadence.minutesPerWeek
+              )}/week across ${parsedIntent.weeklyCadence.weeksCount} weeks (auto-links Mail & PDFs)`}
+            {parsedIntent.mode === "explicit-block-count" &&
+              parsedIntent.explicitBlocks &&
+              ` · ${parsedIntent.explicitBlocks.count} × ${formatDuration(
+                parsedIntent.explicitBlocks.durationMinutesEach
+              )} blocks`}
+          </div>
+        )}
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
           <div className="flex flex-wrap items-center gap-2">

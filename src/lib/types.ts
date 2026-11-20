@@ -33,9 +33,39 @@ export interface CalibrationSample {
   completedAtIso: string;
 }
 
+export interface EventSubtask {
+  id: string;
+  text: string;
+  done: boolean;
+  source?: string;
+}
+
+export interface EventReminderItem {
+  id: string;
+  text: string;
+  leadMinutes?: number;
+}
+
+export interface RelevantPaperRef {
+  id: string;
+  title: string;
+  authorsOrVenue?: string;
+  pathOrUrl?: string;
+  source: "local-pdf" | "mail-or-slack" | "screen" | "manual";
+}
+
+export interface EventChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  timestampIso: string;
+  actionBadge?: string;
+}
+
 export interface CalendarBlock {
   id: string;
   title: string;
+  userEditedTitle?: boolean;
   kind: CalendarBlockKind;
   status: BlockStatus;
   /** Local date string YYYY-MM-DD */
@@ -44,17 +74,23 @@ export interface CalendarBlock {
   startMinutes: number;
   /** Duration in minutes (15-min increments) */
   durationMinutes: number;
-  /** Original uncalibrated gut estimate in minutes (for Principle 2 multiplier tracking) */
+  /** Original uncalibrated gut estimate in minutes */
   gutMinutes?: number;
-  /** Optional hard deadline YYYY-MM-DD for backtracking & priority re-planning */
+  /** Optional hard deadline YYYY-MM-DD */
   deadlineDateKey?: string;
-  /** Shared ID linking segments of a decomposed longstanding deadline/project */
+  /** Shared ID linking segments of a decomposed project */
   projectGroupId?: string;
+  /** Connected Task-Specific Model ID in the user's knowledge graph */
+  taskModelId?: string;
   isRecurring?: boolean;
   /** Personal hold created just for you from an email or Slack mention */
   isSoloHold?: boolean;
   locationOrUrl?: string;
   notes?: string;
+  subtasks?: EventSubtask[];
+  reminders?: EventReminderItem[];
+  relevantPapers?: RelevantPaperRef[];
+  eventChat?: EventChatMessage[];
   attendeeCount?: number;
   attendeeNames?: string[];
   organizerName?: string;
@@ -75,12 +111,85 @@ export interface CalendarBlock {
   sourceCaptureId?: string;
   ruleId?: string;
   sourceLabel: string;
-  /** Concrete evidence from Calendar attendees/agenda, Slack, Email, or Deadline backtrack */
   rationale: string;
   contextSources?: string[];
   confidence: number;
   clarifyingQuestion?: string;
   uncertaintyReason?: string;
+}
+
+/**
+ * Hierarchical User & Task-Specific Model Graph
+ * Inspired by Activity Theory & Tempo (StanfordHCI/striving-cocreation):
+ * Observations -> Cross-App Actions -> Task-Specific Models (Activities) -> Personal Strivings,
+ * with contestable [user-edited], merge, reassign, and remove constraints.
+ */
+export interface UserProfileModel {
+  roleAndAffiliation: string;
+  activeDomains: string;
+  workingStyleNotes: string;
+  currentPriorities: string;
+}
+
+export interface TaskEvidenceItem {
+  id: string;
+  source: "mail" | "slack" | "screen" | "calendar" | "local-pdf" | "user";
+  title: string;
+  snippet: string;
+  timestampIso: string;
+  pathOrUrl?: string;
+}
+
+export interface TaskSpecificModel {
+  id: string;
+  canonicalTitle: string;
+  keywords: string[];
+  parentStrivingId?: string;
+  summary: string;
+  cadenceNote?: string;
+  deadlineDateKey?: string;
+  typicalSessionMinutes: number;
+  immediateTodos: EventSubtask[];
+  relevantPapers: RelevantPaperRef[];
+  evidence: TaskEvidenceItem[];
+  userEdited?: boolean;
+  userReassigned?: boolean;
+  updatedAtIso: string;
+}
+
+export interface StrivingNode {
+  id: string;
+  title: string;
+  domain:
+    | "research"
+    | "funding-career"
+    | "collaboration"
+    | "teaching-service"
+    | "personal-grounding";
+  description: string;
+  confidence: number;
+  userEdited?: boolean;
+}
+
+export interface ModelEditConstraint {
+  id: string;
+  kind: "rename" | "merge" | "reassign" | "remove";
+  instruction: string;
+  createdAtIso: string;
+}
+
+export interface UserModelGraph {
+  profile: UserProfileModel;
+  strivings: StrivingNode[];
+  taskModels: TaskSpecificModel[];
+  constraints: ModelEditConstraint[];
+}
+
+export interface LocalPaperHit {
+  title: string;
+  filename: string;
+  path: string;
+  modifiedIso: string;
 }
 
 export interface CapturedContextWindow {
@@ -257,25 +366,17 @@ export interface OrganizerSettings {
   confirmationPolicy: ConfirmationPolicy;
   calendarSource: CalendarSourceMode;
   captureEngine: CaptureEngineMode;
-  /** Calendars Dayframe reads meetings & busy slots from (unchecked calendars are ignored!) */
   readCalendarIds: string[];
   readCalendarScopeInitialized: boolean;
-  /** Single destination calendar where Dayframe writes all new blocks (personal UMich calendar) */
   writableCalendarId: string;
   writableCalendarTitle: string;
   writableCalendarSource: string;
   pinnedWriteCalendar: boolean;
-  /** Gut estimate × multiplier when sizing tasks onto the calendar (Principle 2) */
   calibrationMultiplier: number;
-  /** Minutes left empty every day as unexpected-events buffer (Principle 3) */
   dailyBufferMinutes: number;
-  /** Keep Saturdays & Sundays free ("Goof Off / Recharge") unless forced by deadline (Principle 3) */
   protectWeekends: boolean;
-  /** If >0 (e.g. 630 = 10:30 AM), avoid placing tasks earlier in the morning (Principle 3) */
   notAMorningPersonUntilMinutes: number;
-  /** Travel, conference, or pre-deadline crunch dates marked busy (Principle 6) */
   busyDateRanges: BusyDateRange[];
-  /** 2-day detail view vs 7-day week visualization (Principle 7) */
   timelineHorizonDays: 2 | 7;
   autoWriteToCalendar: boolean;
   intervalMinutes: number;

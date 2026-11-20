@@ -10,6 +10,7 @@ struct RequestPayload: Decodable {
     let location: String?
     let calendarId: String?
     let eventId: String?
+    let alarmMinutesBefore: Double?
 }
 
 func emitJson(_ dict: [String: Any]) {
@@ -49,7 +50,8 @@ let payload = (try? JSONDecoder().decode(RequestPayload.self, from: stdinData)) 
     notes: nil,
     location: nil,
     calendarId: nil,
-    eventId: nil
+    eventId: nil,
+    alarmMinutesBefore: nil
 )
 
 let store = EKEventStore()
@@ -107,6 +109,34 @@ if !granted {
 }
 
 let action = payload.action ?? "scan"
+
+if action == "update" {
+    guard let id = payload.eventId, !id.isEmpty,
+          let ev = store.event(withIdentifier: id) else {
+        emitJson(["ok": false, "error": "Calendar event was not found."])
+        exit(0)
+    }
+    guard ev.calendar?.allowsContentModifications == true else {
+        emitJson(["ok": false, "error": "Calendar event is read-only."])
+        exit(0)
+    }
+    if let newTitle = payload.title, !newTitle.isEmpty {
+        ev.title = newTitle
+    }
+    if let notes = payload.notes {
+        ev.notes = notes
+    }
+    if let alarmMins = payload.alarmMinutesBefore, alarmMins >= 0 {
+        ev.addAlarm(EKAlarm(relativeOffset: -alarmMins * 60.0))
+    }
+    do {
+        try store.save(ev, span: .thisEvent, commit: true)
+        emitJson(["ok": true])
+    } catch {
+        emitJson(["ok": false, "error": error.localizedDescription])
+    }
+    exit(0)
+}
 
 if action == "delete" {
     guard let id = payload.eventId, !id.isEmpty,

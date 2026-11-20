@@ -1,0 +1,40 @@
+ObjC.import("Foundation");
+ObjC.import("EventKit");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const store = $.EKEventStore.alloc.init;
+  const status = Number($.EKEventStore.authorizationStatusForEntityType(0));
+  if (status !== 3 && status !== 4) {
+    return JSON.stringify({ ok: false, error: "Calendar permission not granted." });
+  }
+  if (!input.eventId) {
+    return JSON.stringify({ ok: false, error: "Missing eventId." });
+  }
+  const ev = store.eventWithIdentifier(String(input.eventId));
+  if (!ev) {
+    return JSON.stringify({ ok: false, error: "Event not found." });
+  }
+  if (ev.calendar && !Boolean(ev.calendar.allowsContentModifications)) {
+    return JSON.stringify({ ok: false, error: "Calendar event is read-only." });
+  }
+  if (input.title) {
+    ev.title = String(input.title);
+  }
+  if (typeof input.notes === "string") {
+    ev.notes = input.notes;
+  }
+  if (typeof input.alarmMinutesBefore === "number" && input.alarmMinutesBefore >= 0) {
+    const alarm = $.EKAlarm.alarmWithRelativeOffset(-Number(input.alarmMinutesBefore) * 60);
+    ev.addAlarm(alarm);
+  }
+  const errRef = Ref();
+  const saved = store.saveEventSpanCommitError(ev, 0, true, errRef);
+  return JSON.stringify({ ok: Boolean(saved) });
+}

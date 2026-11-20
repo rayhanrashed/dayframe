@@ -428,16 +428,18 @@ async function runCalendarWaterfall(action, payload) {
       ? "write-event.jxa"
       : action === "delete"
         ? "delete-event.jxa"
-        : "read-calendars.jxa";
+        : action === "update"
+          ? "update-event.jxa"
+          : "read-calendars.jxa";
   const jxaRes = await runStaticJxa(jxaScript, payload);
   if (jxaRes && jxaRes.ok) {
     return jxaRes;
   }
 
-  if (action === "delete") {
+  if (action === "delete" || action === "update") {
     return {
       ok: false,
-      error: "Could not remove the previous calendar block.",
+      error: "Could not modify calendar event.",
     };
   }
 
@@ -1271,6 +1273,120 @@ const server = http.createServer(async (req, res) => {
         calendarId: body.calendarId ? String(body.calendarId).slice(0, 120) : "",
       });
       sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/calendar/update") {
+      const body = await readJsonBody(req);
+      const eventId = String(body.eventId || "").slice(0, 300);
+      if (!eventId) {
+        sendJson(req, res, 400, { ok: false, error: "Missing eventId." });
+        return;
+      }
+      const result = await runCalendarWaterfall("update", {
+        eventId,
+        title: body.title ? String(body.title).slice(0, 200) : undefined,
+        notes: typeof body.notes === "string" ? body.notes.slice(0, 3500) : undefined,
+        alarmMinutesBefore:
+          typeof body.alarmMinutesBefore === "number"
+            ? Math.max(0, Math.min(10080, body.alarmMinutesBefore))
+            : undefined,
+      });
+      sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/mail/search") {
+      const body = await readJsonBody(req);
+      const query = String(body.query || "").slice(0, 140);
+      const limit = Math.min(10, Math.max(1, Number(body.limit) || 6));
+      const result = await runStaticJxa("search-mail.jxa", { query, limit });
+      sendJson(req, res, 200, result);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/context/local-papers") {
+      const body = await readJsonBody(req);
+      const rawTerms = String(body.query || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, " ")
+        .split(/\s+/)
+        .filter((t) => t.length >= 3 && !["prep", "task", "week", "with", "meeting", "sync", "call"].includes(t))
+        .slice(0, 4);
+
+      if (process.platform !== "darwin" || rawTerms.length === 0) {
+        sendJson(req, res, 200, { ok: true, papers: [] });
+        return;
+      }
+
+      const searchRoots = [
+        path.join(os.homedir(), "Documents"),
+        path.join(os.homedir(), "Downloads"),
+        path.join(os.homedir(), "Desktop"),
+      ].filter((d) => fs.existsSync(d));
+
+      // Safe Spotlight query using strict alphanumeric tokens only
+      const termClauses = rawTerms
+        .map((t) => `(kMDItemDisplayName == "*${t}*"cd || kMDItemTextContent == "*${t}*"cd)`)
+        .join(" || ");
+      const mdfindExpr = `kMDItemContentType == "com.adobe.pdf" && (${termClauses})`;
+      const args = [];
+      for (const root of searchRoots) {
+        args.push("-onlyin", root);
+      }
+      args.push(mdfindExpr);
+
+      const papers = await new Promise((resolve) => {
+        execFile("/usr/bin/mdfind", args, { timeout: 6000 }, (err, stdout) => {
+          if (err || !stdout) return resolve([]);
+          const paths = stdout
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .filter((p) => !p.includes("/node_modules/") && !p.includes("/.Trash/"))
+            .slice(0, 8);
+          const items = [];
+          for (const p of paths) {
+            try {
+              const st = fs.statSync(p);
+              const base = path.basename(p);
+              items.push({
+                title: base.replace(/\.pdf$/i, "").replace(/[_-]+/g, " "),
+                filename: base,
+                path: p,
+                modifiedIso: st.mtime.toISOString(),
+              });
+            } catch {}
+          }
+          resolve(items);
+        });
+      });
+
+      sendJson(req, res, 200, { ok: true, papers });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/context/open-path") {
+      const body = await readJsonBody(req);
+      const candidate = String(body.path || "");
+      const resolved = path.resolve(candidate);
+      const allowedRoots = [
+        path.resolve(os.homedir(), "Documents") + path.sep,
+        path.resolve(os.homedir(), "Downloads") + path.sep,
+        path.resolve(os.homedir(), "Desktop") + path.sep,
+      ];
+      const allowedExt = /\.(pdf|tex|md|txt|docx|pptx|key)$/i.test(resolved);
+      if (
+        process.platform === "darwin" &&
+        allowedExt &&
+        allowedRoots.some((r) => resolved.startsWith(r)) &&
+        fs.existsSync(resolved)
+      ) {
+        execFile("/usr/bin/open", [resolved], () => {});
+        sendJson(req, res, 200, { ok: true });
+      } else {
+        sendJson(req, res, 400, { ok: false, error: "File path outside allowed Documents/Downloads/Desktop scope." });
+      }
       return;
     }
 

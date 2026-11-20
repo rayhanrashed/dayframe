@@ -6,6 +6,7 @@ import { TopMenubar } from "./top-menubar";
 import { CaptureStreamPanel } from "./capture-stream-panel";
 import { PendingConfirmationsDeck } from "./pending-confirmations-deck";
 import { CalendarTimeline } from "./calendar-timeline";
+import { EventWorkspaceDialog } from "./event-workspace-dialog";
 import { OrganizerFeedbackPanel } from "./organizer-feedback-panel";
 import { NightlyAndroidSheet } from "./nightly-android-sheet";
 import { useScreenCapture } from "@/hooks/use-screen-capture";
@@ -13,15 +14,19 @@ import {
   CalendarBlock,
   CalibrationSample,
   DiscussionMessage,
+  EventChatMessage,
+  EventSubtask,
   GatekeeperStats,
   MacCalendarDescriptor,
   ModelLifecycleState,
   OrganizerSettings,
   PipelineLogEntry,
+  RelevantPaperRef,
   ScannedEmailItem,
   ScreenshotCapture,
   StandingRule,
   SuggestedPreferencePrompt,
+  UserModelGraph,
 } from "@/lib/types";
 import {
   addDaysToDateKey,
@@ -40,7 +45,9 @@ import {
 } from "@/lib/scheduler";
 import {
   analyzeScreenshotWithGemma4,
+  chatAndEnrichEventWithGemma4,
   decomposeGoalWithGemma4,
+  induceUserAndTaskModelsWithGemma4,
   LocalGemmaStatus,
   planHolisticCalendarWithGemma4,
   probeLocalGemma,
@@ -57,9 +64,27 @@ import {
 } from "@/lib/valen-decision";
 import {
   pullNextFutureTaskIntoToday,
+  scheduleBlocksForTargetEvent,
   scheduleTaskOntoCalendar,
+  scheduleWeeklyCadenceOntoCalendar,
   takeOverdueWorkForward,
 } from "@/lib/place-on-calendar";
+import {
+  parseEventChatCommand,
+  parseNaturalTaskInput,
+} from "@/lib/nl-schedule-parser";
+import {
+  DEFAULT_USER_MODEL_GRAPH,
+  extractDistinctiveKeywords,
+  findMatchingTaskModel,
+  matchCapturesForKeywords,
+  mergeTaskModelsWithConstraint,
+  reassignTaskModelStriving,
+  removeModelEntityWithConstraint,
+  renameStrivingWithConstraint,
+  renameTaskModelWithConstraint,
+  upsertTaskModelFromSchedule,
+} from "@/lib/user-task-model";
 import {
   describeCalendar,
   isPersonalUmichCalendar,
@@ -77,12 +102,16 @@ import {
   fetchMacModelLifecycle,
   MacBridgeConnectionState,
   probeMacBridge,
+  openLocalMacFile,
   scanMacCalendarEvents,
   scanMacMailMessages,
+  searchLocalMacPapers,
+  searchMacMailByQuery,
   sendMacNativeNotification,
   sleepAllModelsViaMacDaemon,
   stopValenViaMacDaemon,
   toLocalDateKey,
+  updateBlockOnMacCalendar,
   wakeOllamaViaMacDaemon,
   wakeValenViaMacDaemon,
   writeBlockToMacCalendar,
@@ -101,6 +130,7 @@ interface PersistedWorkspaceV2 {
   suggestedPrompts: SuggestedPreferencePrompt[];
   gateStats: GatekeeperStats;
   calibrationSamples: CalibrationSample[];
+  userGraph: UserModelGraph;
   macPairingToken: string;
 }
 
@@ -165,6 +195,11 @@ export function DayframeApp() {
   const [calibrationSamples, setCalibrationSamples] = useState<
     CalibrationSample[]
   >([]);
+  const [userGraph, setUserGraph] = useState<UserModelGraph>(
+    DEFAULT_USER_MODEL_GRAPH
+  );
+  const [isInducingModels, setIsInducingModels] = useState(false);
+  const [isEnrichingEvent, setIsEnrichingEvent] = useState(false);
   const [scopeDialogOpen, setScopeDialogOpen] = useState(false);
   const [decomposingWithAi, setDecomposingWithAi] = useState(false);
   const [scarcityWarning, setScarcityWarning] = useState<string | null>(null);
@@ -287,6 +322,11 @@ export function DayframeApp() {
           if (parsed.gateStats) setGateStats(parsed.gateStats);
           if (parsed.calibrationSamples)
             setCalibrationSamples(parsed.calibrationSamples);
+          if (parsed.userGraph)
+            setUserGraph({
+              ...DEFAULT_USER_MODEL_GRAPH,
+              ...parsed.userGraph,
+            });
           if (parsed.macPairingToken) {
             loadedToken = parsed.macPairingToken;
             setMacPairingToken(parsed.macPairingToken);
@@ -417,6 +457,7 @@ export function DayframeApp() {
         suggestedPrompts,
         gateStats,
         calibrationSamples,
+        userGraph,
         macPairingToken,
       };
       localStorage.setItem(STORAGE_KEY_V3, JSON.stringify(payload));
@@ -434,6 +475,7 @@ export function DayframeApp() {
     rules,
     settings,
     suggestedPrompts,
+    userGraph,
   ]);
 
   const refreshGemmaStatus = useCallback(async () => {
@@ -2200,79 +2242,710 @@ export function DayframeApp() {
       return;
     }
 
-    let milestoneLabels: string[] | undefined;
-    if (task.useGemmaBreakdown) {
-      setDecomposingWithAi(true);
-      try {
-        const mult = task.applyMultiplier ? settings.calibrationMultiplier : 1;
-        const estTotal = Math.max(15, Math.round((task.gutMinutes * mult) / 15) * 15);
-        const segCount =
-          estTotal <= 90
-            ? 1
-            : estTotal >= 180
-              ? 1 + Math.ceil((estTotal - 45) / 90)
-              : Math.ceil(estTotal / 75);
-
-        if (macBridgeState.paired && macPairingToken) {
-          await wakeOllamaViaMacDaemon(macPairingToken);
-        }
-        const gStat = await probeLocalGemma(settings.gemmaModel);
-        if (gStat.reachable) {
-          const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
-          const breakdown = await decomposeGoalWithGemma4({
-            model: tag,
-            goalTitle: task.title,
-            segmentCount: segCount,
-            deadlineDateKey: task.deadlineDateKey,
-          });
-          if (breakdown.ok) {
-            milestoneLabels = breakdown.milestones;
-          }
-        }
-      } finally {
-        if (settings.unloadModelsAfterBatch) {
-          await sleepAllModelsViaMacDaemon({
-            pairingToken: macPairingToken,
-            gemmaModel: settings.gemmaModel,
-          });
-          await unloadGemmaModelImmediately(settings.gemmaModel);
-        }
-        setDecomposingWithAi(false);
-      }
-    }
-
-    const plan = scheduleTaskOntoCalendar({
-      title: task.title,
-      gutMinutes: task.gutMinutes,
-      applyMultiplier: task.applyMultiplier,
-      deadlineDateKey: task.deadlineDateKey,
-      milestoneLabels,
-      blocks,
-      rules,
-      settings: {
-        ...settings,
-        writableCalendarId: writeCalendarRef.current,
-      },
+    const parsed = parseNaturalTaskInput({
+      rawText: task.title,
+      fallbackGutMinutes: task.gutMinutes,
+      explicitDeadlineDateKey: task.deadlineDateKey,
       todayKey,
     });
 
-    if (plan.scarcityWarning) {
-      setScarcityWarning(plan.scarcityWarning);
-    } else {
+    // Automatically search local Mail & local PDFs for matching context on creation!
+    const [matchedEmails, matchedPapers] =
+      macBridgeState.paired && macPairingToken
+        ? await Promise.all([
+            searchMacMailByQuery({
+              pairingToken: macPairingToken,
+              query: parsed.canonicalTitle,
+              limit: 4,
+            }),
+            searchLocalMacPapers({
+              pairingToken: macPairingToken,
+              query: parsed.canonicalTitle,
+            }),
+          ])
+        : [[], []];
+
+    const cadenceNote =
+      parsed.mode === "weekly-cadence" && parsed.weeklyCadence
+        ? `${formatDuration(parsed.weeklyCadence.minutesPerWeek)}/week × ${
+            parsed.weeklyCadence.weeksCount
+          } weeks`
+        : parsed.deadlineDateKey
+          ? `Deadline ${parsed.deadlineDateKey}`
+          : undefined;
+
+    const upserted = upsertTaskModelFromSchedule({
+      graph: userGraph,
+      canonicalTitle: parsed.canonicalTitle,
+      cadenceNote,
+      deadlineDateKey: parsed.deadlineDateKey,
+      typicalSessionMinutes:
+        parsed.mode === "weekly-cadence"
+          ? 60
+          : Math.min(90, parsed.gutMinutes ?? task.gutMinutes),
+      matchedEmails,
+      matchedPapers,
+    });
+    setUserGraph(upserted.graph);
+
+    const autoNotes =
+      matchedEmails.length > 0
+        ? `Related Mail: "${matchedEmails[0].subject}" (${matchedEmails[0].sender})\n${matchedEmails[0].snippet.slice(0, 260)}`
+        : undefined;
+
+    let planBlocks = blocks;
+    let createdBlocks: CalendarBlock[] = [];
+    let planNote = "";
+
+    if (parsed.mode === "weekly-cadence" && parsed.weeklyCadence) {
+      const wkPlan = scheduleWeeklyCadenceOntoCalendar({
+        canonicalTitle: upserted.taskModel.canonicalTitle,
+        minutesPerWeek: parsed.weeklyCadence.minutesPerWeek,
+        weeksCount: parsed.weeklyCadence.weeksCount,
+        taskModelId: upserted.taskModel.id,
+        notes: autoNotes,
+        blocks,
+        rules,
+        settings: {
+          ...settings,
+          writableCalendarId: writeCalendarRef.current,
+        },
+        todayKey,
+      });
+      planBlocks = wkPlan.blocks;
+      createdBlocks = wkPlan.created;
+      planNote = wkPlan.note;
       setScarcityWarning(null);
+    } else {
+      const effectiveGut =
+        parsed.mode === "explicit-block-count" && parsed.explicitBlocks
+          ? parsed.explicitBlocks.count *
+            parsed.explicitBlocks.durationMinutesEach
+          : (parsed.gutMinutes ?? task.gutMinutes);
+      const shouldApplyMult =
+        task.applyMultiplier && !parsed.hasExplicitDuration;
+
+      let milestoneLabels: string[] | undefined;
+      if (task.useGemmaBreakdown) {
+        setDecomposingWithAi(true);
+        try {
+          const mult = shouldApplyMult ? settings.calibrationMultiplier : 1;
+          const estTotal = Math.max(
+            15,
+            Math.round((effectiveGut * mult) / 15) * 15
+          );
+          const segCount =
+            estTotal <= 90
+              ? 1
+              : estTotal >= 180
+                ? 1 + Math.ceil((estTotal - 45) / 90)
+                : Math.ceil(estTotal / 75);
+
+          if (macBridgeState.paired && macPairingToken) {
+            await wakeOllamaViaMacDaemon(macPairingToken);
+          }
+          const gStat = await probeLocalGemma(settings.gemmaModel);
+          if (gStat.reachable) {
+            const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+            const breakdown = await decomposeGoalWithGemma4({
+              model: tag,
+              goalTitle: upserted.taskModel.canonicalTitle,
+              segmentCount: segCount,
+              deadlineDateKey: parsed.deadlineDateKey,
+            });
+            if (breakdown.ok) {
+              milestoneLabels = breakdown.milestones;
+            }
+          }
+        } finally {
+          if (settings.unloadModelsAfterBatch) {
+            await sleepAllModelsViaMacDaemon({
+              pairingToken: macPairingToken,
+              gemmaModel: settings.gemmaModel,
+            });
+            await unloadGemmaModelImmediately(settings.gemmaModel);
+          }
+          setDecomposingWithAi(false);
+        }
+      }
+
+      const plan = scheduleTaskOntoCalendar({
+        title: upserted.taskModel.canonicalTitle,
+        gutMinutes: effectiveGut,
+        applyMultiplier: shouldApplyMult,
+        deadlineDateKey: parsed.deadlineDateKey,
+        milestoneLabels,
+        blocks,
+        rules,
+        settings: {
+          ...settings,
+          writableCalendarId: writeCalendarRef.current,
+        },
+        todayKey,
+      });
+
+      setScarcityWarning(plan.scarcityWarning ?? null);
+      planBlocks = plan.blocks;
+      createdBlocks = plan.created;
+      planNote = plan.note;
     }
 
-    if (plan.created.length === 0) {
-      showToast(plan.note);
+    if (createdBlocks.length === 0) {
+      showToast(planNote);
       return;
     }
 
+    // Attach Task Model ID, auto-matched papers, and email context onto created blocks before writing to Calendar.app
+    const enrichedCreated = createdBlocks.map((b) => ({
+      ...b,
+      taskModelId: upserted.taskModel.id,
+      notes: b.notes || autoNotes,
+      subtasks:
+        upserted.taskModel.immediateTodos.length > 0
+          ? upserted.taskModel.immediateTodos
+          : undefined,
+      relevantPapers:
+        upserted.taskModel.relevantPapers.length > 0
+          ? upserted.taskModel.relevantPapers.slice(0, 4)
+          : undefined,
+    }));
+
     const written: CalendarBlock[] = [];
-    for (const block of plan.created) {
+    for (const block of enrichedCreated) {
       written.push(await pushBlockToExternalCalendar(block));
     }
-    setBlocks(plan.blocks.map((b) => written.find((w) => w.id === b.id) ?? b));
-    showToast(plan.note);
+    setBlocks(planBlocks.map((b) => written.find((w) => w.id === b.id) ?? b));
+    showToast(planNote);
+  };
+
+  // Syncs updated block details (notes, checklist, papers, title, alarms) back to macOS Calendar.app
+  const persistBlockUpdateToCalendar = async (
+    updated: CalendarBlock,
+    alarmMinutesBefore?: number
+  ) => {
+    setBlocks((prev) =>
+      prev.map((b) => (b.id === updated.id ? updated : b))
+    );
+    if (
+      updated.syncedToExternalCalendar &&
+      updated.externalEventId &&
+      macBridgeState.paired &&
+      macPairingToken
+    ) {
+      await updateBlockOnMacCalendar({
+        pairingToken: macPairingToken,
+        eventId: updated.externalEventId,
+        block: updated,
+        alarmMinutesBefore,
+      });
+    }
+  };
+
+  const handlePullEventContextAndPapers = async (
+    blockId: string,
+    customQuestion?: string
+  ) => {
+    const target = blocks.find((b) => b.id === blockId);
+    if (!target) return;
+
+    setIsEnrichingEvent(true);
+    try {
+      const keywords = extractDistinctiveKeywords(target.title);
+      const searchQuery =
+        keywords.join(" ") || target.title.slice(0, 50);
+
+      const [matchedEmails, localPapers] =
+        macBridgeState.paired && macPairingToken
+          ? await Promise.all([
+              searchMacMailByQuery({
+                pairingToken: macPairingToken,
+                query: searchQuery,
+                limit: 5,
+              }),
+              searchLocalMacPapers({
+                pairingToken: macPairingToken,
+                query: searchQuery,
+              }),
+            ])
+          : [[], []];
+
+      const matchedCaps = matchCapturesForKeywords(keywords, captures).map(
+        (c) => ({
+          app: c.appName,
+          title: c.windowTitle,
+          summary: c.summaryText,
+        })
+      );
+
+      if (macBridgeState.paired && macPairingToken) {
+        await wakeOllamaViaMacDaemon(macPairingToken);
+      }
+      const gStat = await probeLocalGemma(settings.gemmaModel);
+
+      let replyText = "";
+      let digest = "";
+      let newTodoStrings: string[] = [];
+      let aiPapers: Array<{ title: string; authorsOrVenue?: string }> = [];
+
+      if (gStat.reachable) {
+        const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+        const enriched = await chatAndEnrichEventWithGemma4({
+          model: tag,
+          event: target,
+          userPrompt:
+            customQuestion ||
+            "Read all matched emails, Slack/screen context, and local PDFs. Summarize what matters for this event, list immediate concrete action items, and note relevant papers.",
+          matchedEmails,
+          matchedCaptures: matchedCaps,
+          localPapers,
+          userGraph,
+        });
+        if (enriched.ok) {
+          replyText = enriched.reply;
+          digest = enriched.contextDigest || "";
+          newTodoStrings = enriched.immediateTodos;
+          aiPapers = enriched.suggestedPapers;
+        } else {
+          replyText = enriched.reply;
+        }
+      } else {
+        replyText = `Found ${matchedEmails.length} matching email(s), ${matchedCaps.length} screen/Slack frame(s), and ${localPapers.length} local PDF(s). (Install/start local Ollama to run Gemma 4 synthesis.)`;
+      }
+
+      const existingTodos = target.subtasks ?? [];
+      const existingTodoTexts = new Set(
+        existingTodos.map((t) => t.text.toLowerCase())
+      );
+      const addedTodos: EventSubtask[] = newTodoStrings
+        .filter((t) => !existingTodoTexts.has(t.toLowerCase()))
+        .map((t, idx) => ({
+          id: `sub-${Date.now()}-${idx}`,
+          text: t,
+          done: false,
+          source: "Gemma 4 Context",
+        }));
+
+      const existingPapers = target.relevantPapers ?? [];
+      const existingPaperTitles = new Set(
+        existingPapers.map((p) => p.title.toLowerCase())
+      );
+      const localPaperRefs: RelevantPaperRef[] = localPapers
+        .filter((p) => !existingPaperTitles.has(p.title.toLowerCase()))
+        .map((p, idx) => ({
+          id: `lp-${Date.now()}-${idx}`,
+          title: p.title,
+          pathOrUrl: p.path,
+          source: "local-pdf",
+        }));
+      const aiPaperRefs: RelevantPaperRef[] = aiPapers
+        .filter(
+          (p) =>
+            !existingPaperTitles.has(p.title.toLowerCase()) &&
+            !localPaperRefs.some(
+              (lp) => lp.title.toLowerCase() === p.title.toLowerCase()
+            )
+        )
+        .map((p, idx) => ({
+          id: `ap-${Date.now()}-${idx}`,
+          title: p.title,
+          authorsOrVenue: p.authorsOrVenue,
+          source: "mail-or-slack",
+        }));
+
+      const emailBrief =
+        matchedEmails.length > 0
+          ? matchedEmails
+              .slice(0, 2)
+              .map((m) => `• Mail (${m.subject}): ${m.snippet.slice(0, 180)}`)
+              .join("\n")
+          : "";
+      const combinedNotes = [target.notes, digest, emailBrief]
+        .filter(Boolean)
+        .join("\n\n")
+        .slice(0, 2400);
+
+      const chatAddition: EventChatMessage[] = [
+        ...(customQuestion
+          ? [
+              {
+                id: `ec-u-${Date.now()}`,
+                role: "user" as const,
+                text: customQuestion,
+                timestampIso: new Date().toISOString(),
+              },
+            ]
+          : []),
+        {
+          id: `ec-a-${Date.now() + 1}`,
+          role: "assistant" as const,
+          text: replyText,
+          timestampIso: new Date().toISOString(),
+          actionBadge: `Linked ${matchedEmails.length} mail · ${
+            localPaperRefs.length + aiPaperRefs.length
+          } papers · ${addedTodos.length} todos`,
+        },
+      ];
+
+      const updatedBlock: CalendarBlock = {
+        ...target,
+        notes: combinedNotes || target.notes,
+        subtasks: [...existingTodos, ...addedTodos],
+        relevantPapers: [...existingPapers, ...localPaperRefs, ...aiPaperRefs],
+        eventChat: [...(target.eventChat ?? []), ...chatAddition],
+      };
+
+      await persistBlockUpdateToCalendar(updatedBlock);
+
+      // Also enrich matching Task-Specific Model
+      const up = upsertTaskModelFromSchedule({
+        graph: userGraph,
+        canonicalTitle: target.title,
+        typicalSessionMinutes: target.durationMinutes,
+        matchedEmails,
+        matchedPapers: localPapers,
+      });
+      setUserGraph({
+        ...up.graph,
+        taskModels: up.graph.taskModels.map((m) =>
+          m.id === up.taskModel.id
+            ? {
+                ...m,
+                summary: digest || m.summary,
+                immediateTodos: [
+                  ...m.immediateTodos,
+                  ...addedTodos.filter(
+                    (td) =>
+                      !m.immediateTodos.some(
+                        (x) => x.text.toLowerCase() === td.text.toLowerCase()
+                      )
+                  ),
+                ],
+              }
+            : m
+        ),
+      });
+    } finally {
+      if (settings.unloadModelsAfterBatch) {
+        await sleepAllModelsViaMacDaemon({
+          pairingToken: macPairingToken,
+          gemmaModel: settings.gemmaModel,
+        });
+        await unloadGemmaModelImmediately(settings.gemmaModel);
+      }
+      setIsEnrichingEvent(false);
+    }
+  };
+
+  const handleSendEventChat = async (blockId: string, text: string) => {
+    const target = blocks.find((b) => b.id === blockId);
+    if (!target) return;
+
+    const intent = parseEventChatCommand(text);
+    const appendChatPair = async (
+      base: CalendarBlock,
+      reply: string,
+      actionBadge?: string,
+      alarmMins?: number
+    ) => {
+      const next: CalendarBlock = {
+        ...base,
+        eventChat: [
+          ...(base.eventChat ?? []),
+          {
+            id: `ec-u-${Date.now()}`,
+            role: "user",
+            text,
+            timestampIso: new Date().toISOString(),
+          },
+          {
+            id: `ec-a-${Date.now() + 1}`,
+            role: "assistant",
+            text: reply,
+            timestampIso: new Date().toISOString(),
+            actionBadge,
+          },
+        ],
+      };
+      await persistBlockUpdateToCalendar(next, alarmMins);
+    };
+
+    if (intent.kind === "schedule-blocks-for-event") {
+      if (!writeCalendarRef.current) {
+        setScopeDialogOpen(true);
+        showToast("Choose your personal UMich calendar first.");
+        return;
+      }
+      const res = scheduleBlocksForTargetEvent({
+        targetEvent: target,
+        count: intent.count,
+        durationMinutesEach: intent.durationMinutesEach,
+        beforeEventTime: intent.beforeEventTime,
+        blocks,
+        rules,
+        settings: {
+          ...settings,
+          writableCalendarId: writeCalendarRef.current,
+        },
+        todayKey,
+      });
+
+      const written: CalendarBlock[] = [];
+      for (const blk of res.created) {
+        written.push(await pushBlockToExternalCalendar(blk));
+      }
+
+      const nextChat: EventChatMessage[] = [
+        ...(target.eventChat ?? []),
+        {
+          id: `ec-u-${Date.now()}`,
+          role: "user",
+          text,
+          timestampIso: new Date().toISOString(),
+        },
+        {
+          id: `ec-a-${Date.now() + 1}`,
+          role: "assistant",
+          text: res.note,
+          timestampIso: new Date().toISOString(),
+          actionBadge:
+            written.length > 0
+              ? `Scheduled ${written.length} block(s)`
+              : undefined,
+        },
+      ];
+
+      setBlocks(
+        res.blocks.map((b) => {
+          const w = written.find((x) => x.id === b.id);
+          if (w) return w;
+          if (b.id === target.id) return { ...b, eventChat: nextChat };
+          return b;
+        })
+      );
+      showToast(res.note);
+      return;
+    }
+
+    if (intent.kind === "pull-context-and-papers") {
+      await handlePullEventContextAndPapers(blockId, text);
+      return;
+    }
+
+    if (intent.kind === "add-subtask") {
+      const sub: EventSubtask = {
+        id: `sub-${Date.now()}`,
+        text: intent.todoText,
+        done: false,
+      };
+      await appendChatPair(
+        { ...target, subtasks: [...(target.subtasks ?? []), sub] },
+        `Added "${intent.todoText}" to this block's checklist and synced to Calendar.app.`,
+        "Todo added"
+      );
+      return;
+    }
+
+    if (intent.kind === "add-reminder") {
+      const lead = intent.leadMinutes ?? 30;
+      const rem = {
+        id: `rem-${Date.now()}`,
+        text: intent.reminderText,
+        leadMinutes: lead,
+      };
+      await appendChatPair(
+        { ...target, reminders: [...(target.reminders ?? []), rem] },
+        `Set reminder ${lead}m before: "${intent.reminderText}".`,
+        `Alert ${lead}m before`,
+        lead
+      );
+      return;
+    }
+
+    if (intent.kind === "add-paper") {
+      const paper: RelevantPaperRef = {
+        id: `pap-${Date.now()}`,
+        title: intent.paperTitle,
+        pathOrUrl: intent.url,
+        source: "manual",
+      };
+      await appendChatPair(
+        {
+          ...target,
+          relevantPapers: [...(target.relevantPapers ?? []), paper],
+        },
+        `Attached paper "${intent.paperTitle}" to this event.`,
+        "Paper attached"
+      );
+      return;
+    }
+
+    if (intent.kind === "rename-event") {
+      await appendChatPair(
+        { ...target, title: intent.newTitle, userEditedTitle: true },
+        `Renamed event to "${intent.newTitle}".`,
+        "Renamed"
+      );
+      return;
+    }
+
+    if (intent.kind === "resize-event") {
+      await appendChatPair(
+        { ...target, durationMinutes: intent.durationMinutes },
+        `Resized block to ${formatDuration(intent.durationMinutes)}.`,
+        `Resized → ${formatDuration(intent.durationMinutes)}`
+      );
+      return;
+    }
+
+    if (intent.kind === "move-event-days") {
+      handleShiftBlockDate(blockId, intent.deltaDays);
+      return;
+    }
+
+    // Default: full Gemma 4 contextual co-pilot question
+    await handlePullEventContextAndPapers(blockId, intent.prompt);
+  };
+
+  const handleInduceModelsNow = async () => {
+    setIsInducingModels(true);
+    try {
+      if (macBridgeState.paired && macPairingToken) {
+        await wakeOllamaViaMacDaemon(macPairingToken);
+      }
+      const gStat = await probeLocalGemma(settings.gemmaModel);
+      if (!gStat.reachable) {
+        showToast("Start or install local Ollama to synthesize models.");
+        return;
+      }
+      const tag = resolveInstalledGemmaTag(settings.gemmaModel, gStat);
+      const result = await induceUserAndTaskModelsWithGemma4({
+        model: tag,
+        currentGraph: userGraph,
+        blocks,
+        captures: captures.slice(0, 15).map((c) => ({
+          app: c.appName,
+          title: c.windowTitle,
+          summary: c.summaryText,
+        })),
+        emails: scannedEmails,
+      });
+
+      if (!result.ok) {
+        showToast("Model synthesis did not return updates.");
+        return;
+      }
+
+      setUserGraph((prev) => {
+        // Preserve [user-edited] strivings verbatim; merge or append newly induced ones
+        const lockedStrivings = prev.strivings.filter((s) => s.userEdited);
+        const inducedStrivings = result.strivings
+          .filter(
+            (s) =>
+              !lockedStrivings.some(
+                (ls) => ls.title.toLowerCase() === s.title.toLowerCase()
+              )
+          )
+          .map((s, idx) => ({
+            id: `st-${Date.now()}-${idx}`,
+            title: s.title,
+            domain: s.domain,
+            description: s.description,
+            confidence: s.confidence,
+          }));
+        const nextStrivings = [...lockedStrivings, ...inducedStrivings].slice(
+          0,
+          6
+        );
+
+        const nextTaskModels = [...prev.taskModels];
+        for (const induced of result.taskModels) {
+          const matchedStriving = nextStrivings.find(
+            (st) =>
+              induced.parentStrivingTitle &&
+              st.title
+                .toLowerCase()
+                .includes(induced.parentStrivingTitle.toLowerCase().slice(0, 18))
+          );
+
+          const existingIdx = nextTaskModels.findIndex(
+            (m) =>
+              m.canonicalTitle.toLowerCase() ===
+              induced.canonicalTitle.toLowerCase()
+          );
+
+          const mappedTodos: EventSubtask[] = induced.immediateTodos.map(
+            (txt, i) => ({
+              id: `tm-td-${Date.now()}-${i}`,
+              text: txt,
+              done: false,
+            })
+          );
+
+          if (existingIdx >= 0) {
+            const cur = nextTaskModels[existingIdx];
+            nextTaskModels[existingIdx] = {
+              ...cur,
+              canonicalTitle: cur.userEdited
+                ? cur.canonicalTitle
+                : induced.canonicalTitle,
+              parentStrivingId: cur.userReassigned
+                ? cur.parentStrivingId
+                : (matchedStriving?.id ?? cur.parentStrivingId),
+              summary: induced.summary || cur.summary,
+              keywords: Array.from(
+                new Set([...cur.keywords, ...induced.keywords])
+              ),
+              immediateTodos:
+                cur.immediateTodos.length > 0 ? cur.immediateTodos : mappedTodos,
+              updatedAtIso: new Date().toISOString(),
+            };
+          } else {
+            nextTaskModels.push({
+              id: `tm-ind-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+              canonicalTitle: induced.canonicalTitle,
+              keywords: induced.keywords,
+              parentStrivingId: matchedStriving?.id,
+              summary: induced.summary,
+              typicalSessionMinutes: induced.typicalSessionMinutes,
+              immediateTodos: mappedTodos,
+              relevantPapers: [],
+              evidence: [],
+              updatedAtIso: new Date().toISOString(),
+            });
+          }
+        }
+
+        return {
+          ...prev,
+          strivings: nextStrivings,
+          taskModels: nextTaskModels,
+        };
+      });
+
+      showToast(
+        `Synthesized ${result.taskModels.length} Task Model(s) & ${result.strivings.length} Striving(s)`
+      );
+    } finally {
+      if (settings.unloadModelsAfterBatch) {
+        await sleepAllModelsViaMacDaemon({
+          pairingToken: macPairingToken,
+          gemmaModel: settings.gemmaModel,
+        });
+        await unloadGemmaModelImmediately(settings.gemmaModel);
+      }
+      setIsInducingModels(false);
+    }
+  };
+
+  const handleScheduleSessionForTaskModel = async (taskModelId: string) => {
+    const tm = userGraph.taskModels.find((m) => m.id === taskModelId);
+    if (!tm) return;
+    await handleAddTaskToCalendar({
+      title: tm.canonicalTitle,
+      gutMinutes: tm.typicalSessionMinutes,
+      applyMultiplier: false,
+      deadlineDateKey: tm.deadlineDateKey,
+    });
   };
 
   const handleToggleBlockDone = async (
@@ -2587,24 +3260,15 @@ export function DayframeApp() {
               setSettings((prev) => ({ ...prev, timelineHorizonDays: days }))
             }
             blocks={blocks}
-            captures={captures}
             rules={rules}
             settings={settings}
-            selectedBlockId={selectedBlockId}
             onSelectBlockId={setSelectedBlockId}
-            onConfirmAndSyncBlock={(id) =>
-              void handleApproveProposedBlock(id, false)
-            }
             onConfirmAndSyncAllAutoBlocks={() =>
               void handleConfirmAndSyncAllAutoBlocks()
             }
             onToggleBlockDone={(id, actual) =>
               void handleToggleBlockDone(id, actual)
             }
-            onAdjustBlockDuration={handleAdjustBlockDuration}
-            onMoveBlockToNextSlot={handleMoveBlockToNextSlot}
-            onShiftBlockDate={handleShiftBlockDate}
-            onDeleteBlock={(id) => handleSkipProposedBlock(id, false)}
             onRunCalendarScanNow={() => {
               void runBaselineCalendarAndMailScan().then((r) => {
                 if (!r.ok && r.error) showToast(r.error);
@@ -2616,6 +3280,44 @@ export function DayframeApp() {
 
         <div className="order-3 lg:col-span-3">
           <OrganizerFeedbackPanel
+            userGraph={userGraph}
+            blocks={blocks}
+            isInducingModels={isInducingModels}
+            onInduceModelsNow={() => void handleInduceModelsNow()}
+            onUpdateUserProfile={(patch) =>
+              setUserGraph((prev) => ({
+                ...prev,
+                profile: { ...prev.profile, ...patch },
+              }))
+            }
+            onRenameStriving={(id, newTitle) =>
+              setUserGraph((prev) =>
+                renameStrivingWithConstraint(prev, id, newTitle)
+              )
+            }
+            onRenameTaskModel={(id, newTitle) =>
+              setUserGraph((prev) =>
+                renameTaskModelWithConstraint(prev, id, newTitle)
+              )
+            }
+            onMergeTaskModels={(keepId, absorbId) =>
+              setUserGraph((prev) =>
+                mergeTaskModelsWithConstraint(prev, keepId, absorbId)
+              )
+            }
+            onReassignTaskModel={(tmId, stId) =>
+              setUserGraph((prev) =>
+                reassignTaskModelStriving(prev, tmId, stId)
+              )
+            }
+            onRemoveModelNode={(kind, id) =>
+              setUserGraph((prev) =>
+                removeModelEntityWithConstraint(prev, kind, id)
+              )
+            }
+            onScheduleSessionForTaskModel={(tmId) =>
+              void handleScheduleSessionForTaskModel(tmId)
+            }
             messages={messages}
             rules={rules}
             suggestedPrompts={suggestedPrompts}
@@ -2690,6 +3392,140 @@ export function DayframeApp() {
           />
         </div>
       </main>
+
+      {(() => {
+        const activeBlock =
+          blocks.find((b) => b.id === selectedBlockId) ?? null;
+        const activeCapture = activeBlock?.sourceCaptureId
+          ? (captures.find((c) => c.id === activeBlock.sourceCaptureId) ?? null)
+          : null;
+        const activeTm = activeBlock
+          ? (userGraph.taskModels.find(
+              (m) => m.id === activeBlock.taskModelId
+            ) ?? findMatchingTaskModel(activeBlock.title, userGraph.taskModels))
+          : undefined;
+
+        return (
+          <EventWorkspaceDialog
+            todayKey={todayKey}
+            block={activeBlock}
+            linkedTaskModel={activeTm}
+            linkedCapture={activeCapture}
+            isBusyEnriching={isEnrichingEvent}
+            onClose={() => setSelectedBlockId(null)}
+            onSendEventChat={handleSendEventChat}
+            onPullContextAndPapers={(id) =>
+              handlePullEventContextAndPapers(id)
+            }
+            onRenameEvent={(id, newTitle) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              void persistBlockUpdateToCalendar({
+                ...found,
+                title: newTitle,
+                userEditedTitle: true,
+              });
+            }}
+            onSaveEventNotes={(id, nextNotes) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              void persistBlockUpdateToCalendar({ ...found, notes: nextNotes });
+              showToast("Saved notes & synced to Calendar.app");
+            }}
+            onToggleSubtask={(id, subId) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              const nextSubs = (found.subtasks ?? []).map((s) =>
+                s.id === subId ? { ...s, done: !s.done } : s
+              );
+              void persistBlockUpdateToCalendar({
+                ...found,
+                subtasks: nextSubs,
+              });
+            }}
+            onAddSubtask={(id, text) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              const nextSubs = [
+                ...(found.subtasks ?? []),
+                { id: `sub-${Date.now()}`, text, done: false },
+              ];
+              void persistBlockUpdateToCalendar({
+                ...found,
+                subtasks: nextSubs,
+              });
+            }}
+            onRemoveSubtask={(id, subId) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              const nextSubs = (found.subtasks ?? []).filter(
+                (s) => s.id !== subId
+              );
+              void persistBlockUpdateToCalendar({
+                ...found,
+                subtasks: nextSubs,
+              });
+            }}
+            onAddPaper={(id, title, pathOrUrl) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              const nextPapers: RelevantPaperRef[] = [
+                ...(found.relevantPapers ?? []),
+                {
+                  id: `pap-${Date.now()}`,
+                  title,
+                  pathOrUrl,
+                  source: "manual",
+                },
+              ];
+              void persistBlockUpdateToCalendar({
+                ...found,
+                relevantPapers: nextPapers,
+              });
+            }}
+            onRemovePaper={(id, paperId) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              const nextPapers = (found.relevantPapers ?? []).filter(
+                (p) => p.id !== paperId
+              );
+              void persistBlockUpdateToCalendar({
+                ...found,
+                relevantPapers: nextPapers,
+              });
+            }}
+            onOpenLocalPaper={(pathOrUrl) => {
+              void openLocalMacFile({
+                pairingToken: macPairingToken,
+                path: pathOrUrl,
+              });
+            }}
+            onAddReminder={(id, text, leadMinutes) => {
+              const found = blocks.find((b) => b.id === id);
+              if (!found) return;
+              const nextRems = [
+                ...(found.reminders ?? []),
+                { id: `rem-${Date.now()}`, text, leadMinutes },
+              ];
+              void persistBlockUpdateToCalendar(
+                { ...found, reminders: nextRems },
+                leadMinutes
+              );
+              showToast(`Added ${leadMinutes}m alert on Calendar.app`);
+            }}
+            onToggleBlockDone={(id, actual) =>
+              void handleToggleBlockDone(id, actual)
+            }
+            onAdjustBlockDuration={handleAdjustBlockDuration}
+            onConfirmAndSyncBlock={(id) =>
+              void handleApproveProposedBlock(id, false)
+            }
+            onMoveBlockToNextSlot={handleMoveBlockToNextSlot}
+            onShiftBlockDate={handleShiftBlockDate}
+            onDeleteBlock={(id) => handleSkipProposedBlock(id, false)}
+          />
+        );
+      })()}
 
       <NightlyAndroidSheet
         open={androidSheetOpen}

@@ -1,0 +1,86 @@
+ObjC.import("Foundation");
+
+function readStdinJson() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const str = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding).js;
+  return str ? JSON.parse(str) : {};
+}
+
+function run() {
+  const input = readStdinJson();
+  const rawQuery = String(input.query || "").trim().toLowerCase();
+  const limit = Math.min(12, Math.max(1, Number(input.limit) || 6));
+
+  const terms = rawQuery
+    .split(/\s+/)
+    .map((t) => t.replace(/[^a-z0-9@.-]/g, ""))
+    .filter((t) => t.length >= 2);
+
+  if (terms.length === 0) {
+    return JSON.stringify({ ok: true, messages: [] });
+  }
+
+  try {
+    const Mail = Application("Mail");
+    const inbox = Mail.inbox;
+    const msgs = inbox.messages();
+    const scanCap = Math.min(150, msgs.length);
+    const matched = [];
+
+    for (let i = 0; i < scanCap && matched.length < limit; i++) {
+      const m = msgs[i];
+      let subj = "";
+      let sender = "";
+      try {
+        subj = String(m.subject() || "");
+        sender = String(m.sender() || "");
+      } catch (_e) {
+        continue;
+      }
+
+      const headerBlob = `${subj} ${sender}`.toLowerCase();
+      let score = 0;
+      for (let k = 0; k < terms.length; k++) {
+        if (headerBlob.includes(terms[k])) score += 2;
+      }
+
+      let bodyStr = "";
+      if (score > 0 || i < 40) {
+        try {
+          bodyStr = String(m.content() || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 1200);
+        } catch (_b) {
+          bodyStr = "";
+        }
+        const bodyLower = bodyStr.toLowerCase();
+        for (let k = 0; k < terms.length; k++) {
+          if (bodyLower.includes(terms[k])) score += 1;
+        }
+      }
+
+      if (score > 0) {
+        matched.push({
+          id: "mail-" + m.id(),
+          subject: subj || "(No subject)",
+          sender,
+          dateIso: m.dateReceived()
+            ? new Date(m.dateReceived()).toISOString()
+            : new Date().toISOString(),
+          snippet: bodyStr.slice(0, 800),
+          score,
+        });
+      }
+    }
+
+    matched.sort((a, b) => b.score - a.score);
+    return JSON.stringify({ ok: true, messages: matched });
+  } catch (_err) {
+    return JSON.stringify({
+      ok: false,
+      error: "Apple Mail not active or Automation not enabled.",
+      messages: [],
+    });
+  }
+}

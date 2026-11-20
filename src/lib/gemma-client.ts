@@ -1,9 +1,12 @@
 import {
   CalendarBlock,
   ExtractedCaptureSignal,
+  LocalPaperHit,
   OrganizerSettings,
   ScannedEmailItem,
   StandingRule,
+  StrivingNode,
+  UserModelGraph,
 } from "./types";
 import {
   addDaysToDateKey,
@@ -896,6 +899,336 @@ Return ONLY valid JSON:
     return {
       ok: false,
       milestones: [],
+      latencyMs: Math.round(performance.now() - t0),
+    };
+  }
+}
+
+export async function chatAndEnrichEventWithGemma4(params: {
+  model: string;
+  event: CalendarBlock;
+  userPrompt: string;
+  matchedEmails: ScannedEmailItem[];
+  matchedCaptures: Array<{ app: string; title: string; summary: string }>;
+  localPapers: LocalPaperHit[];
+  userGraph: UserModelGraph;
+}): Promise<{
+  ok: boolean;
+  reply: string;
+  contextDigest?: string;
+  immediateTodos: string[];
+  suggestedPapers: Array<{ title: string; authorsOrVenue?: string }>;
+  latencyMs: number;
+}> {
+  const {
+    model,
+    event,
+    userPrompt,
+    matchedEmails,
+    matchedCaptures,
+    localPapers,
+    userGraph,
+  } = params;
+  const t0 = performance.now();
+
+  const prompt = `You are Dayframe's offline Gemma 4 co-pilot embedded inside a specific calendar event on the user's MacBook.
+
+User Profile:
+- Role: ${userGraph.profile.roleAndAffiliation}
+- Domains: ${userGraph.profile.activeDomains || "Research & engineering"}
+- Priorities: ${userGraph.profile.currentPriorities || "Not specified"}
+
+Target Calendar Event:
+- Title: "${event.title}"
+- Date & Time: ${event.dateKey} at ${formatMinutesToTime(event.startMinutes)} (${formatDuration(event.durationMinutes)})
+- Attendees: ${(event.attendeeNames ?? []).join(", ") || "Solo / None"}
+- Existing Notes: ${event.notes || event.rationale || "(None)"}
+- Existing Checklist: ${(event.subtasks ?? []).map((t) => t.text).join("; ") || "(None)"}
+
+Matched Local Emails:
+${matchedEmails.length > 0 ? JSON.stringify(matchedEmails.map((m) => ({ from: m.sender, subject: m.subject, snippet: m.snippet.slice(0, 320) })), null, 2) : "(No matching Apple Mail messages found)"}
+
+Matched Slack / App Captures:
+${matchedCaptures.length > 0 ? JSON.stringify(matchedCaptures, null, 2) : "(None)"}
+
+Matched Local PDFs on Mac:
+${localPapers.length > 0 ? JSON.stringify(localPapers.map((p) => ({ title: p.title, filename: p.filename })), null, 2) : "(None)"}
+
+User's Request in Event Chat:
+"${userPrompt}"
+
+Respond directly and concretely (no filler). Extract concrete immediate action items ("immediateTodos") grounded in the emails/captures/request, summarize any useful background context ("contextDigest"), and suggest relevant academic papers or documents ("suggestedPapers") when helpful or requested.
+
+Return ONLY valid JSON:
+{
+  "reply": string,
+  "contextDigest": string,
+  "immediateTodos": string[],
+  "suggestedPapers": [{ "title": string, "authorsOrVenue": string }]
+}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 35000);
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        stream: false,
+        keep_alive: 0,
+        format: "json",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      return {
+        ok: false,
+        reply: `Local Gemma 4 returned HTTP ${res.status}.`,
+        immediateTodos: [],
+        suggestedPapers: [],
+        latencyMs,
+      };
+    }
+
+    const body = (await res.json()) as { message?: { content?: string } };
+    const parsed = JSON.parse(body.message?.content ?? "{}") as {
+      reply?: string;
+      contextDigest?: string;
+      immediateTodos?: unknown[];
+      suggestedPapers?: Array<{ title?: string; authorsOrVenue?: string }>;
+    };
+
+    return {
+      ok: true,
+      reply: String(parsed.reply || "Updated event context.").slice(0, 600),
+      contextDigest: parsed.contextDigest
+        ? String(parsed.contextDigest).slice(0, 500)
+        : undefined,
+      immediateTodos: Array.isArray(parsed.immediateTodos)
+        ? parsed.immediateTodos
+            .map((t) => String(t || "").trim().slice(0, 120))
+            .filter(Boolean)
+            .slice(0, 6)
+        : [],
+      suggestedPapers: Array.isArray(parsed.suggestedPapers)
+        ? parsed.suggestedPapers
+            .filter((p) => p && typeof p.title === "string" && p.title.trim())
+            .map((p) => ({
+              title: String(p.title).trim().slice(0, 140),
+              authorsOrVenue: p.authorsOrVenue
+                ? String(p.authorsOrVenue).trim().slice(0, 90)
+                : undefined,
+            }))
+            .slice(0, 5)
+        : [],
+      latencyMs,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reply:
+        err instanceof Error
+          ? err.message
+          : "Could not reach local Gemma 4 on 127.0.0.1:11434.",
+      immediateTodos: [],
+      suggestedPapers: [],
+      latencyMs: Math.round(performance.now() - t0),
+    };
+  }
+}
+
+/**
+ * Tempo-inspired Hierarchical Induction (StanfordHCI/striving-cocreation):
+ * Synthesizes observed calendar blocks, Slack/app captures, and emails into
+ * Task-Specific Models (Activities) and Personal Strivings, strictly respecting
+ * [user-edited], [user-merged], [user-reassigned], and [user-removed] constraints.
+ */
+export async function induceUserAndTaskModelsWithGemma4(params: {
+  model: string;
+  currentGraph: UserModelGraph;
+  blocks: CalendarBlock[];
+  captures: Array<{ app: string; title: string; summary: string }>;
+  emails: ScannedEmailItem[];
+}): Promise<{
+  ok: boolean;
+  strivings: Array<{
+    title: string;
+    domain: StrivingNode["domain"];
+    description: string;
+    confidence: number;
+  }>;
+  taskModels: Array<{
+    canonicalTitle: string;
+    keywords: string[];
+    parentStrivingTitle: string;
+    summary: string;
+    typicalSessionMinutes: number;
+    immediateTodos: string[];
+  }>;
+  latencyMs: number;
+}> {
+  const { model, currentGraph, blocks, captures, emails } = params;
+  const t0 = performance.now();
+
+  const constraintText =
+    currentGraph.constraints.length > 0
+      ? currentGraph.constraints.map((c) => `- ${c.instruction}`).join("\n")
+      : "(No user edit constraints yet)";
+
+  const lockedStrivings = currentGraph.strivings
+    .filter((s) => s.userEdited)
+    .map((s) => s.title);
+  const lockedTaskModels = currentGraph.taskModels
+    .filter((m) => m.userEdited)
+    .map((m) => m.canonicalTitle);
+
+  const calendarSample = blocks
+    .filter((b) => !b.occupiesTimeOnly)
+    .slice(0, 30)
+    .map((b) => ({
+      title: b.title,
+      kind: b.kind,
+      duration: b.durationMinutes,
+      attendees: b.attendeeCount ?? 0,
+      notes: b.notes ? b.notes.slice(0, 140) : undefined,
+    }));
+
+  const prompt = `You are Dayframe's hierarchical user & task modeler, grounded in Activity Theory and Emmons' personal strivings framework (following Tempo / striving co-creation).
+
+User Self-Context:
+- Role: ${currentGraph.profile.roleAndAffiliation}
+- Domains: ${currentGraph.profile.activeDomains}
+- Working Style: ${currentGraph.profile.workingStyleNotes}
+- Current Priorities: ${currentGraph.profile.currentPriorities}
+
+HARD USER CONSTRAINTS (NEVER VIOLATE):
+${constraintText}
+Locked [user-edited] Strivings (keep verbatim): ${JSON.stringify(lockedStrivings)}
+Locked [user-edited] Task Models (keep verbatim): ${JSON.stringify(lockedTaskModels)}
+
+Observed Evidence Across Applications:
+1. Calendar Events & Scheduled Blocks:
+${JSON.stringify(calendarSample)}
+
+2. Slack & Screen Captures:
+${JSON.stringify(captures.slice(0, 15))}
+
+3. Recent Emails:
+${JSON.stringify(emails.slice(0, 10).map((e) => ({ subject: e.subject, from: e.sender, snippet: e.snippet.slice(0, 180) })))}
+
+Construct a two-tier abstraction connecting cross-app evidence:
+1. "strivings" (2 to 5 ongoing personal/professional pursuits that explain WHY the user is doing these activities — neither vague platitudes nor one-off tasks).
+2. "taskModels" (specific ongoing projects, fellowships, papers, collaborations, or courses — with clean standard names like "AIIM Fellowship" or "UIST Submission", 2-5 lowercase matching keywords, which striving they serve, a concise status summary synthesized across apps, typical focus block length in minutes, and 1-3 concrete immediate next steps).
+
+Return ONLY valid JSON:
+{
+  "strivings": [
+    {
+      "title": string,
+      "domain": "research" | "funding-career" | "collaboration" | "teaching-service" | "personal-grounding",
+      "description": string,
+      "confidence": number
+    }
+  ],
+  "taskModels": [
+    {
+      "canonicalTitle": string,
+      "keywords": string[],
+      "parentStrivingTitle": string,
+      "summary": string,
+      "typicalSessionMinutes": number,
+      "immediateTodos": string[]
+    }
+  ]
+}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 45000);
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        stream: false,
+        keep_alive: 0,
+        format: "json",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    clearTimeout(timer);
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      return { ok: false, strivings: [], taskModels: [], latencyMs };
+    }
+
+    const body = (await res.json()) as { message?: { content?: string } };
+    const parsed = JSON.parse(body.message?.content ?? "{}") as {
+      strivings?: Array<Record<string, unknown>>;
+      taskModels?: Array<Record<string, unknown>>;
+    };
+
+    const allowedDomains = new Set([
+      "research",
+      "funding-career",
+      "collaboration",
+      "teaching-service",
+      "personal-grounding",
+    ]);
+
+    const strivings = (parsed.strivings ?? [])
+      .filter((s) => typeof s.title === "string" && s.title.trim())
+      .slice(0, 5)
+      .map((s) => ({
+        title: String(s.title).trim().slice(0, 140),
+        domain: allowedDomains.has(String(s.domain))
+          ? (String(s.domain) as StrivingNode["domain"])
+          : ("research" as const),
+        description: String(s.description || "").trim().slice(0, 240),
+        confidence: Math.max(0.3, Math.min(0.99, Number(s.confidence) || 0.8)),
+      }));
+
+    const taskModels = (parsed.taskModels ?? [])
+      .filter(
+        (m) => typeof m.canonicalTitle === "string" && m.canonicalTitle.trim()
+      )
+      .slice(0, 12)
+      .map((m) => ({
+        canonicalTitle: String(m.canonicalTitle).trim().slice(0, 90),
+        keywords: Array.isArray(m.keywords)
+          ? m.keywords
+              .map((k) => String(k || "").toLowerCase().trim())
+              .filter((k) => k.length >= 2)
+              .slice(0, 6)
+          : [],
+        parentStrivingTitle: String(m.parentStrivingTitle || "").trim(),
+        summary: String(m.summary || "").trim().slice(0, 260),
+        typicalSessionMinutes: Math.max(
+          30,
+          Math.min(
+            120,
+            Math.round((Number(m.typicalSessionMinutes) || 60) / 15) * 15
+          )
+        ),
+        immediateTodos: Array.isArray(m.immediateTodos)
+          ? m.immediateTodos
+              .map((t) => String(t || "").trim().slice(0, 120))
+              .filter(Boolean)
+              .slice(0, 4)
+          : [],
+      }));
+
+    return { ok: true, strivings, taskModels, latencyMs };
+  } catch {
+    return {
+      ok: false,
+      strivings: [],
+      taskModels: [],
       latencyMs: Math.round(performance.now() - t0),
     };
   }
