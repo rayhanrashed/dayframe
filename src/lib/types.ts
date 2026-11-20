@@ -32,19 +32,34 @@ export interface CalendarBlock {
   /** Personal hold created just for you from an email or Slack mention */
   isSoloHold?: boolean;
   locationOrUrl?: string;
+  notes?: string;
+  attendeeCount?: number;
+  attendeeNames?: string[];
+  organizerName?: string;
+  hasVideoLink?: boolean;
   calendarTitle?: string;
+  calendarImmutable?: boolean;
+  isDayframeCreated?: boolean;
   externalEventId?: string;
   syncedToExternalCalendar?: boolean;
   linkedMeetingId?: string;
   sourceCaptureId?: string;
   ruleId?: string;
   sourceLabel: string;
+  /** Concrete evidence from Calendar attendees/agenda, Slack, or Email */
   rationale: string;
+  contextSources?: string[];
   confidence: number;
-  /** Plain-language question shown when Dayframe is unsure whether to add this block */
   clarifyingQuestion?: string;
-  /** Short badge reason why Dayframe is asking before writing to Calendar.app */
   uncertaintyReason?: string;
+}
+
+export interface CapturedContextWindow {
+  windowId: number;
+  ownerName: string;
+  windowTitle: string;
+  kind: "slack" | "email" | "messaging" | "work-context" | string;
+  imageDataUrl: string;
 }
 
 export type RuleCategory =
@@ -74,10 +89,12 @@ export interface ExtractedCaptureSignal {
   hasActionableItem: boolean;
   title: string;
   summary: string;
+  contextEvidence?: string;
   detectedKind: CalendarBlockKind;
   estimatedMinutes: number;
   proposedDateKey?: string;
   proposedStartMinutes?: number;
+  linkedMeetingId?: string;
   isRecurringMention?: boolean;
   isSoloInvite?: boolean;
   locationOrUrl?: string;
@@ -205,7 +222,6 @@ export interface OrganizerSettings {
   valenPort: number;
   valenSignalThreshold: number;
   batchExecutionMode: BatchExecutionMode;
-  /** Scheduled daily batch times in minutes from 00:00 (e.g. [570, 810, 1050] = 9:30 AM, 1:30 PM, 5:30 PM) */
   batchWindowMinutes: number[];
   unloadModelsAfterBatch: boolean;
   confirmationPolicy: ConfirmationPolicy;

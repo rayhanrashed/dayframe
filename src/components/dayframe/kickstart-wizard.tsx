@@ -26,6 +26,7 @@ import {
 import {
   MacBridgeConnectionState,
   openMacCalendarPrivacySettings,
+  openMacScreenPrivacySettings,
   sleepAllModelsViaMacDaemon,
   wakeOllamaViaMacDaemon,
 } from "@/lib/calendar-connectors";
@@ -84,8 +85,14 @@ interface KickstartWizardProps {
   onRunOneOffInitialScan: () => Promise<{
     ok: boolean;
     existingCount: number;
+    eligibleMeetingCount: number;
+    skippedChoreCount: number;
+    windowsCapturedNames: string[];
+    screenPermissionNeeded?: boolean;
     emailCount: number;
     proposedCount: number;
+    gemmaRan: boolean;
+    gemmaNote?: string;
     error?: string;
   }>;
   scannedBlocks: CalendarBlock[];
@@ -132,8 +139,14 @@ export function KickstartWizard({
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanStats, setScanStats] = useState<{
     existingCount: number;
+    eligibleMeetingCount: number;
+    skippedChoreCount: number;
+    windowsCapturedNames: string[];
+    screenPermissionNeeded?: boolean;
     emailCount: number;
     proposedCount: number;
+    gemmaRan: boolean;
+    gemmaNote?: string;
   } | null>(null);
   const [finalizing, setFinalizing] = useState(false);
 
@@ -209,8 +222,14 @@ export function KickstartWizard({
     setScanCompletedOnce(true);
     setScanStats({
       existingCount: res.existingCount,
+      eligibleMeetingCount: res.eligibleMeetingCount,
+      skippedChoreCount: res.skippedChoreCount,
+      windowsCapturedNames: res.windowsCapturedNames,
+      screenPermissionNeeded: res.screenPermissionNeeded,
       emailCount: res.emailCount,
       proposedCount: res.proposedCount,
+      gemmaRan: res.gemmaRan,
+      gemmaNote: res.gemmaNote,
     });
   };
 
@@ -803,10 +822,10 @@ export function KickstartWizard({
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="space-y-1">
                 <h2 className="text-base font-semibold">
-                  One-Off Baseline Scan (Wake &rarr; Scan &rarr; Unload to 0 MB)
+                  Contextual Scan: Calendar + Open Slack/Mail Windows + Gemma 4
                 </h2>
                 <p className="max-w-xl text-xs text-muted-foreground">
-                  Reads your next 7 days in macOS Calendar.app plus recent Apple Mail messages, wakes your local models to draft prep &amp; focus candidates, then unloads the models right back to 0 MB RAM so you can review Yes/No at your pace.
+                  Reads your 7-day Calendar (attendees, video links, agendas — skipping personal chores &amp; solo routines), captures open Slack &amp; Mail/Gmail windows on your Mac, wakes Gemma 4 to reason across all of them together, then unloads back to 0 MB RAM.
                 </p>
               </div>
 
@@ -821,10 +840,10 @@ export function KickstartWizard({
                   <Sparkles className="size-4" />
                 )}
                 {runningScan
-                  ? "Waking Models & Scanning..."
+                  ? "Reading Calendar, Slack & Gemma 4..."
                   : scanCompletedOnce
-                    ? "Re-Run Baseline Scan"
-                    : "Run Initial Calendar & Mail Scan"}
+                    ? "Re-Run Contextual Scan"
+                    : "Run Contextual Scan (Calendar + Slack + Mail)"}
               </Button>
             </div>
 
@@ -860,41 +879,86 @@ export function KickstartWizard({
             )}
 
             {scanStats && (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <div className="rounded-xl border bg-muted/30 p-3 text-xs">
-                  <div className="flex items-center gap-1.5 text-muted-foreground">
-                    <Calendar className="size-3.5" />
-                    Existing Calendar Events
+              <div className="space-y-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+                  <div className="rounded-xl border bg-muted/30 p-3 text-xs">
+                    <div className="flex items-center gap-1.5 text-muted-foreground">
+                      <Calendar className="size-3.5" />
+                      Real Meetings vs Chores
+                    </div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {scanStats.eligibleMeetingCount}{" "}
+                      <span className="text-xs font-normal text-muted-foreground">
+                        of {scanStats.existingCount} ({scanStats.skippedChoreCount} chores/solo skipped)
+                      </span>
+                    </div>
                   </div>
-                  <div className="mt-1 text-lg font-semibold">
-                    {scanStats.existingCount}
+
+                  <div className="rounded-xl border bg-muted/30 p-3 text-xs">
+                    <div className="flex items-center gap-1.5 text-muted-foreground">
+                      <Laptop className="size-3.5" />
+                      Slack &amp; Mail Windows Read
+                    </div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {scanStats.windowsCapturedNames.length}
+                    </div>
+                    {scanStats.windowsCapturedNames.length > 0 && (
+                      <div className="mt-0.5 truncate text-[10.5px] text-muted-foreground">
+                        {scanStats.windowsCapturedNames.join(", ")}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-xl border bg-muted/30 p-3 text-xs">
+                    <div className="flex items-center gap-1.5 text-muted-foreground">
+                      <Mail className="size-3.5" />
+                      Apple Mail Screened
+                    </div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {scanStats.emailCount}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border bg-muted/30 p-3 text-xs">
+                    <div className="flex items-center gap-1.5 text-muted-foreground">
+                      <CheckCircle2 className="size-3.5 text-emerald-500" />
+                      Gemma 4 Contextual Proposals
+                    </div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {proposedBlocks.length}
+                    </div>
                   </div>
                 </div>
-                <div className="rounded-xl border bg-muted/30 p-3 text-xs">
-                  <div className="flex items-center gap-1.5 text-muted-foreground">
-                    <Mail className="size-3.5" />
-                    Apple Mail Messages Screened
+
+                {scanStats.screenPermissionNeeded && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-900 dark:text-amber-200">
+                    <span>
+                      Want Dayframe to read your open <strong>Slack</strong> and <strong>Gmail/Browser</strong> windows automatically? Allow <strong>Screen Recording</strong> for your terminal app, then click Re-Run Contextual Scan.
+                    </span>
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() =>
+                        void openMacScreenPrivacySettings(macPairingToken)
+                      }
+                    >
+                      Open Screen Recording Settings
+                    </Button>
                   </div>
-                  <div className="mt-1 text-lg font-semibold">
-                    {scanStats.emailCount}
+                )}
+
+                {scanStats.gemmaNote && !scanStats.gemmaRan && (
+                  <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-900 dark:text-amber-200">
+                    {scanStats.gemmaNote}
                   </div>
-                </div>
-                <div className="rounded-xl border bg-muted/30 p-3 text-xs">
-                  <div className="flex items-center gap-1.5 text-muted-foreground">
-                    <CheckCircle2 className="size-3.5 text-emerald-500" />
-                    Proposed for Your Review
-                  </div>
-                  <div className="mt-1 text-lg font-semibold">
-                    {proposedBlocks.length}
-                  </div>
-                </div>
+                )}
               </div>
             )}
 
             {proposedBlocks.length > 0 && (
               <div className="space-y-2.5">
                 <div className="text-xs font-semibold">
-                  Proposed Blocks — Review Now or Decide One-by-One in Workspace ({proposedBlocks.length})
+                  Gemma 4 Contextual Proposals ({proposedBlocks.length})
                 </div>
                 <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
                   {proposedBlocks.map((blk) => (
@@ -902,21 +966,20 @@ export function KickstartWizard({
                       key={blk.id}
                       className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-background p-3 text-xs"
                     >
-                      <div className="space-y-0.5">
-                        <div className="flex items-center gap-2 font-semibold">
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-1.5 font-semibold">
                           <span>{blk.title}</span>
                           <Badge variant="secondary" className="text-[10px]">
-                            {blk.kind === "prep"
-                              ? "Prep Rule"
-                              : blk.isSoloHold
-                                ? "Solo Hold"
-                                : "Focus Block"}
+                            {blk.sourceLabel}
                           </Badge>
                         </div>
                         <div className="text-[11px] text-muted-foreground">
-                          {formatDateKeyLabel(blk.dateKey, todayKey)} •{" "}
-                          {formatMinutesToTime(blk.startMinutes)} (
-                          {formatDuration(blk.durationMinutes)}) — {blk.rationale}
+                          <span className="font-medium text-foreground">
+                            {formatDateKeyLabel(blk.dateKey, todayKey)} •{" "}
+                            {formatMinutesToTime(blk.startMinutes)} (
+                            {formatDuration(blk.durationMinutes)})
+                          </span>{" "}
+                          — {blk.rationale}
                         </div>
                       </div>
 
@@ -959,7 +1022,7 @@ export function KickstartWizard({
 
             {existingBlocks.length > 0 && proposedBlocks.length === 0 && (
               <p className="rounded-xl border bg-muted/30 p-3 text-xs text-muted-foreground">
-                Loaded {existingBlocks.length} existing calendar events. Models unloaded back to 0 MB RAM.
+                Loaded {existingBlocks.length} calendar events ({scanStats?.skippedChoreCount ?? 0} personal chores/solo routines ignored). Gemma 4 found no extra prep or Slack/Mail tasks needed right now — models unloaded back to 0 MB RAM.
               </p>
             )}
 

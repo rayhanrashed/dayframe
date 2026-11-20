@@ -1,5 +1,6 @@
 import {
   CalendarBlock,
+  CapturedContextWindow,
   MacCalendarDescriptor,
   ModelLifecycleState,
   ScannedEmailItem,
@@ -350,6 +351,62 @@ export async function acknowledgeMacDiskCaptures(params: {
   }
 }
 
+export async function openMacScreenPrivacySettings(
+  pairingToken: string
+): Promise<void> {
+  if (!pairingToken.trim()) return;
+  try {
+    await fetch(`${MAC_BRIDGE_BASE}/api/system/open-screen-privacy`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${pairingToken.trim()}` },
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function captureOpenSlackAndMailWindows(params: {
+  pairingToken: string;
+  maxWindows?: number;
+}): Promise<{
+  ok: boolean;
+  windowsCaptured: CapturedContextWindow[];
+  screenPermissionNeeded?: boolean;
+  hostTerminalApp?: string;
+}> {
+  if (!params.pairingToken.trim()) {
+    return { ok: false, windowsCaptured: [] };
+  }
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/capture/context-windows`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.pairingToken.trim()}`,
+      },
+      body: JSON.stringify({ maxWindows: params.maxWindows ?? 4 }),
+    });
+    if (!res.ok) return { ok: false, windowsCaptured: [] };
+    const data = (await res.json()) as {
+      ok?: boolean;
+      windowsCaptured?: CapturedContextWindow[];
+      screenPermissionNeeded?: boolean;
+      hostTerminalApp?: boolean | string;
+    };
+    return {
+      ok: Boolean(data.ok),
+      windowsCaptured: data.windowsCaptured ?? [],
+      screenPermissionNeeded: Boolean(data.screenPermissionNeeded),
+      hostTerminalApp:
+        typeof data.hostTerminalApp === "string"
+          ? data.hostTerminalApp
+          : undefined,
+    };
+  } catch {
+    return { ok: false, windowsCaptured: [] };
+  }
+}
+
 export async function openMacCalendarPrivacySettings(
   pairingToken: string
 ): Promise<void> {
@@ -423,8 +480,16 @@ export async function scanMacCalendarEvents(params: {
         startIso: string;
         endIso: string;
         isRecurring: boolean;
-        location: string;
+        location?: string;
+        url?: string;
+        hasVideoLink?: boolean;
+        notes?: string;
+        attendeeCount?: number;
+        attendeeNames?: string[];
+        organizerName?: string;
         calendarTitle: string;
+        calendarImmutable?: boolean;
+        isDayframeCreated?: boolean;
       }>;
     };
 
@@ -448,6 +513,15 @@ export async function scanMacCalendarEvents(params: {
         Math.min(480, Math.round(rawDur / 15) * 15)
       );
 
+      const attCount = ev.attendeeCount ?? 0;
+      const attNames = ev.attendeeNames ?? [];
+      const attendeeSummary =
+        attCount > 0
+          ? `${attCount} attendee${attCount === 1 ? "" : "s"}${
+              attNames.length > 0 ? ` (${attNames.slice(0, 3).join(", ")})` : ""
+            }`
+          : "Solo / 0 external attendees";
+
       return {
         id: `mac-cal-${idx}-${ev.id.slice(0, 14)}`,
         title: ev.title,
@@ -457,14 +531,21 @@ export async function scanMacCalendarEvents(params: {
         startMinutes,
         durationMinutes,
         isRecurring: ev.isRecurring,
-        locationOrUrl: ev.location || undefined,
+        locationOrUrl: ev.url || ev.location || undefined,
+        notes: ev.notes || undefined,
+        attendeeCount: attCount,
+        attendeeNames: attNames,
+        organizerName: ev.organizerName || undefined,
+        hasVideoLink: Boolean(ev.hasVideoLink),
         calendarTitle: ev.calendarTitle,
+        calendarImmutable: Boolean(ev.calendarImmutable),
+        isDayframeCreated: Boolean(ev.isDayframeCreated),
         externalEventId: ev.id,
         syncedToExternalCalendar: true,
-        sourceLabel: `macOS Calendar (${ev.calendarTitle})`,
-        rationale: ev.isRecurring
-          ? "Existing recurring event from your macOS Calendar."
-          : "Existing event from your macOS Calendar.",
+        sourceLabel: `Calendar (${ev.calendarTitle})`,
+        rationale: `${attendeeSummary}${
+          ev.hasVideoLink ? " • Video call" : ""
+        }${ev.notes ? ` • Notes: ${ev.notes.slice(0, 110)}` : ""}`,
         confidence: 1,
       };
     });

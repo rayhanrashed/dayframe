@@ -7,11 +7,20 @@ function readStdinJson() {
   return str ? JSON.parse(str) : {};
 }
 
+function hasVideoLinkInText(str) {
+  const lower = String(str || "").toLowerCase();
+  return (
+    lower.includes("zoom.us/") ||
+    lower.includes("meet.google.com/") ||
+    lower.includes("teams.microsoft.com/") ||
+    lower.includes("webex.com/")
+  );
+}
+
 function run() {
   const input = readStdinJson();
   const store = $.EKEventStore.alloc.init;
 
-  // EKAuthorizationStatus: 0=notDetermined, 1=restricted, 2=denied, 3=fullAccess/authorized, 4=writeOnly
   const initialStatus = Number($.EKEventStore.authorizationStatusForEntityType(0));
   let granted = initialStatus === 3;
   let done = initialStatus !== 0;
@@ -87,16 +96,49 @@ function run() {
       if (ev.isAllDay) continue;
       const sMs = Math.round(ev.startDate.timeIntervalSince1970 * 1000);
       const eMs = Math.round(ev.endDate.timeIntervalSince1970 * 1000);
+      const title = ev.title ? String(ev.title.js) : "Untitled Event";
+      const rawNotes = ev.notes ? String(ev.notes.js) : "";
+      const loc = ev.location ? String(ev.location.js) : "";
+      const urlStr = ev.URL && ev.URL.absoluteString ? String(ev.URL.absoluteString.js) : "";
+
+      let attendeeCount = 0;
+      const attendeeNames = [];
+      try {
+        const atts = ev.attendees;
+        if (atts && atts.count > 0) {
+          for (let k = 0; k < atts.count; k++) {
+            const p = atts.objectAtIndex(k);
+            attendeeCount++;
+            if (attendeeNames.length < 8 && p.name) {
+              attendeeNames.push(String(p.name.js));
+            }
+          }
+        }
+      } catch (_e) {}
+
+      const isDayframeCreated =
+        title.startsWith("[Prep] ") ||
+        title.startsWith("[Focus] ") ||
+        title.startsWith("[Solo Hold] ") ||
+        rawNotes.includes("Scheduled offline by Dayframe") ||
+        rawNotes.includes("Scheduled by Dayframe");
+
       events.push({
         id: ev.eventIdentifier ? ev.eventIdentifier.js : "ek-" + i,
-        title: ev.title ? ev.title.js : "Untitled Event",
+        title,
         startIso: new Date(sMs).toISOString(),
         endIso: new Date(eMs).toISOString(),
         isRecurring: Boolean(ev.hasRecurrenceRules),
-        location: ev.location ? ev.location.js : "",
-        notes: ev.notes ? ev.notes.js.slice(0, 300) : "",
+        location: loc,
+        url: urlStr,
+        hasVideoLink: Boolean(urlStr) || hasVideoLinkInText(loc) || hasVideoLinkInText(rawNotes),
+        notes: rawNotes.slice(0, 900),
+        attendeeCount,
+        attendeeNames,
         calendarId: ev.calendar ? ev.calendar.calendarIdentifier.js : "",
         calendarTitle: ev.calendar ? ev.calendar.title.js : "Calendar",
+        calendarImmutable: ev.calendar ? !Boolean(ev.calendar.allowsContentModifications) : false,
+        isDayframeCreated,
       });
     }
   }

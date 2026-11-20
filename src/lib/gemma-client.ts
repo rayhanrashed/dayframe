@@ -1,8 +1,17 @@
 import {
+  CalendarBlock,
   ExtractedCaptureSignal,
+  OrganizerSettings,
   ScannedEmailItem,
   StandingRule,
 } from "./types";
+import {
+  addDaysToDateKey,
+  formatDuration,
+  formatMinutesToTime,
+  isEligibleRealMeetingForPrep,
+  summarizeOpenWindowsForDay,
+} from "./scheduler";
 
 const OLLAMA_BASE = "http://127.0.0.1:11434";
 
@@ -53,6 +62,24 @@ export interface LocalGemmaStatus {
   selectedModelInstalled: boolean;
   pingMs?: number;
   errorDetail?: string;
+}
+
+export function resolveInstalledGemmaTag(
+  preferredModel: string,
+  status: LocalGemmaStatus
+): string {
+  if (status.selectedModelInstalled) {
+    return (
+      status.installedModels.find(
+        (m) =>
+          m.toLowerCase() === preferredModel.toLowerCase() ||
+          (preferredModel === "gemma4:e4b" &&
+            (m.toLowerCase() === "gemma4:latest" ||
+              m.toLowerCase() === "gemma4"))
+      ) ?? preferredModel
+    );
+  }
+  return status.installedGemma4Models[0] ?? preferredModel;
 }
 
 export async function probeLocalGemma(
@@ -114,7 +141,7 @@ export async function probeLocalGemma(
       installedGemma4Models: [],
       selectedModelInstalled: false,
       errorDetail:
-        "Ollama is currently sleeping (0 MB RAM) — Dayframe wakes it automatically only when a batch sweep runs.",
+        "Ollama is currently sleeping (0 MB RAM) — Dayframe wakes it automatically during scans and batch sweeps.",
     };
   }
 }
@@ -155,17 +182,11 @@ export async function testGemma4Ping(params: {
       latencyMs: Math.round(performance.now() - t0),
       resolvedModel: model,
       message:
-        "Ollama is currently stopped (0 MB RAM). Click 'Wake & Test' or run ./dayframe on your MacBook.",
+        "Ollama is currently stopped (0 MB RAM). Click 'Wake, Test & Sleep' or run ./dayframe on your MacBook.",
     };
   }
 
-  const targetModel = status.selectedModelInstalled
-    ? status.installedModels.find(
-        (m) =>
-          m.toLowerCase() === model.toLowerCase() ||
-          (model === "gemma4:e4b" && m.toLowerCase() === "gemma4:latest")
-      ) ?? model
-    : status.installedGemma4Models[0] ?? model;
+  const targetModel = resolveInstalledGemmaTag(model, status);
 
   try {
     const controller = new AbortController();
@@ -225,13 +246,53 @@ export async function testGemma4Ping(params: {
   }
 }
 
+export function buildCompactCalendarContextText(
+  blocks: CalendarBlock[],
+  todayDateKey: string,
+  rules: StandingRule[],
+  settings: OrganizerSettings
+): string {
+  const lines: string[] = [];
+  for (let d = 0; d < 5; d++) {
+    const dk = addDaysToDateKey(todayDateKey, d);
+    const dayEvents = blocks
+      .filter((b) => b.dateKey === dk)
+      .sort((a, b) => a.startMinutes - b.startMinutes);
+    const evStr =
+      dayEvents.length === 0
+        ? "No events"
+        : dayEvents
+            .map(
+              (e) =>
+                `[id=${e.id}] ${formatMinutesToTime(
+                  e.startMinutes
+                )} (${formatDuration(e.durationMinutes)}) "${e.title}"${
+                  (e.attendeeCount ?? 0) > 0
+                    ? ` [${e.attendeeCount} attendees]`
+                    : ""
+                }`
+            )
+            .join("; ");
+    const freeStr = summarizeOpenWindowsForDay({
+      dateKey: dk,
+      blocks,
+      rules,
+      settings,
+    });
+    lines.push(`${dk}: Events=[${evStr}] | OpenSlots=[${freeStr}]`);
+  }
+  return lines.join("\n");
+}
+
 export async function analyzeScreenshotWithGemma4(params: {
   imageDataUrl: string;
   model: string;
   appName: string;
   windowTitle: string;
   todayDateKey: string;
+  existingBlocks?: CalendarBlock[];
   rules: StandingRule[];
+  settings?: OrganizerSettings;
   device: "macbook" | "android";
   valenHint?: {
     intentChoice: string;
@@ -242,6 +303,7 @@ export async function analyzeScreenshotWithGemma4(params: {
 }): Promise<{
   ok: boolean;
   signal?: ExtractedCaptureSignal;
+  rawObservation?: string;
   modelUsed: string;
   latencyMs: number;
   error?: string;
@@ -252,7 +314,9 @@ export async function analyzeScreenshotWithGemma4(params: {
     appName,
     windowTitle,
     todayDateKey,
+    existingBlocks = [],
     rules,
+    settings,
     device,
     valenHint,
   } = params;
@@ -275,42 +339,51 @@ export async function analyzeScreenshotWithGemma4(params: {
     .map((r) => `- ${r.title}: ${r.description}`)
     .join("\n");
 
+  const calContext =
+    existingBlocks.length > 0 && settings
+      ? `\nUser's Upcoming Calendar & Free Slots:\n${buildCompactCalendarContextText(
+          existingBlocks,
+          todayDateKey,
+          rules,
+          settings
+        )}`
+      : "";
+
   const stage1Context = valenHint
-    ? `\nStage-1 Valen-Decision Gatekeeper pre-screening: p(actionable)=${valenHint.signalProbability.toFixed(
+    ? `\nStage-1 Valen Gatekeeper: p(actionable)=${valenHint.signalProbability.toFixed(
         2
       )}, intent="${valenHint.intentChoice}", urgency=${valenHint.urgencyScore.toFixed(
         1
-      )}/3${
-        valenHint.bboxCropped
-          ? " (image cropped to Valen's grounded bbox region)"
-          : ""
-      }.`
+      )}/3.`
     : "";
 
-  const prompt = `You are Dayframe's Stage-2 Gemma 4 multimodal calendar planner running 100% offline on the user's MacBook.
+  const prompt = `You are Dayframe's Gemma 4 multimodal executive assistant running offline on the user's MacBook.
 Today's local date is ${todayDateKey}.
-Captured device: ${device} | Active app: "${appName}" | Window title: "${windowTitle}".${stage1Context}
+Source window: "${appName}" — "${windowTitle}" (${device}).${stage1Context}${calContext}
 
-Inspect the screenshot carefully (emails, Slack messages, or meeting mentions).
-IMPORTANT: When you are even slightly unsure whether an item belongs on the user's calendar, whether it is assigned to the user vs FYI, whether a meeting time is tentative, or how much focus time it needs, set "needsUserConfirmation": true and write a clear, conversational "clarifyingQuestion" asking the user! We prefer asking the user OFTEN rather than silently guessing.
+Read the visible text in this screenshot carefully (especially Slack DMs/channels, email threads in Gmail/Mail/Outlook, or project trackers).
+Cross-reference what you see on screen with the user's Upcoming Calendar above!
 
-Rules for extraction:
-1. Informal or unconfirmed meeting mention in email/Slack -> detectedKind="meeting", isSoloInvite=true, needsUserConfirmation=true, clarifyingQuestion="Put a solo hold for '<title>' on your calendar, or wait until confirmed?".
-2. Concrete task, review, deliverable, or reply -> detectedKind="deep-work" (>=45m) or "follow-up" (15-30m) with realistic estimatedMinutes (15, 30, 45, 60, 90, 120). If ownership or duration isn't 100% certain, set needsUserConfirmation=true and ask in clarifyingQuestion.
-3. General browsing, reading code with no commitment, or noise -> set hasActionableItem=false.
+STRICT INTELLIGENCE RULES:
+1. NEVER propose blocks for personal chores, household tasks, workouts, meals, casual banter, general reading, coding with no external commitment, or events ALREADY on the user's calendar above! If there is no real work/scheduling action for the user, set "hasActionableItem": false.
+2. If a Slack message or email asks the user to do a concrete deliverable, review, deck, code change, or reply (especially tied to an upcoming meeting in the calendar above — set "linkedMeetingId" if it prepares for that meeting!), set "hasActionableItem": true, estimate a realistic duration (15, 30, 45, 60, 90, 120), and cite the exact Slack channel/sender or email subject in "contextEvidence".
+3. If a Slack message or email informally proposes a meeting time not yet on the calendar (e.g. "free tomorrow at 3pm?"), set detectedKind="meeting", isSoloInvite=true, proposedDateKey, and proposedStartMinutes.
+4. Set "needsUserConfirmation": true whenever ownership, exact timing, or duration benefits from a quick Yes/No check, and make "clarifyingQuestion" cite the specific Slack/email context (NEVER generic!).
 
-User's Standing Rules:
-${rulesList || "- Reserve prep time at least 2 hours before recurring meetings."}
+Standing Rules:
+${rulesList}
 
-Return ONLY valid JSON matching this schema:
+Return ONLY valid JSON:
 {
   "hasActionableItem": boolean,
   "title": string,
   "summary": string,
+  "contextEvidence": string,
   "detectedKind": "meeting" | "deep-work" | "follow-up",
   "estimatedMinutes": number,
   "proposedDateKey": string | null,
   "proposedStartMinutes": number | null,
+  "linkedMeetingId": string | null,
   "isRecurringMention": boolean,
   "isSoloInvite": boolean,
   "locationOrUrl": string | null,
@@ -323,7 +396,7 @@ Return ONLY valid JSON matching this schema:
 
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 35000);
+    const timer = setTimeout(() => controller.abort(), 45000);
 
     const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
       method: "POST",
@@ -351,7 +424,7 @@ Return ONLY valid JSON matching this schema:
         ok: false,
         modelUsed: model,
         latencyMs,
-        error: `Local Ollama HTTP ${res.status} — queued for next batch sweep.`,
+        error: `Local Ollama HTTP ${res.status}`,
       };
     }
 
@@ -363,12 +436,17 @@ Return ONLY valid JSON matching this schema:
     const rawConf = Number(parsed.confidence);
     const confidence = Number.isFinite(rawConf)
       ? Math.max(0.1, Math.min(0.99, rawConf))
-      : 0.74;
+      : 0.78;
+
+    const evidence = parsed.contextEvidence
+      ? String(parsed.contextEvidence).slice(0, 260)
+      : undefined;
 
     return {
       ok: true,
       modelUsed: model,
       latencyMs,
+      rawObservation: evidence || String(parsed.summary || ""),
       signal: {
         hasActionableItem: Boolean(parsed.hasActionableItem),
         title: String(parsed.title || "Captured calendar block").slice(0, 120),
@@ -376,6 +454,7 @@ Return ONLY valid JSON matching this schema:
           0,
           280
         ),
+        contextEvidence: evidence,
         detectedKind:
           parsed.detectedKind === "meeting" ||
           parsed.detectedKind === "follow-up"
@@ -397,6 +476,10 @@ Return ONLY valid JSON matching this schema:
           typeof parsed.proposedStartMinutes === "number"
             ? parsed.proposedStartMinutes
             : undefined,
+        linkedMeetingId:
+          typeof parsed.linkedMeetingId === "string" && parsed.linkedMeetingId
+            ? parsed.linkedMeetingId
+            : undefined,
         isRecurringMention: Boolean(parsed.isRecurringMention),
         isSoloInvite: Boolean(parsed.isSoloInvite),
         locationOrUrl: parsed.locationOrUrl
@@ -411,7 +494,7 @@ Return ONLY valid JSON matching this schema:
             ? Boolean(parsed.needsUserConfirmation)
             : confidence < 0.88,
         clarifyingQuestion: parsed.clarifyingQuestion
-          ? String(parsed.clarifyingQuestion).slice(0, 220)
+          ? String(parsed.clarifyingQuestion).slice(0, 240)
           : undefined,
         uncertaintyReason: parsed.uncertaintyReason
           ? String(parsed.uncertaintyReason).slice(0, 100)
@@ -431,76 +514,181 @@ Return ONLY valid JSON matching this schema:
   }
 }
 
-export async function analyzeInboxEmailsWithGemma4(params: {
-  emails: ScannedEmailItem[];
+export interface HolisticPrepProposal {
+  meetingId: string;
+  prepTitle: string;
+  prepMinutes: number;
+  contextEvidence: string;
+  contextSources: string[];
+  confidence: number;
+  askUser: boolean;
+  clarifyingQuestion: string;
+}
+
+export interface HolisticActionProposal {
+  signal: ExtractedCaptureSignal;
+  sourceLabel: string;
+  contextSources: string[];
+}
+
+/**
+ * Holistic System-2 Planner: Reasons jointly across the user's 7-day Calendar
+ * (attendees, organizer, video links, agenda notes, open gaps), live Slack/Window
+ * observations, and Apple Mail messages.
+ *
+ * NEVER proposes prep for personal chores, 0-attendee reminders, workouts, meals,
+ * or trivial check-ins. Every output block must be grounded in specific context.
+ */
+export async function planHolisticCalendarWithGemma4(params: {
   model: string;
   todayDateKey: string;
+  allCalendarBlocks: CalendarBlock[];
+  emails: ScannedEmailItem[];
+  windowObservations: Array<{
+    source: string;
+    detail: string;
+  }>;
   rules: StandingRule[];
+  settings: OrganizerSettings;
 }): Promise<{
   ok: boolean;
-  signals: Array<
-    ExtractedCaptureSignal & { sourceEmailId: string; sourceLabel: string }
-  >;
+  prepProposals: HolisticPrepProposal[];
+  actionProposals: HolisticActionProposal[];
   latencyMs: number;
   error?: string;
 }> {
-  const { emails, model, todayDateKey, rules } = params;
+  const {
+    model,
+    todayDateKey,
+    allCalendarBlocks,
+    emails,
+    windowObservations,
+    rules,
+    settings,
+  } = params;
   const t0 = performance.now();
-  if (emails.length === 0) {
-    return { ok: true, signals: [], latencyMs: 0 };
+
+  const eligibleMeetings = allCalendarBlocks.filter(
+    isEligibleRealMeetingForPrep
+  );
+
+  if (
+    eligibleMeetings.length === 0 &&
+    emails.length === 0 &&
+    windowObservations.length === 0
+  ) {
+    return {
+      ok: true,
+      prepProposals: [],
+      actionProposals: [],
+      latencyMs: 0,
+    };
   }
+
+  const compactMeetings = eligibleMeetings.slice(0, 25).map((m) => ({
+    meetingId: m.id,
+    title: m.title,
+    date: m.dateKey,
+    startTime: formatMinutesToTime(m.startMinutes),
+    durationMinutes: m.durationMinutes,
+    isRecurring: Boolean(m.isRecurring),
+    attendeeCount: m.attendeeCount ?? 0,
+    attendees: (m.attendeeNames ?? []).slice(0, 6),
+    organizer: m.organizerName || undefined,
+    hasVideoLink: Boolean(m.hasVideoLink),
+    calendar: m.calendarTitle,
+    agendaOrNotes: m.notes ? m.notes.slice(0, 350) : "",
+  }));
 
   const compactEmails = emails.slice(0, 12).map((e) => ({
     id: e.id,
+    from: e.sender,
     subject: e.subject,
-    sender: e.sender,
-    dateIso: e.dateIso,
-    snippet: e.snippet,
+    snippet: e.snippet.slice(0, 350),
   }));
 
-  const rulesText = rules
+  const rulesSummary = rules
     .filter((r) => r.enabled)
-    .map((r) => `- ${r.title}`)
+    .map((r) => `- [${r.category}] ${r.title}: ${r.description}`)
     .join("\n");
 
-  const prompt = `You are Dayframe's offline local Gemma 4 organizer scanning the user's Apple Mail inbox.
+  const scheduleOverview = buildCompactCalendarContextText(
+    allCalendarBlocks,
+    todayDateKey,
+    rules,
+    settings
+  );
+
+  const prompt = `You are Dayframe's local Gemma 4 executive calendar strategist.
 Today's date is ${todayDateKey}.
-Extract items that may belong on the user's calendar:
-- Informal or unbooked meeting mentions -> detectedKind="meeting", isSoloInvite=true, needsUserConfirmation=true
-- Concrete work/deliverables/replies -> detectedKind="deep-work" or "follow-up" with realistic estimatedMinutes (15..120).
-Whenever you are not 100% sure whether the user wants an email placed on their calendar or how long it takes, set "needsUserConfirmation": true and write a helpful "clarifyingQuestion" asking the user directly!
-Ignore newsletters, receipts, automated notifications, and spam.
 
-Standing Rules:
-${rulesText}
+You have the user's FULL context across:
+1. Eligible Interpersonal Meetings on their Calendar (already pre-filtered, but you MUST still apply strict common sense!):
+${JSON.stringify(compactMeetings, null, 2)}
 
-Emails JSON:
-${JSON.stringify(compactEmails)}
+2. Full 5-Day Schedule & Open Free Slots:
+${scheduleOverview}
 
-Return ONLY valid JSON with shape:
+3. Recent Slack & Open Window Observations on their MacBook:
+${
+  windowObservations.length > 0
+    ? JSON.stringify(windowObservations, null, 2)
+    : "(No open Slack/Mail windows captured in this pass)"
+}
+
+4. Apple Mail Inbox Messages:
+${compactEmails.length > 0 ? JSON.stringify(compactEmails, null, 2) : "(None)"}
+
+5. User's Standing Rules & Past Preferences:
+${rulesSummary}
+
+YOUR JOB — APPLY HIGH INTELLIGENCE & COMMON SENSE (ZERO BABYSITTING / ZERO SPAM):
+A. "prepProposals": Inspect each meeting in (1) alongside Slack (3) and Mail (4).
+   - ONLY propose prep for meetings where a thoughtful professional/researcher ACTUALLY needs advance preparation (e.g., presenting, interviewing, board/advisor/committee/client review, 1:1 with agenda/deliverables, design/architecture critique, or a meeting referenced in Slack/Mail).
+   - DO NOT propose prep for casual coffee chats, daily standups, social events, passive all-hands, workouts, chores, errands, or any event where prep would be silly or unnecessary! When in doubt whether prep is genuinely useful, SKIP IT rather than spamming dumb prep blocks.
+   - Make "prepTitle" specific to the meeting's topic/agenda (e.g., "Review Q4 latency metrics for Eng Sync", NOT generic "Prep: Meeting"), size "prepMinutes" realistically (15, 30, 45, 60, or 90), and explain the concrete reason in "contextEvidence" (citing attendees, agenda notes, or Slack/Mail context).
+
+B. "actionProposals": Inspect Slack observations (3) and Mail messages (4).
+   - Extract ONLY real, concrete tasks/reviews/deliverables directed at the user OR informal meeting mentions not yet on the calendar (isSoloInvite=true).
+   - Ignore newsletters, automated receipts, GitHub/CI spam, marketing emails, and casual Slack chatter.
+   - Cite the exact Slack channel/person or email sender/subject in "sourceLabel" and "contextEvidence".
+
+Return ONLY valid JSON with this exact structure:
 {
-  "items": [
+  "prepProposals": [
     {
-      "sourceEmailId": string,
+      "meetingId": string,
+      "prepTitle": string,
+      "prepMinutes": number,
+      "contextEvidence": string,
+      "contextSources": string[],
+      "confidence": number,
+      "askUser": boolean,
+      "clarifyingQuestion": string
+    }
+  ],
+  "actionProposals": [
+    {
       "title": string,
       "summary": string,
+      "contextEvidence": string,
+      "sourceLabel": string,
       "detectedKind": "meeting" | "deep-work" | "follow-up",
       "estimatedMinutes": number,
       "proposedDateKey": string | null,
       "proposedStartMinutes": number | null,
-      "isRecurringMention": boolean,
+      "linkedMeetingId": string | null,
       "isSoloInvite": boolean,
       "confidence": number,
-      "needsUserConfirmation": boolean,
-      "clarifyingQuestion": string,
-      "uncertaintyReason": string
+      "askUser": boolean,
+      "clarifyingQuestion": string
     }
   ]
 }`;
 
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 35000);
+    const timer = setTimeout(() => controller.abort(), 50000);
     const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -519,77 +707,129 @@ Return ONLY valid JSON with shape:
     if (!res.ok) {
       return {
         ok: false,
-        signals: [],
+        prepProposals: [],
+        actionProposals: [],
         latencyMs,
-        error: `Gemma 4 inbox scan returned HTTP ${res.status}.`,
+        error: `Local Gemma 4 planner returned HTTP ${res.status}.`,
       };
     }
 
     const body = (await res.json()) as { message?: { content?: string } };
     const parsed = JSON.parse(body.message?.content ?? "{}") as {
-      items?: Array<Record<string, unknown>>;
+      prepProposals?: Array<Record<string, unknown>>;
+      actionProposals?: Array<Record<string, unknown>>;
     };
 
-    const signals = (parsed.items ?? []).map((item) => {
-      const email = emails.find((e) => e.id === item.sourceEmailId);
-      const rawConf = Number(item.confidence);
-      const confidence = Number.isFinite(rawConf)
-        ? Math.max(0.1, Math.min(0.99, rawConf))
-        : 0.72;
-      return {
-        sourceEmailId: String(item.sourceEmailId || ""),
-        sourceLabel: email ? `Mail: ${email.subject}` : "Mail Scan",
-        hasActionableItem: true,
-        title: String(item.title || email?.subject || "Email follow-up").slice(
-          0,
-          120
-        ),
-        summary: String(item.summary || "").slice(0, 260),
-        detectedKind:
-          item.detectedKind === "meeting" || item.detectedKind === "follow-up"
-            ? (item.detectedKind as "meeting" | "follow-up")
-            : ("deep-work" as const),
-        estimatedMinutes: Math.max(
-          15,
-          Math.min(
-            180,
-            Math.round((Number(item.estimatedMinutes) || 45) / 15) * 15
-          )
-        ),
-        proposedDateKey:
-          typeof item.proposedDateKey === "string" &&
-          /^\d{4}-\d{2}-\d{2}$/.test(item.proposedDateKey)
-            ? item.proposedDateKey
-            : undefined,
-        proposedStartMinutes:
-          typeof item.proposedStartMinutes === "number"
-            ? item.proposedStartMinutes
-            : undefined,
-        isRecurringMention: Boolean(item.isRecurringMention),
-        isSoloInvite: Boolean(item.isSoloInvite),
-        fingerprintKey: `email-${String(item.sourceEmailId || item.title)}`,
-        confidence,
-        needsUserConfirmation:
-          item.needsUserConfirmation !== undefined
-            ? Boolean(item.needsUserConfirmation)
-            : true,
-        clarifyingQuestion: item.clarifyingQuestion
-          ? String(item.clarifyingQuestion).slice(0, 220)
-          : undefined,
-        uncertaintyReason: item.uncertaintyReason
-          ? String(item.uncertaintyReason).slice(0, 100)
-          : undefined,
-      };
-    });
+    const validMeetingIds = new Set(eligibleMeetings.map((m) => m.id));
 
-    return { ok: true, signals, latencyMs };
+    const prepProposals: HolisticPrepProposal[] = (parsed.prepProposals ?? [])
+      .filter(
+        (p) =>
+          typeof p.meetingId === "string" &&
+          validMeetingIds.has(p.meetingId) &&
+          Number(p.prepMinutes || 0) >= 15
+      )
+      .map((p) => {
+        const rawConf = Number(p.confidence);
+        return {
+          meetingId: String(p.meetingId),
+          prepTitle: String(p.prepTitle || "Meeting prep").slice(0, 120),
+          prepMinutes: Math.max(
+            15,
+            Math.min(
+              120,
+              Math.round((Number(p.prepMinutes) || 30) / 15) * 15
+            )
+          ),
+          contextEvidence: String(
+            p.contextEvidence || "Identified by Gemma 4 from meeting context."
+          ).slice(0, 280),
+          contextSources: Array.isArray(p.contextSources)
+            ? p.contextSources.map((s) => String(s)).slice(0, 4)
+            : ["Calendar + Gemma 4"],
+          confidence: Number.isFinite(rawConf)
+            ? Math.max(0.2, Math.min(0.99, rawConf))
+            : 0.8,
+          askUser: p.askUser !== undefined ? Boolean(p.askUser) : true,
+          clarifyingQuestion: String(p.clarifyingQuestion || "").slice(0, 240),
+        };
+      });
+
+    const actionProposals: HolisticActionProposal[] = (
+      parsed.actionProposals ?? []
+    )
+      .filter((a) => typeof a.title === "string" && a.title.trim().length > 2)
+      .map((a) => {
+        const rawConf = Number(a.confidence);
+        const conf = Number.isFinite(rawConf)
+          ? Math.max(0.2, Math.min(0.99, rawConf))
+          : 0.78;
+        const src = String(a.sourceLabel || "Slack / Mail Scan").slice(0, 90);
+        const evidence = String(a.contextEvidence || a.summary || "").slice(
+          0,
+          260
+        );
+        return {
+          sourceLabel: src,
+          contextSources: [src],
+          signal: {
+            hasActionableItem: true,
+            title: String(a.title).slice(0, 120),
+            summary: String(a.summary || evidence).slice(0, 260),
+            contextEvidence: evidence,
+            detectedKind:
+              a.detectedKind === "meeting" || a.detectedKind === "follow-up"
+                ? (a.detectedKind as "meeting" | "follow-up")
+                : ("deep-work" as const),
+            estimatedMinutes: Math.max(
+              15,
+              Math.min(
+                180,
+                Math.round((Number(a.estimatedMinutes) || 45) / 15) * 15
+              )
+            ),
+            proposedDateKey:
+              typeof a.proposedDateKey === "string" &&
+              /^\d{4}-\d{2}-\d{2}$/.test(a.proposedDateKey)
+                ? a.proposedDateKey
+                : undefined,
+            proposedStartMinutes:
+              typeof a.proposedStartMinutes === "number"
+                ? a.proposedStartMinutes
+                : undefined,
+            linkedMeetingId:
+              typeof a.linkedMeetingId === "string" && a.linkedMeetingId
+                ? a.linkedMeetingId
+                : undefined,
+            isSoloInvite: Boolean(a.isSoloInvite),
+            fingerprintKey: `holistic-${String(a.title).toLowerCase().slice(0, 40)}`,
+            confidence: conf,
+            needsUserConfirmation:
+              a.askUser !== undefined ? Boolean(a.askUser) : true,
+            clarifyingQuestion: a.clarifyingQuestion
+              ? String(a.clarifyingQuestion).slice(0, 240)
+              : undefined,
+            uncertaintyReason: src,
+          },
+        };
+      });
+
+    return {
+      ok: true,
+      prepProposals,
+      actionProposals,
+      latencyMs,
+    };
   } catch (err) {
     return {
       ok: false,
-      signals: [],
+      prepProposals: [],
+      actionProposals: [],
       latencyMs: Math.round(performance.now() - t0),
       error:
-        err instanceof Error ? err.message : "Failed calling local Gemma 4.",
+        err instanceof Error
+          ? err.message
+          : "Failed calling local Gemma 4 holistic planner.",
     };
   }
 }

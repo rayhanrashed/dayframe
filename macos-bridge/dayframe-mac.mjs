@@ -220,6 +220,150 @@ function runSwiftEventKit(binPath, stdinObject = {}) {
   });
 }
 
+let cachedSwiftWindowsPath = null;
+let swiftWindowsCompileAttempted = false;
+
+function ensureSwiftWindowsBinary() {
+  if (process.platform !== "darwin") return null;
+  if (cachedSwiftWindowsPath && fs.existsSync(cachedSwiftWindowsPath)) {
+    return cachedSwiftWindowsPath;
+  }
+  if (swiftWindowsCompileAttempted) return null;
+  swiftWindowsCompileAttempted = true;
+
+  const swiftSrc = path.join(__dirname, "swift", "dayframe-windows.swift");
+  const outBin = path.join(BIN_DIR, "dayframe-windows");
+  const stampFile = path.join(BIN_DIR, "dayframe-windows.mtime");
+
+  if (!fs.existsSync("/usr/bin/swiftc") || !fs.existsSync(swiftSrc)) {
+    return null;
+  }
+
+  const srcMtime = String(Math.floor(fs.statSync(swiftSrc).mtimeMs));
+  if (
+    fs.existsSync(outBin) &&
+    fs.existsSync(stampFile) &&
+    fs.readFileSync(stampFile, "utf8").trim() === srcMtime
+  ) {
+    cachedSwiftWindowsPath = outBin;
+    return outBin;
+  }
+
+  return new Promise((resolve) => {
+    execFile(
+      "/usr/bin/swiftc",
+      [swiftSrc, "-framework", "CoreGraphics", "-framework", "Foundation", "-o", outBin],
+      { timeout: 20000 },
+      (err) => {
+        if (err || !fs.existsSync(outBin)) {
+          resolve(null);
+          return;
+        }
+        execFile("/usr/bin/codesign", ["-s", "-", "--force", outBin], { timeout: 5000 }, () => {
+          try {
+            fs.writeFileSync(stampFile, srcMtime, "utf8");
+          } catch {}
+          cachedSwiftWindowsPath = outBin;
+          resolve(outBin);
+        });
+      }
+    );
+  });
+}
+
+function captureWindowById(windowId) {
+  return new Promise((resolve) => {
+    const tempShotPath = path.join(
+      os.tmpdir(),
+      `dayframe-win-${windowId}-${crypto.randomUUID()}.jpg`
+    );
+    execFile(
+      "/usr/sbin/screencapture",
+      ["-x", "-o", "-l", String(windowId), "-t", "jpg", tempShotPath],
+      { timeout: 10000 },
+      (err) => {
+        if (err || !fs.existsSync(tempShotPath)) {
+          resolve({ ok: false, permissionError: true });
+          return;
+        }
+        try {
+          const bytes = fs.readFileSync(tempShotPath);
+          fs.unlinkSync(tempShotPath);
+          if (bytes.length < 1500) {
+            resolve({ ok: false });
+            return;
+          }
+          resolve({
+            ok: true,
+            bytes,
+            hash: crypto.createHash("sha256").update(bytes).digest("hex"),
+            imageDataUrl: `data:image/jpeg;base64,${bytes.toString("base64")}`,
+          });
+        } catch {
+          try {
+            if (fs.existsSync(tempShotPath)) fs.unlinkSync(tempShotPath);
+          } catch {}
+          resolve({ ok: false });
+        }
+      }
+    );
+  });
+}
+
+async function captureOpenContextWindows(maxWindows = 4) {
+  if (process.platform !== "darwin") {
+    return { ok: false, windowsCaptured: [], error: "Requires macOS." };
+  }
+  const winBin = await ensureSwiftWindowsBinary();
+  if (!winBin) {
+    return { ok: true, windowsCaptured: [] };
+  }
+
+  const listResult = await new Promise((resolve) => {
+    execFile(winBin, [], { timeout: 8000 }, (err, stdout) => {
+      if (err || !stdout) return resolve({ windows: [] });
+      try {
+        resolve(JSON.parse(stdout.trim()));
+      } catch {
+        resolve({ windows: [] });
+      }
+    });
+  });
+
+  const rawWindows = Array.isArray(listResult.windows)
+    ? listResult.windows.slice(0, maxWindows)
+    : [];
+
+  const captured = [];
+  let permissionBlocked = false;
+
+  for (const w of rawWindows) {
+    const wid = Number(w.windowId);
+    if (!Number.isFinite(wid) || wid <= 0) continue;
+    const shot = await captureWindowById(wid);
+    if (!shot.ok) {
+      if (shot.permissionError) permissionBlocked = true;
+      continue;
+    }
+    captured.push({
+      windowId: wid,
+      ownerName: String(w.ownerName || "App"),
+      windowTitle: String(w.windowTitle || w.ownerName || "Window"),
+      kind: String(w.kind || "work-context"),
+      hash: shot.hash,
+      imageDataUrl: shot.imageDataUrl,
+    });
+  }
+
+  return {
+    ok: true,
+    windowsFoundCount: rawWindows.length,
+    windowsCaptured: captured,
+    screenPermissionNeeded: permissionBlocked && captured.length === 0,
+    hostTerminalApp: detectHostTerminalApp(),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Static JXA Runner (Calendar.app EventKit, Mail.app, Frontmost App, Notify)
 // ---------------------------------------------------------------------------
@@ -419,50 +563,76 @@ function captureMacScreenSilent() {
   });
 }
 
-async function captureAndEnqueueToDisk() {
-  const shot = await captureMacScreenSilent();
-  if (!shot.ok || shot.skippedPrivateApp || shot.skippedDuplicate || !shot.bytes) {
-    return shot;
-  }
+const lastWindowHashes = new Map();
+
+function writeQueueEntry(bytes, appName, windowTitle) {
   const id = `q-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
   const jpgPath = path.join(QUEUE_DIR, `${id}.jpg`);
   const metaPath = path.join(QUEUE_DIR, `${id}.json`);
   const capturedAtIso = new Date().toISOString();
+  fs.writeFileSync(jpgPath, bytes, { mode: 0o600 });
+  fs.writeFileSync(
+    metaPath,
+    JSON.stringify({ id, capturedAtIso, appName, windowTitle }),
+    { mode: 0o600 }
+  );
+  return { id, capturedAtIso };
+}
+
+function pruneDiskQueue() {
+  const metas = fs
+    .readdirSync(QUEUE_DIR)
+    .filter((n) => n.endsWith(".json"))
+    .sort();
+  while (metas.length > 120) {
+    const oldest = metas.shift();
+    if (!oldest) break;
+    const base = oldest.replace(/\.json$/, "");
+    try {
+      fs.unlinkSync(path.join(QUEUE_DIR, `${base}.json`));
+      fs.unlinkSync(path.join(QUEUE_DIR, `${base}.jpg`));
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function captureAndEnqueueToDisk() {
+  let queuedCount = 0;
   try {
-    fs.writeFileSync(jpgPath, shot.bytes, { mode: 0o600 });
-    fs.writeFileSync(
-      metaPath,
-      JSON.stringify({
-        id,
-        capturedAtIso,
-        appName: shot.appName,
-        windowTitle: shot.windowTitle,
-      }),
-      { mode: 0o600 }
-    );
-    // Cap disk queue at 120 pending screenshots (FIFO)
-    const metas = fs
-      .readdirSync(QUEUE_DIR)
-      .filter((n) => n.endsWith(".json"))
-      .sort();
-    while (metas.length > 120) {
-      const oldest = metas.shift();
-      if (!oldest) break;
-      const base = oldest.replace(/\.json$/, "");
-      try {
-        fs.unlinkSync(path.join(QUEUE_DIR, `${base}.json`));
-        fs.unlinkSync(path.join(QUEUE_DIR, `${base}.jpg`));
-      } catch {
-        // ignore
+    // 1. Capture open Slack / Email windows directly by CGWindowID even if behind other apps
+    const ctxWins = await captureOpenContextWindows(3);
+    if (ctxWins.ok && Array.isArray(ctxWins.windowsCaptured)) {
+      for (const w of ctxWins.windowsCaptured) {
+        const key = `${w.ownerName}::${w.kind}`;
+        if (lastWindowHashes.get(key) === w.hash) continue;
+        lastWindowHashes.set(key, w.hash);
+        const rawB64 = w.imageDataUrl.split(",")[1] || "";
+        if (!rawB64) continue;
+        writeQueueEntry(
+          Buffer.from(rawB64, "base64"),
+          w.kind === "slack" ? `Slack (${w.ownerName})` : w.ownerName,
+          w.windowTitle
+        );
+        queuedCount++;
       }
     }
-    return {
-      ok: true,
-      queuedId: id,
-      capturedAtIso,
-      appName: shot.appName,
-      windowTitle: shot.windowTitle,
-    };
+
+    // 2. Also capture frontmost screen if not Dayframe itself
+    const shot = await captureMacScreenSilent();
+    if (
+      shot.ok &&
+      !shot.skippedPrivateApp &&
+      !shot.skippedDuplicate &&
+      shot.bytes &&
+      !String(shot.windowTitle || "").toLowerCase().includes("dayframe")
+    ) {
+      writeQueueEntry(shot.bytes, shot.appName, shot.windowTitle);
+      queuedCount++;
+    }
+
+    pruneDiskQueue();
+    return { ok: true, queuedCount };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Queue write failed" };
   }
@@ -1005,6 +1175,26 @@ const server = http.createServer(async (req, res) => {
         message: String(body.message || "").slice(0, 220),
       });
       sendJson(req, res, 200, out);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/system/open-screen-privacy") {
+      if (process.platform === "darwin") {
+        execFile(
+          "/usr/bin/open",
+          ["x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"],
+          () => {}
+        );
+      }
+      sendJson(req, res, 200, { ok: true, hostTerminalApp: detectHostTerminalApp() });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/capture/context-windows") {
+      const body = await readJsonBody(req);
+      const maxWindows = Math.min(5, Math.max(1, Number(body.maxWindows) || 4));
+      const result = await captureOpenContextWindows(maxWindows);
+      sendJson(req, res, 200, result);
       return;
     }
 

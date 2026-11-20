@@ -16,7 +16,7 @@ export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   valenPort: 43823,
   valenSignalThreshold: 0.45,
   batchExecutionMode: "scheduled-batches",
-  batchWindowMinutes: [9 * 60 + 30, 13 * 60 + 30, 17 * 60 + 30], // 9:30 AM, 1:30 PM, 5:30 PM
+  batchWindowMinutes: [9 * 60 + 30, 13 * 60 + 30, 17 * 60 + 30],
   unloadModelsAfterBatch: true,
   confirmationPolicy: "ask-often",
   calendarSource: "none",
@@ -26,8 +26,8 @@ export const DEFAULT_ORGANIZER_SETTINGS: OrganizerSettings = {
   autoWriteToCalendar: false,
   intervalMinutes: 5,
   skipDuplicateFrames: true,
-  workdayStartMinutes: 9 * 60, // 9:00 AM
-  workdayEndMinutes: 18 * 60, // 6:00 PM
+  workdayStartMinutes: 9 * 60,
+  workdayEndMinutes: 18 * 60,
   minGapBetweenBlocksMinutes: 15,
   nightlyAndroidSyncHour: 23,
 };
@@ -61,20 +61,20 @@ export const BATCH_SCHEDULE_PRESETS: Array<{
 export const DEFAULT_STANDING_RULES: StandingRule[] = [
   {
     id: "rule-recurring-prep-2h",
-    title: "≥2h runway before recurring meetings",
+    title: "≥2h runway before real meetings that need prep",
     description:
-      "Reserve preparation time finishing at least 2 hours before recurring meetings (or the afternoon prior when a recurring meeting starts early in the morning).",
+      "When Gemma 4 sees a multi-person meeting, presentation, review, or call that genuinely requires preparation (never chores, workouts, meals, or solo reminders), finish prep at least 2 hours ahead.",
     category: "prep-time",
     enabled: true,
     appliesToRecurring: true,
-    prepDurationMinutes: 60,
+    prepDurationMinutes: 45,
     minLeadMinutesBeforeMeeting: 120,
   },
   {
     id: "rule-solo-holds",
-    title: "Solo calendar holds from email & Slack mentions",
+    title: "Solo calendar holds from Slack & email mentions",
     description:
-      "When an email or Slack message mentions a specific meeting time without a formal invite, propose a personal hold on your calendar and ask before adding.",
+      "When a Slack message or email mentions a meeting time without a formal invite, propose a personal hold in an open slot and ask before adding.",
     category: "solo-invite",
     enabled: true,
   },
@@ -99,7 +99,7 @@ export const DEFAULT_SUGGESTED_QUESTIONS: SuggestedPreferencePrompt[] = [
     question:
       "Want mornings (9:00 AM – 11:30 AM) protected exclusively for deep work and meeting prep?",
     whyItMatters:
-      "Routes shorter 15–30m email/Slack follow-up replies to afternoon gaps instead of fragmenting your morning.",
+      "Routes shorter 15–30m Slack/email follow-up replies to afternoon gaps instead of fragmenting your morning.",
     acceptLabel: "Protect morning focus",
     ruleToCreate: {
       title: "Morning deep-work protection (replies in afternoon)",
@@ -107,24 +107,6 @@ export const DEFAULT_SUGGESTED_QUESTIONS: SuggestedPreferencePrompt[] = [
         "Prefer afternoon windows for ≤30m follow-ups so mornings stay open for ≥45m focus and prep.",
       category: "availability",
       enabled: true,
-    },
-  },
-  {
-    id: "q-external-prep",
-    question:
-      "Also propose 45m of prep (≥2h ahead) before non-recurring 1:1, Interview, or Client calls?",
-    whyItMatters:
-      "Extends your 2-hour prep runway beyond weekly recurring syncs to one-off high-stakes calls.",
-    acceptLabel: "Enable for 1:1 / Client / Interview",
-    ruleToCreate: {
-      title: "45m prep (≥2h ahead) for 1:1, Client & Interview calls",
-      description:
-        "Reserve 45m finishing ≥2h before meetings matching 1:1, Client, Customer, or Interview.",
-      category: "prep-time",
-      enabled: true,
-      triggerPattern: "1:1|Client|Customer|Interview|Board",
-      prepDurationMinutes: 45,
-      minLeadMinutesBeforeMeeting: 120,
     },
   },
   {
@@ -147,6 +129,63 @@ export const DEFAULT_SUGGESTED_QUESTIONS: SuggestedPreferencePrompt[] = [
     },
   },
 ];
+
+const CHORE_OR_PERSONAL_ROUTINE_REGEX =
+  /\b(clean|cleaning|toilet|bathroom|restroom|kitchen|laundry|dishes|dish|trash|garbage|recycle|vacuum|mop|sweep|chore|chores|grocery|groceries|shopping|errand|errands|cook|cooking|breakfast|lunch|dinner|supper|meal|eat|coffee\s+break|gym|workout|exercise|jog|jogging|yoga|pilates|swim|walk\s+dog|dog\s+walk|feed\s+dog|feed\s+cat|litter|shower|bath|sleep|nap|bedtime|wake\s+up|vitamin|vitamins|pill|medication|meds|commute|drive\s+home|drive\s+to|haircut|barber|dentist|orthodontist|doctor|physical\s+therapy|massage|pay\s+rent|pay\s+bill|water\s+plants|focus\s+time|deep\s+work|heads\s+down|no\s+meetings|do\s+not\s+book|dnb|ooo|out\s+of\s+office|pto|vacation|holiday|birthday|anniversary|standup|daily\s+stand-?up|scrum)\b/i;
+
+const EXPLICIT_EXTERNAL_MEETING_TITLE_REGEX =
+  /\b(1:1|1-1|one-on-one|interview|presentation|pitch|defense|committee|board|client|customer|advisor|professor|prof\.|review\s+with|sync\s+with|call\s+with|meeting\s+with|chat\s+with|demo|panel|seminar|colloquium|lecture)\b/i;
+
+/**
+ * Hard sanity filter: returns true ONLY when a calendar event is an actual
+ * interpersonal / external meeting or talk that could plausibly need advance preparation.
+ * Personal chores ("Cleaning toilet"), solo routines, 0-attendee personal reminders,
+ * immutable holiday/birthday feeds, and Dayframe's own blocks ALWAYS return false.
+ */
+export function isEligibleRealMeetingForPrep(block: CalendarBlock): boolean {
+  if (block.kind !== "meeting") return false;
+  if (block.isDayframeCreated) return false;
+  if (block.calendarImmutable) return false;
+
+  const calName = (block.calendarTitle || "").toLowerCase();
+  if (
+    /birthday|holiday|reminder|chore|habit|routine|fitness|workout|meal|family\s+chores/i.test(
+      calName
+    )
+  ) {
+    return false;
+  }
+
+  const title = block.title.trim();
+  if (!title) return false;
+  if (
+    title.startsWith("[Prep]") ||
+    title.startsWith("[Focus]") ||
+    title.startsWith("[Solo Hold]")
+  ) {
+    return false;
+  }
+
+  // Personal chores, meals, workouts, errands, daily standups NEVER need prep blocks
+  if (CHORE_OR_PERSONAL_ROUTINE_REGEX.test(title)) {
+    return false;
+  }
+
+  const attendees = block.attendeeCount ?? 0;
+  const hasVideo = Boolean(block.hasVideoLink);
+
+  // A 0-attendee event with no video call link is almost always a personal reminder/task/routine
+  // that is ALREADY blocked on the user's calendar — unless the title explicitly names an external meeting/talk.
+  if (
+    attendees === 0 &&
+    !hasVideo &&
+    !EXPLICIT_EXTERNAL_MEETING_TITLE_REGEX.test(title)
+  ) {
+    return false;
+  }
+
+  return true;
+}
 
 export function formatMinutesToTime(totalMinutes: number): string {
   const clamped = ((totalMinutes % 1440) + 1440) % 1440;
@@ -232,6 +271,52 @@ export function getProtectedIntervals(
       (r) => r.enabled && r.category === "availability" && r.protectedWindow
     )
     .map((r) => r.protectedWindow!);
+}
+
+export function summarizeOpenWindowsForDay(params: {
+  dateKey: string;
+  blocks: CalendarBlock[];
+  rules: StandingRule[];
+  settings: OrganizerSettings;
+}): string {
+  const { dateKey, blocks, rules, settings } = params;
+  const dayBlocks = blocks.filter((b) => b.dateKey === dateKey);
+  const protectedWins = getProtectedIntervals(rules);
+  const freeRanges: Array<{ start: number; end: number }> = [];
+
+  let cursor = settings.workdayStartMinutes;
+  while (cursor + 15 <= settings.workdayEndMinutes) {
+    const busy =
+      dayBlocks.some((b) =>
+        intervalsOverlap(
+          cursor,
+          cursor + 15,
+          b.startMinutes,
+          b.startMinutes + b.durationMinutes
+        )
+      ) ||
+      protectedWins.some((pw) =>
+        intervalsOverlap(cursor, cursor + 15, pw.startMinutes, pw.endMinutes)
+      );
+
+    if (!busy) {
+      const last = freeRanges[freeRanges.length - 1];
+      if (last && last.end === cursor) {
+        last.end = cursor + 15;
+      } else {
+        freeRanges.push({ start: cursor, end: cursor + 15 });
+      }
+    }
+    cursor += 15;
+  }
+
+  const meaningful = freeRanges.filter((r) => r.end - r.start >= 30);
+  if (meaningful.length === 0) return "No >=30m free slots";
+  return meaningful
+    .map(
+      (r) => `${formatMinutesToTime(r.start)}-${formatMinutesToTime(r.end)}`
+    )
+    .join(", ");
 }
 
 interface SlotQuery {
@@ -336,7 +421,10 @@ export function calibrateDuration(
     ) {
       continue;
     }
-    if (matchesRulePattern(title, rule.triggerPattern) && rule.fixedMinutesOverride) {
+    if (
+      matchesRulePattern(title, rule.triggerPattern) &&
+      rule.fixedMinutesOverride
+    ) {
       return {
         minutes: roundTo15(rule.fixedMinutesOverride),
         appliedRule: rule,
@@ -346,166 +434,212 @@ export function calibrateDuration(
   return { minutes: roundTo15(baseMinutes) };
 }
 
-function findMatchingPrepRule(
-  meeting: CalendarBlock,
-  rules: StandingRule[]
-): StandingRule | undefined {
-  const prepRules = rules.filter((r) => r.enabled && r.category === "prep-time");
-  for (const rule of prepRules) {
-    if (rule.appliesToRecurring && meeting.isRecurring) return rule;
-    if (rule.triggerPattern && matchesRulePattern(meeting.title, rule.triggerPattern)) {
-      return rule;
+/**
+ * Slots a Gemma-verified contextual prep block for a specific meeting,
+ * respecting the user's >=2h runway rule (or afternoon prior for early meetings).
+ */
+export function placeGemmaContextualPrepBlock(params: {
+  meeting: CalendarBlock;
+  prepTitle: string;
+  prepMinutes: number;
+  contextEvidence: string;
+  contextSources: string[];
+  confidence: number;
+  askUser: boolean;
+  clarifyingQuestion?: string;
+  blocks: CalendarBlock[];
+  rules: StandingRule[];
+  settings: OrganizerSettings;
+  todayKey: string;
+}): { updatedBlocks: CalendarBlock[]; createdPrep?: CalendarBlock } {
+  const {
+    meeting,
+    prepTitle,
+    prepMinutes,
+    contextEvidence,
+    contextSources,
+    confidence,
+    askUser,
+    clarifyingQuestion,
+    blocks,
+    rules,
+    settings,
+    todayKey,
+  } = params;
+
+  if (!isEligibleRealMeetingForPrep(meeting)) {
+    return { updatedBlocks: blocks };
+  }
+
+  if (
+    rules.some(
+      (r) =>
+        r.enabled &&
+        r.category === "ignore-pattern" &&
+        (matchesRulePattern(meeting.title, r.triggerPattern) ||
+          matchesRulePattern(prepTitle, r.triggerPattern))
+    )
+  ) {
+    return { updatedBlocks: blocks };
+  }
+
+  const alreadyHasPrep = blocks.some(
+    (b) => b.kind === "prep" && b.linkedMeetingId === meeting.id
+  );
+  if (alreadyHasPrep) {
+    return { updatedBlocks: blocks };
+  }
+
+  const leadRule = rules.find(
+    (r) => r.enabled && r.category === "prep-time" && r.appliesToRecurring
+  );
+  const minLead = leadRule?.minLeadMinutesBeforeMeeting ?? 120;
+  const duration = roundTo15(Math.max(15, Math.min(120, prepMinutes)));
+  const idealFinishBy = meeting.startMinutes - minLead;
+
+  let chosenDateKey = meeting.dateKey;
+  let chosenStart: number | null = null;
+
+  if (idealFinishBy - settings.workdayStartMinutes >= duration) {
+    chosenStart = findOpenSlot({
+      dateKey: meeting.dateKey,
+      durationMinutes: duration,
+      blocks,
+      rules,
+      settings,
+      preferLatestBeforeMinutes: idealFinishBy,
+      mustFinishByMinutes: idealFinishBy,
+    });
+  }
+
+  if (chosenStart === null && meeting.dateKey > todayKey) {
+    const prevDayKey = addDaysToDateKey(meeting.dateKey, -1);
+    const prevSlot = findOpenSlot({
+      dateKey: prevDayKey,
+      durationMinutes: duration,
+      blocks,
+      rules,
+      settings,
+      preferLatestBeforeMinutes: settings.workdayEndMinutes,
+      preferAfternoon: true,
+    });
+    if (prevSlot !== null) {
+      chosenDateKey = prevDayKey;
+      chosenStart = prevSlot;
     }
   }
-  return undefined;
+
+  if (chosenStart === null) {
+    chosenDateKey = meeting.dateKey;
+    chosenStart = findOpenSlot({
+      dateKey: meeting.dateKey,
+      durationMinutes: duration,
+      blocks,
+      rules,
+      settings,
+      preferLatestBeforeMinutes: meeting.startMinutes,
+      mustFinishByMinutes: meeting.startMinutes,
+    });
+  }
+
+  if (chosenStart === null) {
+    return { updatedBlocks: blocks };
+  }
+
+  const hasAutoConfirmRule = rules.some(
+    (r) =>
+      r.enabled &&
+      r.category === "auto-confirm" &&
+      matchesRulePattern(meeting.title, r.triggerPattern)
+  );
+  const shouldAsk =
+    settings.confirmationPolicy === "always-ask"
+      ? true
+      : hasAutoConfirmRule
+        ? false
+        : askUser || settings.confirmationPolicy === "ask-often";
+
+  const prepBlock: CalendarBlock = {
+    id: `prep-${meeting.id}`,
+    title: prepTitle.trim() || `Prep for ${meeting.title}`,
+    kind: "prep",
+    status: shouldAsk ? "proposed" : "auto-scheduled",
+    dateKey: chosenDateKey,
+    startMinutes: chosenStart,
+    durationMinutes: duration,
+    linkedMeetingId: meeting.id,
+    sourceLabel: contextSources[0] || `Meeting Context (${meeting.title})`,
+    rationale: contextEvidence,
+    contextSources,
+    confidence,
+    clarifyingQuestion: shouldAsk
+      ? clarifyingQuestion ||
+        `Block ${formatDuration(duration)} for "${prepTitle}" (${formatMinutesToTime(
+          chosenStart
+        )}, ≥${formatDuration(minLead)} before "${meeting.title}")?`
+      : undefined,
+    uncertaintyReason: shouldAsk ? "Contextual meeting prep" : undefined,
+  };
+
+  const next = [...blocks, prepBlock].sort(
+    (a, b) =>
+      a.dateKey.localeCompare(b.dateKey) || a.startMinutes - b.startMinutes
+  );
+
+  return { updatedBlocks: next, createdPrep: prepBlock };
 }
 
+/**
+ * Only reconciles explicit keyword-targeted user prep rules (e.g., "Interview|Board")
+ * on eligible real meetings — NEVER blindly adds prep to every recurring calendar event!
+ */
 export function reconcilePrepBlocks(
   currentBlocks: CalendarBlock[],
   rules: StandingRule[],
   settings: OrganizerSettings,
-  todayKey: string = toLocalDateKey(new Date()),
-  initialStatus: "confirmed" | "proposed" | "auto-scheduled" = "proposed"
+  todayKey: string = toLocalDateKey(new Date())
 ): CalendarBlock[] {
-  const retained = currentBlocks.filter(
-    (b) => !(b.kind === "prep" && !b.syncedToExternalCalendar && b.status !== "confirmed")
+  // Purge any prep blocks attached to ineligible chores/routines
+  const meetingMap = new Map(
+    currentBlocks.filter((b) => b.kind === "meeting").map((m) => [m.id, m])
   );
-  const working = [...retained];
+  let working = currentBlocks.filter((b) => {
+    if (b.kind !== "prep" || b.syncedToExternalCalendar) return true;
+    if (b.linkedMeetingId) {
+      const parent = meetingMap.get(b.linkedMeetingId);
+      if (parent && !isEligibleRealMeetingForPrep(parent)) return false;
+    }
+    return true;
+  });
 
-  const meetings = working
-    .filter((b) => b.kind === "meeting")
-    .sort(
-      (a, b) =>
-        a.dateKey.localeCompare(b.dateKey) || a.startMinutes - b.startMinutes
+  // Only apply explicit user-defined triggerPattern prep rules automatically
+  const explicitKeywordRules = rules.filter(
+    (r) => r.enabled && r.category === "prep-time" && Boolean(r.triggerPattern)
+  );
+
+  for (const meeting of working.filter(isEligibleRealMeetingForPrep)) {
+    const matchedRule = explicitKeywordRules.find((r) =>
+      matchesRulePattern(meeting.title, r.triggerPattern)
     );
+    if (!matchedRule) continue;
 
-  for (const meeting of meetings) {
-    if (
-      rules.some(
-        (r) =>
-          r.enabled &&
-          r.category === "ignore-pattern" &&
-          matchesRulePattern(`Prep: ${meeting.title}`, r.triggerPattern)
-      )
-    ) {
-      continue;
-    }
-
-    const alreadyHasPrep = working.some(
-      (b) =>
-        (b.kind === "prep" && b.linkedMeetingId === meeting.id) ||
-        (b.dateKey === meeting.dateKey &&
-          b.title.toLowerCase() === `prep: ${meeting.title}`.toLowerCase())
-    );
-    if (alreadyHasPrep) continue;
-
-    const rule = findMatchingPrepRule(meeting, rules);
-    if (!rule) continue;
-
-    const prepDuration = roundTo15(rule.prepDurationMinutes ?? 60);
-    const minLead = rule.minLeadMinutesBeforeMeeting ?? 120;
-    const idealFinishBy = meeting.startMinutes - minLead;
-
-    let chosenDateKey = meeting.dateKey;
-    let chosenStart: number | null = null;
-    let rationale = "";
-
-    if (idealFinishBy - settings.workdayStartMinutes >= prepDuration) {
-      chosenStart = findOpenSlot({
-        dateKey: meeting.dateKey,
-        durationMinutes: prepDuration,
-        blocks: working,
-        rules,
-        settings,
-        preferLatestBeforeMinutes: idealFinishBy,
-        mustFinishByMinutes: idealFinishBy,
-      });
-      if (chosenStart !== null) {
-        rationale = `Scheduled ≥${formatDuration(minLead)} ahead of "${meeting.title}" per "${rule.title}".`;
-      }
-    }
-
-    if (chosenStart === null && meeting.dateKey > todayKey) {
-      const prevDayKey = addDaysToDateKey(meeting.dateKey, -1);
-      const prevSlot = findOpenSlot({
-        dateKey: prevDayKey,
-        durationMinutes: prepDuration,
-        blocks: working,
-        rules,
-        settings,
-        preferLatestBeforeMinutes: settings.workdayEndMinutes,
-        preferAfternoon: true,
-      });
-      if (prevSlot !== null) {
-        chosenDateKey = prevDayKey;
-        chosenStart = prevSlot;
-        rationale = `"${meeting.title}" starts at ${formatMinutesToTime(
-          meeting.startMinutes
-        )}, so prep was placed the afternoon before to preserve your ≥${formatDuration(
-          minLead
-        )} lead rule.`;
-      }
-    }
-
-    if (chosenStart === null) {
-      chosenDateKey = meeting.dateKey;
-      chosenStart = findOpenSlot({
-        dateKey: meeting.dateKey,
-        durationMinutes: prepDuration,
-        blocks: working,
-        rules,
-        settings,
-        preferLatestBeforeMinutes: meeting.startMinutes,
-        mustFinishByMinutes: meeting.startMinutes,
-      });
-      if (chosenStart !== null) {
-        rationale = `Closest open window prior to "${meeting.title}".`;
-      }
-    }
-
-    if (chosenStart !== null) {
-      const hasAutoConfirmRule = rules.some(
-        (r) =>
-          r.enabled &&
-          r.category === "auto-confirm" &&
-          matchesRulePattern(meeting.title, r.triggerPattern)
-      );
-      const effectiveStatus =
-        settings.confirmationPolicy === "always-ask"
-          ? "proposed"
-          : hasAutoConfirmRule
-            ? "auto-scheduled"
-            : initialStatus;
-
-      working.push({
-        id: `prep-${meeting.id}`,
-        title: `Prep: ${meeting.title}`,
-        kind: "prep",
-        status: effectiveStatus,
-        dateKey: chosenDateKey,
-        startMinutes: chosenStart,
-        durationMinutes: prepDuration,
-        linkedMeetingId: meeting.id,
-        ruleId: rule.id,
-        sourceLabel: rule.title,
-        rationale,
-        confidence: meeting.isRecurring ? 0.92 : 0.78,
-        clarifyingQuestion: `Put ${formatDuration(
-          prepDuration
-        )} of prep before "${meeting.title}" (${formatMinutesToTime(
-          chosenStart
-        )} on ${chosenDateKey}) on your calendar?`,
-        uncertaintyReason: meeting.isRecurring
-          ? "Confirm recurring prep slot"
-          : "Suggested meeting prep — confirm if needed",
-      });
-    }
+    const placed = placeGemmaContextualPrepBlock({
+      meeting,
+      prepTitle: `Prep: ${meeting.title}`,
+      prepMinutes: matchedRule.prepDurationMinutes ?? 45,
+      contextEvidence: `Matches your explicit Standing Rule "${matchedRule.title}".`,
+      contextSources: [`Rule: ${matchedRule.title}`],
+      confidence: 0.9,
+      askUser: settings.confirmationPolicy !== "auto-high-confidence",
+      blocks: working,
+      rules,
+      settings,
+      todayKey,
+    });
+    working = placed.updatedBlocks;
   }
 
-  return working.sort(
-    (a, b) =>
-      a.dateKey.localeCompare(b.dateKey) || a.startMinutes - b.startMinutes
-  );
+  return working;
 }
 
 function normalizeTokens(text: string): Set<string> {
@@ -602,57 +736,56 @@ export function evaluateConfirmationRequirement(params: {
       matchesRulePattern(signal.title, r.triggerPattern)
   );
 
-  const conf = signal.confidence ?? 0.75;
+  const conf = signal.confidence ?? 0.78;
 
   let shouldAskUser = false;
   let defaultReason = signal.uncertaintyReason || "";
 
   if (settings.confirmationPolicy === "always-ask") {
     shouldAskUser = true;
-    defaultReason = defaultReason || "Always-ask policy active";
+    defaultReason = defaultReason || `From ${sourceLabel}`;
   } else if (isExplicitlyAutoConfirmed) {
     shouldAskUser = false;
   } else if (settings.confirmationPolicy === "ask-often") {
     if (signal.isSoloInvite || signal.detectedKind === "meeting") {
       shouldAskUser = true;
       defaultReason =
-        defaultReason || "Informal meeting mention — confirm solo hold";
+        defaultReason || `Informal mention in ${sourceLabel}`;
     } else if (signal.needsUserConfirmation) {
       shouldAskUser = true;
-      defaultReason =
-        defaultReason || "Model flagged uncertainty — asking you first";
+      defaultReason = defaultReason || `Spotted in ${sourceLabel}`;
     } else if (conf < 0.9) {
       shouldAskUser = true;
       defaultReason =
         defaultReason ||
-        `Confidence ${Math.round(conf * 100)}% — confirm before adding`;
+        `${sourceLabel} (${Math.round(conf * 100)}% confidence)`;
     } else if (!hasDurationRule && calibratedMinutes >= 45) {
       shouldAskUser = true;
       defaultReason =
         defaultReason ||
-        `Estimated ${formatDuration(calibratedMinutes)} focus time — confirm duration`;
+        `Confirm ${formatDuration(calibratedMinutes)} focus slot`;
     }
   } else {
-    // auto-high-confidence
-    shouldAskUser = conf < 0.72 || Boolean(signal.needsUserConfirmation && conf < 0.8);
-    defaultReason = defaultReason || "Low confidence — confirm before scheduling";
+    shouldAskUser =
+      conf < 0.72 || Boolean(signal.needsUserConfirmation && conf < 0.8);
+    defaultReason = defaultReason || `Confirm ${sourceLabel} block`;
   }
 
   const clarifyingQuestion =
     signal.clarifyingQuestion ||
     (signal.isSoloInvite
-      ? `Saw "${signal.title}" in ${sourceLabel} — put a ${formatDuration(
+      ? `${sourceLabel}: Put a ${formatDuration(
           calibratedMinutes
-        )} solo hold on your calendar, or skip?`
-      : `Should I put "${signal.title}" (${formatDuration(
+        )} solo hold for "${signal.title}" on your calendar?`
+      : `${sourceLabel}: Block ${formatDuration(
           calibratedMinutes
-        )}) on your calendar from ${sourceLabel}, or skip it?`);
+        )} on your calendar for "${signal.title}"?`);
 
   return {
     ignoredByRule: false,
     shouldAskUser,
     clarifyingQuestion,
-    uncertaintyReason: defaultReason || "Confirm before writing to Calendar",
+    uncertaintyReason: defaultReason || `From ${sourceLabel}`,
   };
 }
 
@@ -660,6 +793,7 @@ export function placeSignalOnCalendar(params: {
   signal: ExtractedCaptureSignal;
   sourceLabel: string;
   sourceCaptureId?: string;
+  contextSources?: string[];
   defaultDateKey: string;
   blocks: CalendarBlock[];
   captures: ScreenshotCapture[];
@@ -677,6 +811,7 @@ export function placeSignalOnCalendar(params: {
     signal,
     sourceLabel,
     sourceCaptureId,
+    contextSources,
     defaultDateKey,
     blocks,
     captures,
@@ -686,6 +821,11 @@ export function placeSignalOnCalendar(params: {
   } = params;
 
   if (!signal.hasActionableItem) {
+    return { updatedBlocks: blocks, deduplicated: false, askedUser: false };
+  }
+
+  // Never create blocks for chores/personal habits even if seen on screen
+  if (CHORE_OR_PERSONAL_ROUTINE_REGEX.test(signal.title)) {
     return { updatedBlocks: blocks, deduplicated: false, askedUser: false };
   }
 
@@ -725,6 +865,9 @@ export function placeSignalOnCalendar(params: {
       : "auto-scheduled";
 
   const targetDateKey = signal.proposedDateKey || defaultDateKey;
+  const evidenceText = signal.contextEvidence
+    ? `${signal.contextEvidence} (${signal.summary})`
+    : signal.summary;
 
   if (
     signal.detectedKind === "meeting" &&
@@ -742,19 +885,18 @@ export function placeSignalOnCalendar(params: {
       isRecurring: Boolean(signal.isRecurringMention),
       isSoloHold: Boolean(signal.isSoloInvite ?? true),
       locationOrUrl: signal.locationOrUrl,
+      linkedMeetingId: signal.linkedMeetingId,
       sourceCaptureId,
       sourceLabel,
-      rationale: `Solo calendar hold created just for you (${signal.summary}).`,
-      confidence: signal.confidence ?? 0.78,
+      rationale: evidenceText,
+      contextSources: contextSources ?? [sourceLabel],
+      confidence: signal.confidence ?? 0.8,
       clarifyingQuestion: askUser ? decision.clarifyingQuestion : undefined,
       uncertaintyReason: askUser ? decision.uncertaintyReason : undefined,
     };
-    const next = reconcilePrepBlocks(
-      [...blocks, soloMeeting],
-      rules,
-      settings,
-      defaultDateKey,
-      "proposed"
+    const next = [...blocks, soloMeeting].sort(
+      (a, b) =>
+        a.dateKey.localeCompare(b.dateKey) || a.startMinutes - b.startMinutes
     );
     return {
       updatedBlocks: next,
@@ -764,20 +906,37 @@ export function placeSignalOnCalendar(params: {
     };
   }
 
-  const preferAfternoon =
-    signal.detectedKind === "follow-up" || calibratedMinutes <= 30;
+  // If this task prepares for a specific linked meeting, finish >=2h before that meeting!
+  let mustFinishBy: number | undefined;
+  let preferredDate = targetDateKey;
+  if (signal.linkedMeetingId) {
+    const linked = blocks.find((b) => b.id === signal.linkedMeetingId);
+    if (linked) {
+      preferredDate = linked.dateKey;
+      mustFinishBy = Math.max(
+        settings.workdayStartMinutes + calibratedMinutes,
+        linked.startMinutes - 120
+      );
+    }
+  }
 
-  let chosenDate = targetDateKey;
+  const preferAfternoon =
+    !mustFinishBy &&
+    (signal.detectedKind === "follow-up" || calibratedMinutes <= 30);
+
+  let chosenDate = preferredDate;
   let chosenStart: number | null = null;
 
   for (let d = 0; d < 5; d++) {
-    const candidateDate = addDaysToDateKey(targetDateKey, d);
+    const candidateDate = addDaysToDateKey(preferredDate, d);
     const slot = findOpenSlot({
       dateKey: candidateDate,
       durationMinutes: calibratedMinutes,
       blocks,
       rules,
       settings,
+      preferLatestBeforeMinutes: d === 0 ? mustFinishBy : undefined,
+      mustFinishByMinutes: d === 0 ? mustFinishBy : undefined,
       preferAfternoon: d === 0 ? preferAfternoon : false,
     });
     if (slot !== null) {
@@ -788,7 +947,7 @@ export function placeSignalOnCalendar(params: {
   }
 
   if (chosenStart === null) {
-    chosenDate = targetDateKey;
+    chosenDate = preferredDate;
     chosenStart = settings.workdayEndMinutes - calibratedMinutes;
   }
 
@@ -800,15 +959,17 @@ export function placeSignalOnCalendar(params: {
     dateKey: chosenDate,
     startMinutes: chosenStart,
     durationMinutes: calibratedMinutes,
+    linkedMeetingId: signal.linkedMeetingId,
     sourceCaptureId,
     ruleId: appliedRule?.id,
     sourceLabel,
-    rationale: `${signal.summary}${
+    rationale: `${evidenceText}${
       appliedRule
-        ? ` • Calibrated to ${formatDuration(calibratedMinutes)} via "${appliedRule.title}".`
-        : ` • Slotted into open ${formatDuration(calibratedMinutes)} window.`
+        ? ` • Sized to ${formatDuration(calibratedMinutes)} via "${appliedRule.title}".`
+        : ""
     }`,
-    confidence: signal.confidence ?? 0.76,
+    contextSources: contextSources ?? [sourceLabel],
+    confidence: signal.confidence ?? 0.78,
     clarifyingQuestion: askUser ? decision.clarifyingQuestion : undefined,
     uncertaintyReason: askUser ? decision.uncertaintyReason : undefined,
   };
@@ -828,7 +989,7 @@ export function placeSignalOnCalendar(params: {
 
 export function extractRuleTriggerFromTitle(title: string): string {
   return title
-    .replace(/^Prep:\s*/i, "")
+    .replace(/^Prep(?:\s+for)?:?\s*/i, "")
     .replace(/[^a-zA-Z0-9\s]/g, " ")
     .split(/\s+/)
     .filter((w) => w.length > 3)
@@ -865,7 +1026,7 @@ export function applyUserRuleFeedback(params: {
         autoWriteToCalendar: false,
       },
       assistantReply:
-        "Switched to Always Ask — I will ask for your Yes/No confirmation on every single item before touching your Calendar.",
+        "Switched to Always Ask — I will ask for your confirmation on every proposed item before writing to Calendar.app.",
       actionSummary: "Confirmation policy → Always Ask",
     };
   }
@@ -879,7 +1040,7 @@ export function applyUserRuleFeedback(params: {
         confirmationPolicy: "ask-often",
       },
       assistantReply:
-        "Set to Ask Often — whenever a task, meeting mention, or duration isn't 100% certain, I'll queue a Yes/No question for you first.",
+        "Set to Ask Often — I'll filter out chores/noise automatically and ask you on genuine task/prep candidates.",
       actionSummary: "Confirmation policy → Ask Often",
     };
   }
@@ -910,13 +1071,19 @@ export function applyUserRuleFeedback(params: {
         ? roundTo15(Number(hoursPrepMatch[1]) * 60)
         : undefined;
 
-    const isRecurringTarget =
-      lower.includes("recurring") ||
-      lower.includes("recurrent") ||
-      !lower.match(/for\s+[a-z]+/);
+    const topicMatch = lower.match(
+      /(?:before|for)\s+([a-z0-9\s-]+?)(?:\s+meetings?|\s+calls?|\s+syncs?|$)/
+    );
+    const explicitKeyword =
+      topicMatch &&
+      !["recurring", "recurrent", "my", "all"].includes(
+        topicMatch[1].trim().toLowerCase()
+      )
+        ? topicMatch[1].trim().split(/\s+/)[0]
+        : undefined;
 
     const updatedRules = [...rules];
-    if (isRecurringTarget) {
+    if (!explicitKeyword) {
       const idx = updatedRules.findIndex(
         (r) => r.category === "prep-time" && r.appliesToRecurring
       );
@@ -927,47 +1094,29 @@ export function applyUserRuleFeedback(params: {
           enabled: true,
           minLeadMinutesBeforeMeeting: newLeadMinutes,
           prepDurationMinutes:
-            newPrepDuration ?? prev.prepDurationMinutes ?? 60,
-          title: `≥${formatDuration(newLeadMinutes)} runway before recurring meetings`,
-          description: `Reserve ${formatDuration(
-            newPrepDuration ?? prev.prepDurationMinutes ?? 60
-          )} finishing ≥${formatDuration(newLeadMinutes)} before recurring meetings.`,
+            newPrepDuration ?? prev.prepDurationMinutes ?? 45,
+          title: `≥${formatDuration(newLeadMinutes)} runway before real meetings that need prep`,
+          description: `When Gemma 4 identifies a meeting requiring preparation, finish ${formatDuration(
+            newPrepDuration ?? prev.prepDurationMinutes ?? 45
+          )} of prep ≥${formatDuration(newLeadMinutes)} ahead.`,
           createdFromFeedback: true,
         };
-      } else {
-        updatedRules.unshift({
-          id: `rule-fb-${Date.now()}`,
-          title: `≥${formatDuration(newLeadMinutes)} runway before recurring meetings`,
-          description: `Reserve ${formatDuration(
-            newPrepDuration ?? 60
-          )} finishing ≥${formatDuration(newLeadMinutes)} before recurring meetings.`,
-          category: "prep-time",
-          enabled: true,
-          appliesToRecurring: true,
-          prepDurationMinutes: newPrepDuration ?? 60,
-          minLeadMinutesBeforeMeeting: newLeadMinutes,
-          createdFromFeedback: true,
-        });
       }
     } else {
-      const topicMatch = lower.match(
-        /(?:before|for)\s+([a-z0-9\s-]+?)(?:\s+meetings?|\s+calls?|\s+syncs?|$)/
-      );
-      const keyword = topicMatch?.[1]?.trim().split(/\s+/)[0] || "review";
       updatedRules.unshift({
         id: `rule-fb-${Date.now()}`,
-        title: `Prep before "${keyword}" meetings (≥${formatDuration(
+        title: `Prep before "${explicitKeyword}" meetings (≥${formatDuration(
           newLeadMinutes
         )} ahead)`,
         description: `Reserve ${formatDuration(
-          newPrepDuration ?? 60
+          newPrepDuration ?? 45
         )} finishing ≥${formatDuration(
           newLeadMinutes
-        )} before "${keyword}" meetings.`,
+        )} before "${explicitKeyword}" meetings.`,
         category: "prep-time",
         enabled: true,
-        triggerPattern: keyword,
-        prepDurationMinutes: newPrepDuration ?? 60,
+        triggerPattern: explicitKeyword,
+        prepDurationMinutes: newPrepDuration ?? 45,
         minLeadMinutesBeforeMeeting: newLeadMinutes,
         createdFromFeedback: true,
       });
@@ -978,10 +1127,10 @@ export function applyUserRuleFeedback(params: {
       blocks: reconciled,
       rules: updatedRules,
       settings,
-      assistantReply: `Saved to your Standing Rules and updated prep blocks on your schedule (≥${formatDuration(
+      assistantReply: `Updated your prep rule (≥${formatDuration(
         newLeadMinutes
-      )} ahead).`,
-      actionSummary: `Updated prep rule (≥${formatDuration(newLeadMinutes)} lead)`,
+      )} lead). Gemma 4 will apply this selectively to real meetings that warrant preparation.`,
+      actionSummary: `Updated prep runway (≥${formatDuration(newLeadMinutes)} lead)`,
     };
   }
 
@@ -1055,7 +1204,7 @@ export function applyUserRuleFeedback(params: {
     blocks,
     rules: [noteRule, ...rules],
     settings,
-    assistantReply: `Saved to your local Standing Rules so Gemma 4 applies "${noteRule.title}" during each offline batch run.`,
+    assistantReply: `Saved to your local Standing Rules so Gemma 4 applies "${noteRule.title}" during each contextual scan and batch run.`,
     actionSummary: "Saved rule to local Gemma 4 memory",
   };
 }

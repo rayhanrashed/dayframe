@@ -10,7 +10,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { CalendarBlock, ConfirmationPolicy } from "@/lib/types";
+import {
+  CalendarBlock,
+  ConfirmationPolicy,
+  ScreenshotCapture,
+} from "@/lib/types";
 import {
   formatDateKeyLabel,
   formatDuration,
@@ -19,10 +23,10 @@ import {
 import {
   ArrowRight,
   CalendarCheck,
-  Check,
   CheckCheck,
   Clock,
   HelpCircle,
+  MessageSquareText,
   Sparkles,
   X,
 } from "lucide-react";
@@ -30,6 +34,8 @@ import {
 interface PendingConfirmationsDeckProps {
   todayKey: string;
   proposedBlocks: CalendarBlock[];
+  allBlocks: CalendarBlock[];
+  captures: ScreenshotCapture[];
   confirmationPolicy: ConfirmationPolicy;
   onChangeConfirmationPolicy: (policy: ConfirmationPolicy) => void;
   onApproveBlock: (id: string, rememberAlwaysRule: boolean) => void;
@@ -45,6 +51,8 @@ const QUICK_DURATIONS = [15, 30, 45, 60, 90];
 export function PendingConfirmationsDeck({
   todayKey,
   proposedBlocks,
+  allBlocks,
+  captures,
   confirmationPolicy,
   onChangeConfirmationPolicy,
   onApproveBlock,
@@ -77,12 +85,8 @@ export function PendingConfirmationsDeck({
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold tracking-tight">
                 {proposedBlocks.length > 0
-                  ? `Should I Put ${
-                      proposedBlocks.length === 1
-                        ? "This"
-                        : `These (${proposedBlocks.length})`
-                    } on Your Calendar?`
-                  : "Calendar Confirmation Queue"}
+                  ? `Contextual Calendar Proposals (${proposedBlocks.length})`
+                  : "Contextual Proposals Queue"}
               </h2>
               {proposedBlocks.length > 0 && (
                 <Badge className="bg-amber-600 text-[10px] text-white hover:bg-amber-600">
@@ -92,8 +96,8 @@ export function PendingConfirmationsDeck({
             </div>
             <p className="text-[11px] text-muted-foreground">
               {proposedBlocks.length > 0
-                ? "Nothing below touches macOS Calendar.app until you click Yes."
-                : "No pending questions right now — whenever an email, Slack message, or duration is uncertain, I ask you here first."}
+                ? "Reasoned by Gemma 4 across your real meetings, Slack windows, and Mail (chores & solo routines ignored)."
+                : "0 pending questions — Gemma 4 skips chores/routines automatically and only asks when Slack, Mail, or a real meeting warrants calendar time."}
             </p>
           </div>
         </div>
@@ -111,7 +115,10 @@ export function PendingConfirmationsDeck({
               }
             }}
           >
-            <SelectTrigger size="sm" className="h-7 min-w-[165px] bg-background text-xs">
+            <SelectTrigger
+              size="sm"
+              className="h-7 min-w-[165px] bg-background text-xs"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -119,10 +126,10 @@ export function PendingConfirmationsDeck({
                 Ask Often When Unsure (Default)
               </SelectItem>
               <SelectItem value="always-ask">
-                Always Ask Every Single Item
+                Always Ask Every Proposal
               </SelectItem>
               <SelectItem value="auto-high-confidence">
-                Ask Only Low-Confidence (&lt;72%)
+                Auto-Add High Confidence (&ge;72%)
               </SelectItem>
             </SelectContent>
           </Select>
@@ -145,41 +152,77 @@ export function PendingConfirmationsDeck({
         <div className="mt-3.5 space-y-2.5">
           {proposedBlocks.map((blk) => {
             const endMin = blk.startMinutes + blk.durationMinutes;
+            const linkedMeeting = blk.linkedMeetingId
+              ? allBlocks.find((m) => m.id === blk.linkedMeetingId)
+              : null;
+            const linkedShot = blk.sourceCaptureId
+              ? captures.find((c) => c.id === blk.sourceCaptureId)
+              : null;
+
             return (
               <div
                 key={blk.id}
                 className="rounded-xl border border-border/90 bg-background p-3 shadow-2xs"
               >
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div className="space-y-1">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1 space-y-1.5">
                     <div className="flex flex-wrap items-center gap-1.5">
-                      <Badge variant="outline" className="text-[10px]">
-                        {blk.uncertaintyReason || "Confirm before scheduling"}
+                      <Badge variant="secondary" className="gap-1 text-[10px]">
+                        <MessageSquareText className="size-2.5" />
+                        {blk.sourceLabel}
                       </Badge>
-                      <span className="text-[10.5px] text-muted-foreground">
-                        Source: {blk.sourceLabel} • Confidence{" "}
-                        {Math.round(blk.confidence * 100)}%
-                      </span>
+                      {(blk.contextSources ?? [])
+                        .filter((s) => s !== blk.sourceLabel)
+                        .map((src, idx) => (
+                          <Badge
+                            key={`${blk.id}-ctx-${idx}`}
+                            variant="outline"
+                            className="text-[10px]"
+                          >
+                            {src}
+                          </Badge>
+                        ))}
+                      {linkedMeeting && (
+                        <Badge variant="outline" className="text-[10px]">
+                          Linked: {linkedMeeting.title} (
+                          {formatMinutesToTime(linkedMeeting.startMinutes)})
+                        </Badge>
+                      )}
                     </div>
+
                     <p className="text-xs font-semibold leading-snug">
                       {blk.clarifyingQuestion ||
                         `Put "${blk.title}" (${formatDuration(
                           blk.durationMinutes
                         )}) on your calendar?`}
                     </p>
-                    <p className="text-[11px] text-muted-foreground">
+
+                    <div className="rounded-lg border bg-muted/30 px-2.5 py-1.5 text-[11px] leading-relaxed text-muted-foreground">
+                      <span className="font-medium text-foreground">
+                        Why Gemma 4 proposed this:{" "}
+                      </span>
                       {blk.rationale}
-                    </p>
+                    </div>
                   </div>
 
-                  <div className="rounded-lg border bg-muted/40 px-2.5 py-1.5 text-right text-xs">
-                    <div className="font-medium">
-                      {formatDateKeyLabel(blk.dateKey, todayKey)}
-                    </div>
-                    <div className="flex items-center justify-end gap-1 font-mono text-[11px] text-muted-foreground">
-                      <Clock className="size-3" />
-                      {formatMinutesToTime(blk.startMinutes)} –{" "}
-                      {formatMinutesToTime(endMin)}
+                  <div className="flex items-start gap-2">
+                    {linkedShot?.imageDataUrl && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={linkedShot.imageDataUrl}
+                        alt={linkedShot.windowTitle}
+                        className="hidden h-14 w-20 rounded-md border object-cover sm:block"
+                      />
+                    )}
+                    <div className="rounded-lg border bg-muted/40 px-2.5 py-1.5 text-right text-xs">
+                      <div className="font-medium">
+                        {formatDateKeyLabel(blk.dateKey, todayKey)}
+                      </div>
+                      <div className="flex items-center justify-end gap-1 font-mono text-[11px] text-muted-foreground">
+                        <Clock className="size-3" />
+                        {formatMinutesToTime(blk.startMinutes)} –{" "}
+                        {formatMinutesToTime(endMin)}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -222,7 +265,6 @@ export function PendingConfirmationsDeck({
                     </button>
                   </div>
 
-                  {/* Yes / No / Remember Rule Buttons */}
                   <div className="flex flex-wrap items-center gap-1.5">
                     <Button
                       size="xs"
@@ -237,10 +279,9 @@ export function PendingConfirmationsDeck({
                       variant="secondary"
                       onClick={() => onApproveBlock(blk.id, true)}
                       className="gap-1"
-                      title="Add to Calendar AND remember to auto-schedule items like this"
                     >
                       <Sparkles className="size-3" />
-                      Always Add Like This
+                      Always Like This
                     </Button>
                     <Button
                       size="xs"
@@ -249,16 +290,14 @@ export function PendingConfirmationsDeck({
                       className="gap-1"
                     >
                       <X className="size-3" />
-                      No, Skip
+                      Skip
                     </Button>
                     <Button
                       size="xs"
                       variant="ghost"
                       onClick={() => onSkipBlock(blk.id, true)}
                       className="text-[11px] text-muted-foreground"
-                      title="Skip AND never suggest similar items again"
                     >
-                      <Check className="mr-0.5 size-3 opacity-0" />
                       Never Like This
                     </Button>
                   </div>

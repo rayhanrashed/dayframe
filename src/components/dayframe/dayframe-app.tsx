@@ -32,19 +32,21 @@ import {
   findOpenSlot,
   formatDuration,
   formatMinutesToTime,
+  isEligibleRealMeetingForPrep,
+  placeGemmaContextualPrepBlock,
   placeSignalOnCalendar,
   reconcilePrepBlocks,
 } from "@/lib/scheduler";
 import {
-  analyzeInboxEmailsWithGemma4,
   analyzeScreenshotWithGemma4,
   LocalGemmaStatus,
+  planHolisticCalendarWithGemma4,
   probeLocalGemma,
+  resolveInstalledGemmaTag,
   unloadGemmaModelImmediately,
 } from "@/lib/gemma-client";
 import {
   cropImageToValenBbox,
-  evaluateMeetingPrepNeedWithValen,
   filterInboxEmailsWithValen,
   probeValenRuntime,
   runValenScreenshotGate,
@@ -53,6 +55,7 @@ import {
 } from "@/lib/valen-decision";
 import {
   acknowledgeMacDiskCaptures,
+  captureOpenSlackAndMailWindows,
   configureMacBackgroundCollector,
   fetchMacAndroidFolderQueue,
   fetchMacDiskCaptureQueue,
@@ -70,7 +73,8 @@ import {
   writeBlockToMacCalendar,
 } from "@/lib/calendar-connectors";
 
-const STORAGE_KEY_V2 = "dayframe.real.v2";
+const STORAGE_KEY_V3 = "dayframe.contextual.v3";
+const LEGACY_V2_KEY = "dayframe.real.v2";
 const LEGACY_TOY_KEY = "dayframe.workspace.v1";
 
 interface PersistedWorkspaceV2 {
@@ -205,7 +209,20 @@ export function DayframeApp() {
 
       try {
         localStorage.removeItem(LEGACY_TOY_KEY);
-        const raw = localStorage.getItem(STORAGE_KEY_V2);
+        // Migrate pairing token from v2 if upgrading, while purging stale v2 naive prep blocks
+        const legacyV2Raw = localStorage.getItem(LEGACY_V2_KEY);
+        if (legacyV2Raw) {
+          try {
+            const v2 = JSON.parse(legacyV2Raw) as Partial<PersistedWorkspaceV2>;
+            if (v2.macPairingToken) {
+              loadedToken = v2.macPairingToken;
+              setMacPairingToken(v2.macPairingToken);
+            }
+          } catch {}
+          localStorage.removeItem(LEGACY_V2_KEY);
+        }
+
+        const raw = localStorage.getItem(STORAGE_KEY_V3);
         if (raw) {
           const parsed = JSON.parse(raw) as Partial<PersistedWorkspaceV2>;
           if (parsed.settings) {
@@ -320,7 +337,7 @@ export function DayframeApp() {
         gateStats,
         macPairingToken,
       };
-      localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(payload));
+      localStorage.setItem(STORAGE_KEY_V3, JSON.stringify(payload));
     } catch {
       // Ignore quota exceeded
     }
@@ -452,12 +469,18 @@ export function DayframeApp() {
     ]
   );
 
-  // One-Off Baseline Scan: Wake -> Scan Calendar & Mail -> Unload Back to 0 MB RAM
+  // Contextual Scan: Calendar (attendees/notes/URLs) + Open Slack/Mail Windows + Apple Mail -> Gemma 4 -> Unload to 0 MB RAM
   const runBaselineCalendarAndMailScan = useCallback(async (): Promise<{
     ok: boolean;
     existingCount: number;
+    eligibleMeetingCount: number;
+    skippedChoreCount: number;
+    windowsCapturedNames: string[];
+    screenPermissionNeeded?: boolean;
     emailCount: number;
     proposedCount: number;
+    gemmaRan: boolean;
+    gemmaNote?: string;
     error?: string;
   }> => {
     setIsSyncingCalendar(true);
@@ -468,25 +491,37 @@ export function DayframeApp() {
         return {
           ok: false,
           existingCount: 0,
+          eligibleMeetingCount: 0,
+          skippedChoreCount: 0,
+          windowsCapturedNames: [],
           emailCount: 0,
           proposedCount: 0,
+          gemmaRan: false,
           error:
             bridge.error ||
             "Mac Daemon is not paired yet. Run `./dayframe` (or `Dayframe.command`) on your MacBook.",
         };
       }
 
-      const [calRes, mailRes] = await Promise.all([
+      const [calRes, mailRes, winRes] = await Promise.all([
         scanMacCalendarEvents({ pairingToken: macPairingToken, daysAhead: 7 }),
         scanMacMailMessages({ pairingToken: macPairingToken, limit: 12 }),
+        captureOpenSlackAndMailWindows({
+          pairingToken: macPairingToken,
+          maxWindows: 4,
+        }),
       ]);
 
       if (!calRes.ok) {
         return {
           ok: false,
           existingCount: 0,
+          eligibleMeetingCount: 0,
+          skippedChoreCount: 0,
+          windowsCapturedNames: [],
           emailCount: 0,
           proposedCount: 0,
+          gemmaRan: false,
           error: calRes.error,
         };
       }
@@ -496,13 +531,30 @@ export function DayframeApp() {
       const fetchedEmails = mailRes.messages;
       setScannedEmails(fetchedEmails);
 
+      const eligibleMeetings = fetchedCalendarBlocks.filter(
+        isEligibleRealMeetingForPrep
+      );
+      const skippedChoreCount = Math.max(
+        0,
+        fetchedCalendarBlocks.length - eligibleMeetings.length
+      );
+      const capturedWindows = winRes.windowsCaptured ?? [];
+      const windowsCapturedNames = capturedWindows.map(
+        (w) =>
+          `${w.ownerName}${
+            w.windowTitle && w.windowTitle !== w.ownerName
+              ? ` (${w.windowTitle.slice(0, 28)})`
+              : ""
+          }`
+      );
+
       const valenSpec =
         VALEN_MODEL_CATALOG.find((v) => v.id === settings.valenModelId) ??
         VALEN_MODEL_CATALOG[0];
 
-      // Phase 1: Wake Valen on demand -> Score meetings & filter emails -> Stop Valen immediately
+      // Phase 1 (Optional): Valen screens Apple Mail newsletters, then stops immediately
       let candidateEmails = fetchedEmails;
-      if (settings.valenEnabled) {
+      if (settings.valenEnabled && fetchedEmails.length > 0) {
         setModelLifecycle((prev) => ({ ...prev, activePhase: "waking-valen" }));
         await wakeValenViaMacDaemon({
           pairingToken: macPairingToken,
@@ -514,111 +566,203 @@ export function DayframeApp() {
           activePhase: "screening-valen",
         }));
 
-        for (let i = 0; i < fetchedCalendarBlocks.length; i++) {
-          const ev = fetchedCalendarBlocks[i];
-          if (!ev.isRecurring && ev.durationMinutes >= 30) {
-            const prepEval = await evaluateMeetingPrepNeedWithValen({
-              meetingTitle: ev.title,
-              durationMinutes: ev.durationMinutes,
-              modelId: settings.valenModelId,
-              port: settings.valenPort,
-              macPairingToken,
-            });
-            if (!prepEval) break;
-            if (prepEval.needsPrep) {
-              fetchedCalendarBlocks[i] = {
-                ...ev,
-                isRecurring: true,
-                rationale: `Valen-Decision scored prep necessity p=${prepEval.probability.toFixed(
-                  2
-                )} (${prepEval.recommendedPrepMinutes}m recommended).`,
-              };
-            }
-          }
-        }
-
-        if (fetchedEmails.length > 0) {
-          const emailGate = await filterInboxEmailsWithValen({
-            emails: fetchedEmails,
-            modelId: settings.valenModelId,
-            port: settings.valenPort,
-            threshold: settings.valenSignalThreshold,
-            macPairingToken,
+        const emailGate = await filterInboxEmailsWithValen({
+          emails: fetchedEmails,
+          modelId: settings.valenModelId,
+          port: settings.valenPort,
+          threshold: settings.valenSignalThreshold,
+          macPairingToken,
+        });
+        if (emailGate.usedValen) {
+          candidateEmails = emailGate.keptEmails;
+          appendLog({
+            stage: "valen-gate",
+            title: `Valen screened ${fetchedEmails.length} Mail messages`,
+            detail: `Filtered ${emailGate.droppedCount} newsletters/FYI alerts; forwarded ${candidateEmails.length} to Gemma 4.`,
+            modelUsed: settings.valenModelId,
+            latencyMs: emailGate.totalLatencyMs,
           });
-          if (emailGate.usedValen) {
-            candidateEmails = emailGate.keptEmails;
-            appendLog({
-              stage: "valen-gate",
-              title: `Valen screened ${fetchedEmails.length} Mail messages`,
-              detail: `Filtered ${emailGate.droppedCount} newsletters/FYI alerts; forwarded ${candidateEmails.length} to Gemma 4.`,
-              modelUsed: settings.valenModelId,
-              latencyMs: emailGate.totalLatencyMs,
-            });
-          }
         }
 
         if (settings.unloadModelsAfterBatch) {
           await stopValenViaMacDaemon(macPairingToken);
-          appendLog({
-            stage: "lifecycle",
-            title: "Stopped Valen-Decision after Stage-1 triage",
-            detail: "Freed Stage-1 memory before waking Gemma 4.",
-          });
         }
       }
 
+      // Start ONLY from real existing calendar events + explicit keyword rules (NO blind recurring chore prep!)
       let workingBlocks = reconcilePrepBlocks(
         fetchedCalendarBlocks,
         rules,
         settings,
-        todayKey,
-        "proposed"
+        todayKey
       );
+      let workingCaptures = [...captures];
 
-      // Phase 2: Wake Gemma 4 ONLY if candidate emails exist -> Extract -> Unload to 0 MB
-      if (candidateEmails.length > 0) {
-        setModelLifecycle((prev) => ({ ...prev, activePhase: "waking-gemma" }));
-        await wakeOllamaViaMacDaemon(macPairingToken);
-        const gStatus = await probeLocalGemma(settings.gemmaModel);
-        setGemmaStatus(gStatus);
+      // Phase 2: ALWAYS wake Gemma 4 to inspect open Slack/Mail windows + reason holistically across Calendar & Mail
+      setModelLifecycle((prev) => ({ ...prev, activePhase: "waking-gemma" }));
+      await wakeOllamaViaMacDaemon(macPairingToken);
+      const gStatus = await probeLocalGemma(settings.gemmaModel);
+      setGemmaStatus(gStatus);
 
-        if (gStatus.reachable) {
-          setModelLifecycle((prev) => ({
-            ...prev,
-            activePhase: "reasoning-gemma",
-          }));
-          const inboxAnalysis = await analyzeInboxEmailsWithGemma4({
-            emails: candidateEmails,
-            model: settings.gemmaModel,
+      let gemmaRan = false;
+      let gemmaNote: string | undefined;
+
+      if (!gStatus.reachable) {
+        gemmaNote =
+          "Local Ollama could not be started on 127.0.0.1:11434. Install Ollama (`brew install ollama` and `ollama pull gemma4:e4b`) so Gemma 4 can analyze your meetings, Slack, and emails.";
+      } else {
+        const activeGemmaTag = resolveInstalledGemmaTag(
+          settings.gemmaModel,
+          gStatus
+        );
+        setModelLifecycle((prev) => ({
+          ...prev,
+          activePhase: "reasoning-gemma",
+        }));
+
+        // 2A. Read captured open Slack & Gmail/Mail windows with Gemma 4 Vision
+        const windowObservations: Array<{ source: string; detail: string }> = [];
+
+        for (const win of capturedWindows) {
+          const sourceName =
+            win.kind === "slack"
+              ? `Slack (${win.windowTitle.slice(0, 40)})`
+              : `${win.ownerName} (${win.windowTitle.slice(0, 40)})`;
+
+          const winAnalysis = await analyzeScreenshotWithGemma4({
+            imageDataUrl: win.imageDataUrl,
+            model: activeGemmaTag,
+            appName: win.ownerName,
+            windowTitle: win.windowTitle,
             todayDateKey: todayKey,
+            existingBlocks: workingBlocks,
             rules,
+            settings,
+            device: "macbook",
           });
+
+          if (winAnalysis.ok) {
+            gemmaRan = true;
+            if (winAnalysis.rawObservation) {
+              windowObservations.push({
+                source: sourceName,
+                detail: winAnalysis.rawObservation,
+              });
+            }
+
+            const capId = `cap-win-${Date.now()}-${win.windowId}`;
+            let createdId: string | undefined;
+            let asked = false;
+            let dedup = false;
+
+            if (winAnalysis.signal?.hasActionableItem) {
+              const placed = placeSignalOnCalendar({
+                signal: winAnalysis.signal,
+                sourceLabel: sourceName,
+                sourceCaptureId: capId,
+                contextSources: [sourceName],
+                defaultDateKey: todayKey,
+                blocks: workingBlocks,
+                captures: workingCaptures,
+                rules,
+                settings,
+              });
+              workingBlocks = placed.updatedBlocks;
+              createdId = placed.createdBlock?.id;
+              asked = placed.askedUser;
+              dedup = placed.deduplicated;
+            }
+
+            const newWinCap: ScreenshotCapture = {
+              id: capId,
+              timestampIso: new Date().toISOString(),
+              device: "macbook",
+              appName: sourceName,
+              windowTitle: win.windowTitle,
+              summaryText:
+                winAnalysis.signal?.contextEvidence ||
+                winAnalysis.signal?.summary ||
+                "Read window context.",
+              imageDataUrl: win.imageDataUrl,
+              modelUsed: activeGemmaTag,
+              inferenceMs: winAnalysis.latencyMs,
+              extractedSignal: winAnalysis.signal,
+              createdBlockId: createdId,
+              syncState: !winAnalysis.signal?.hasActionableItem
+                ? "no-action"
+                : dedup
+                  ? "deduplicated"
+                  : asked
+                    ? "awaiting-confirmation"
+                    : "scheduled",
+            };
+            workingCaptures = [newWinCap, ...workingCaptures];
+          }
+        }
+
+        // 2B. Holistic Gemma 4 planner across eligible meetings + Slack observations + Apple Mail
+        const holistic = await planHolisticCalendarWithGemma4({
+          model: activeGemmaTag,
+          todayDateKey: todayKey,
+          allCalendarBlocks: workingBlocks,
+          emails: candidateEmails,
+          windowObservations,
+          rules,
+          settings,
+        });
+
+        if (holistic.ok) {
+          gemmaRan = true;
           appendLog({
             stage: "gemma4",
-            title: `Gemma 4 analyzed ${candidateEmails.length} Mail messages`,
-            detail: inboxAnalysis.ok
-              ? `Proposed ${inboxAnalysis.signals.length} calendar candidate(s) for your confirmation.`
-              : inboxAnalysis.error || "Inbox extraction failed.",
-            modelUsed: settings.gemmaModel,
-            latencyMs: inboxAnalysis.latencyMs,
+            title: `Gemma 4 analyzed ${eligibleMeetings.length} real meeting(s), ${capturedWindows.length} Slack/Mail window(s), and ${candidateEmails.length} email(s)`,
+            detail: `Skipped ${skippedChoreCount} chores/solo routines; proposed ${holistic.prepProposals.length} contextual prep block(s) and ${holistic.actionProposals.length} task/hold block(s).`,
+            modelUsed: activeGemmaTag,
+            latencyMs: holistic.latencyMs,
           });
 
-          for (const sig of inboxAnalysis.signals) {
+          for (const prep of holistic.prepProposals) {
+            const targetMeeting = workingBlocks.find(
+              (b) => b.id === prep.meetingId
+            );
+            if (!targetMeeting) continue;
+            const res = placeGemmaContextualPrepBlock({
+              meeting: targetMeeting,
+              prepTitle: prep.prepTitle,
+              prepMinutes: prep.prepMinutes,
+              contextEvidence: prep.contextEvidence,
+              contextSources: prep.contextSources,
+              confidence: prep.confidence,
+              askUser: prep.askUser,
+              clarifyingQuestion: prep.clarifyingQuestion,
+              blocks: workingBlocks,
+              rules,
+              settings,
+              todayKey,
+            });
+            workingBlocks = res.updatedBlocks;
+          }
+
+          for (const act of holistic.actionProposals) {
             const placed = placeSignalOnCalendar({
-              signal: sig,
-              sourceLabel: sig.sourceLabel,
+              signal: act.signal,
+              sourceLabel: act.sourceLabel,
+              contextSources: act.contextSources,
               defaultDateKey: todayKey,
               blocks: workingBlocks,
-              captures,
+              captures: workingCaptures,
               rules,
               settings,
               forceAskUser: true,
             });
             workingBlocks = placed.updatedBlocks;
           }
+        } else if (holistic.error) {
+          gemmaNote = holistic.error;
         }
       }
 
+      setCaptures(workingCaptures);
       setBlocks(workingBlocks);
       const proposedCount = workingBlocks.filter(
         (b) => b.status === "proposed"
@@ -627,16 +771,26 @@ export function DayframeApp() {
       return {
         ok: true,
         existingCount: fetchedCalendarBlocks.length,
+        eligibleMeetingCount: eligibleMeetings.length,
+        skippedChoreCount,
+        windowsCapturedNames,
+        screenPermissionNeeded: winRes.screenPermissionNeeded,
         emailCount: fetchedEmails.length,
         proposedCount,
+        gemmaRan,
+        gemmaNote,
       };
     } catch (err) {
       return {
         ok: false,
         existingCount: 0,
+        eligibleMeetingCount: 0,
+        skippedChoreCount: 0,
+        windowsCapturedNames: [],
         emailCount: 0,
         proposedCount: 0,
-        error: err instanceof Error ? err.message : "Baseline scan failed.",
+        gemmaRan: false,
+        error: err instanceof Error ? err.message : "Contextual scan failed.",
       };
     } finally {
       if (settings.unloadModelsAfterBatch) {
@@ -714,14 +868,42 @@ export function DayframeApp() {
         }
       }
 
-      const pendingBatch = mergedCaptures.filter(
+      let pendingBatch = mergedCaptures.filter(
         (c) =>
           c.device === "macbook" &&
           (c.syncState === "queued-for-batch" || c.syncState === "needs-gemma")
       );
 
+      // If no queued screenshots yet, capture currently open Slack & Mail windows directly!
+      if (pendingBatch.length === 0 && macBridgeState.paired && macPairingToken) {
+        const liveWins = await captureOpenSlackAndMailWindows({
+          pairingToken: macPairingToken,
+          maxWindows: 3,
+        });
+        if (liveWins.ok && liveWins.windowsCaptured.length > 0) {
+          const freshWinCaps: ScreenshotCapture[] = liveWins.windowsCaptured.map(
+            (w) => ({
+              id: `cap-livewin-${Date.now()}-${w.windowId}`,
+              timestampIso: new Date().toISOString(),
+              device: "macbook",
+              appName:
+                w.kind === "slack" ? `Slack (${w.ownerName})` : w.ownerName,
+              windowTitle: w.windowTitle,
+              summaryText: "Captured open Slack/Mail window for batch sweep...",
+              imageDataUrl: w.imageDataUrl,
+              modelUsed: settings.gemmaModel,
+              syncState: "queued-for-batch",
+            })
+          );
+          mergedCaptures = [...freshWinCaps, ...mergedCaptures];
+          pendingBatch = freshWinCaps;
+        }
+      }
+
       if (pendingBatch.length === 0) {
-        showToast("Queue is empty — 0 screenshots waiting (models stayed at 0 MB RAM)");
+        showToast(
+          "No queued screenshots or open Slack/Mail windows found (models stayed at 0 MB RAM)"
+        );
         return;
       }
 
@@ -863,6 +1045,12 @@ export function DayframeApp() {
         if (macBridgeState.paired && macPairingToken) {
           await wakeOllamaViaMacDaemon(macPairingToken);
         }
+        const gStat = await probeLocalGemma(settings.gemmaModel);
+        setGemmaStatus(gStat);
+        const activeGemmaTag = resolveInstalledGemmaTag(
+          settings.gemmaModel,
+          gStat
+        );
         setModelLifecycle((prev) => ({
           ...prev,
           activePhase: "reasoning-gemma",
@@ -871,11 +1059,13 @@ export function DayframeApp() {
         for (const item of survivorsForGemma) {
           const analysis = await analyzeScreenshotWithGemma4({
             imageDataUrl: item.croppedImage,
-            model: settings.gemmaModel,
+            model: activeGemmaTag,
             appName: item.cap.appName,
             windowTitle: item.cap.windowTitle,
             todayDateKey: todayKey,
+            existingBlocks: workingBlocks,
             rules,
+            settings,
             device: "macbook",
             valenHint: item.valenMeta
               ? {
@@ -1847,6 +2037,8 @@ export function DayframeApp() {
           <PendingConfirmationsDeck
             todayKey={todayKey}
             proposedBlocks={proposedBlocks}
+            allBlocks={blocks}
+            captures={captures}
             confirmationPolicy={settings.confirmationPolicy}
             onChangeConfirmationPolicy={(policy) =>
               setSettings((prev) => ({ ...prev, confirmationPolicy: policy }))

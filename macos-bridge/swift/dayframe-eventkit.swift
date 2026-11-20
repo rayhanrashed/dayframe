@@ -20,6 +20,25 @@ func emitJson(_ dict: [String: Any]) {
     }
 }
 
+func containsVideoUrl(_ text: String) -> Bool {
+    let lower = text.lowercased()
+    let markers = [
+        "zoom.us/",
+        "meet.google.com/",
+        "teams.microsoft.com/",
+        "teams.live.com/",
+        "webex.com/",
+        "chime.aws/",
+        "around.co/",
+        "tuple.app/",
+        "whereby.com/"
+    ]
+    for m in markers {
+        if lower.contains(m) { return true }
+    }
+    return false
+}
+
 let stdinData = FileHandle.standardInput.readDataToEndOfFile()
 let payload = (try? JSONDecoder().decode(RequestPayload.self, from: stdinData)) ?? RequestPayload(
     action: "scan",
@@ -135,7 +154,7 @@ if action == "create" {
     exit(0)
 }
 
-// Default action: "scan"
+// Default action: "scan" with FULL meeting context (attendees, organizer, notes, URLs, calendar mutability)
 let defaultCalId = store.defaultCalendarForNewEvents?.calendarIdentifier ?? ""
 let cals = store.calendars(for: .event).map { c -> [String: Any] in
     return [
@@ -161,17 +180,56 @@ iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 var outEvents: [[String: Any]] = []
 for (idx, ev) in rawEvents.enumerated() {
     if ev.isAllDay { continue }
-    let notesTrimmed = ev.notes.map { String($0.prefix(300)) } ?? ""
+    let title = ev.title ?? "Untitled Event"
+    let rawNotes = ev.notes ?? ""
+    let notesTrimmed = String(rawNotes.prefix(900))
+    let locationStr = ev.location ?? ""
+    let urlStr = ev.url?.absoluteString ?? ""
+
+    var attendeeNames: [String] = []
+    var humanAttendeeCount = 0
+    if let attendees = ev.attendees {
+        for p in attendees {
+            // Skip room resources (participantType == .room is 2)
+            if p.participantType == .room || p.participantType == .resource {
+                continue
+            }
+            humanAttendeeCount += 1
+            if attendeeNames.count < 8 {
+                let rawName = p.name ?? p.url.absoluteString.replacingOccurrences(of: "mailto:", with: "")
+                if !rawName.isEmpty {
+                    attendeeNames.append(rawName)
+                }
+            }
+        }
+    }
+
+    let organizerName = ev.organizer?.name ?? ""
+    let hasVideoLink = !urlStr.isEmpty || containsVideoUrl(locationStr) || containsVideoUrl(rawNotes)
+    let isDayframeCreated =
+        title.hasPrefix("[Prep] ") ||
+        title.hasPrefix("[Focus] ") ||
+        title.hasPrefix("[Solo Hold] ") ||
+        rawNotes.contains("Scheduled offline by Dayframe") ||
+        rawNotes.contains("Scheduled by Dayframe")
+
     outEvents.append([
         "id": ev.eventIdentifier ?? "ek-\(idx)",
-        "title": ev.title ?? "Untitled Event",
+        "title": title,
         "startIso": iso.string(from: ev.startDate),
         "endIso": iso.string(from: ev.endDate),
         "isRecurring": ev.hasRecurrenceRules,
-        "location": ev.location ?? "",
+        "location": locationStr,
+        "url": urlStr,
+        "hasVideoLink": hasVideoLink,
         "notes": notesTrimmed,
+        "attendeeCount": humanAttendeeCount,
+        "attendeeNames": attendeeNames,
+        "organizerName": organizerName,
         "calendarId": ev.calendar?.calendarIdentifier ?? "",
-        "calendarTitle": ev.calendar?.title ?? "Calendar"
+        "calendarTitle": ev.calendar?.title ?? "Calendar",
+        "calendarImmutable": !(ev.calendar?.allowsContentModifications ?? true),
+        "isDayframeCreated": isDayframeCreated
     ])
 }
 
