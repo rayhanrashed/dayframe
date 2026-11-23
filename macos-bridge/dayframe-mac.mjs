@@ -1193,6 +1193,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/system/shutdown") {
+      collectorConfig.enabled = false;
+      saveCollectorConfig();
+      sendJson(req, res, 200, { ok: true, shuttingDown: true });
+      setTimeout(() => {
+        void cleanShutdown(true);
+      }, 150);
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/system/open-screen-privacy") {
       if (process.platform === "darwin") {
         execFile(
@@ -1557,15 +1567,41 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-async function cleanShutdown() {
+const initialParentPid = process.ppid;
+let shuttingDown = false;
+
+async function cleanShutdown(killAnyLocalOllama = true) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   if (collectorTimer) clearInterval(collectorTimer);
   await stopValenImmediately();
-  await unloadAndStopOllama();
+  await unloadAndStopOllama("");
+
+  if (killAnyLocalOllama && process.platform === "darwin") {
+    await new Promise((resolve) => {
+      execFile("/usr/bin/pkill", ["-TERM", "-f", "ollama serve"], () => {
+        execFile("/usr/bin/pkill", ["-TERM", "-f", "ollama runner"], () => {
+          resolve();
+        });
+      });
+    });
+  }
   process.exit(0);
 }
 
-process.on("SIGINT", () => void cleanShutdown());
-process.on("SIGTERM", () => void cleanShutdown());
+process.on("SIGINT", () => void cleanShutdown(true));
+process.on("SIGTERM", () => void cleanShutdown(true));
+process.on("SIGHUP", () => void cleanShutdown(true));
+
+// Watchdog: if launched by ./dayframe and the parent terminal/launcher exits (even via window close or SIGKILL),
+// automatically unload Gemma 4, stop Ollama/Valen, and exit within 3 seconds so zero background processes remain!
+if (process.env.DAYFRAME_MANAGED === "1" && initialParentPid > 1) {
+  setInterval(() => {
+    if (process.ppid === 1) {
+      void cleanShutdown(true);
+    }
+  }, 3000).unref();
+}
 
 server.listen(BRIDGE_PORT, "127.0.0.1", () => {
   console.log("\n==============================================================");

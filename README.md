@@ -53,6 +53,13 @@ For development with hot reload, run:
 ./dayframe --dev
 ```
 
+To check running status or stop all Dayframe, Ollama/Gemma 4, and Valen background processes:
+
+```bash
+./dayframe status
+./dayframe stop
+```
+
 ## macOS Permissions
 
 Grant permissions in **System Settings -> Privacy & Security** to the terminal app running `./dayframe` (for example, `Terminal` or `Cursor`):

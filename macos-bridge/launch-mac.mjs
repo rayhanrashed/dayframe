@@ -8,7 +8,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const uiPort = process.env.PORT || "43820";
-const useDevMode = process.argv.includes("--dev");
+const args = process.argv.slice(2);
+const subcommand = args[0] || "";
+const useDevMode = args.includes("--dev");
+const pidFile = path.join(os.homedir(), ".dayframe", "pids.json");
 
 const cleanEnv = {
   ...process.env,
@@ -28,6 +31,116 @@ function findOllamaBin() {
     if (fs.existsSync(c)) return c;
   }
   return "ollama";
+}
+
+function runQuiet(cmd, cmdArgs) {
+  try {
+    return execFileSync(cmd, cmdArgs, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function unloadAllOllamaModels() {
+  try {
+    const res = await fetch("http://127.0.0.1:11434/api/ps");
+    if (!res.ok) return;
+    const data = await res.json();
+    const models = Array.isArray(data.models) ? data.models : [];
+    for (const m of models) {
+      const name = String(m.name || m.model || "");
+      if (!name) continue;
+      await fetch("http://127.0.0.1:11434/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: name, keep_alive: 0 }),
+      }).catch(() => {});
+    }
+  } catch {
+    // Ollama not running
+  }
+}
+
+async function stopAllDayframeAndModels() {
+  console.log("Stopping Dayframe, Gemma 4 / Ollama, and Valen background processes...");
+
+  // 1. Unload any resident Gemma 4 / Ollama models from unified memory
+  await unloadAllOllamaModels();
+
+  // 2. Ask Mac Bridge to shut down cleanly if paired token exists
+  const tokenFile = path.join(os.homedir(), ".dayframe-bridge-token");
+  if (fs.existsSync(tokenFile)) {
+    const tok = fs.readFileSync(tokenFile, "utf8").trim();
+    await fetch("http://127.0.0.1:43822/api/system/shutdown", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${tok}` },
+    }).catch(() => {});
+  }
+
+  // 3. Kill recorded PIDs if present
+  if (fs.existsSync(pidFile)) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(pidFile, "utf8"));
+      for (const pid of [saved.bridgePid, saved.nextPid, saved.launcherPid]) {
+        if (typeof pid === "number" && pid > 1 && pid !== process.pid) {
+          try {
+            process.kill(pid, "SIGTERM");
+          } catch {}
+        }
+      }
+      fs.unlinkSync(pidFile);
+    } catch {}
+  }
+
+  // 4. Disable background screenshot collector flag on disk
+  const collectorCfg = path.join(os.homedir(), ".dayframe", "collector-config.json");
+  if (fs.existsSync(collectorCfg)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(collectorCfg, "utf8"));
+      fs.writeFileSync(
+        collectorCfg,
+        JSON.stringify({ ...parsed, enabled: false }, null, 2),
+        { mode: 0o600 }
+      );
+    } catch {}
+  }
+
+  // 5. Terminate any lingering orphaned processes on macOS
+  if (process.platform === "darwin") {
+    runQuiet("/usr/bin/pkill", ["-TERM", "-f", "macos-bridge/dayframe-mac.mjs"]);
+    runQuiet("/usr/bin/pkill", ["-TERM", "-f", `next.*${uiPort}`]);
+    runQuiet("/usr/bin/pkill", ["-TERM", "-f", "Valen-Decision"]);
+    runQuiet("/usr/bin/pkill", ["-TERM", "-f", "ollama runner"]);
+    runQuiet("/usr/bin/pkill", ["-TERM", "-f", "ollama serve"]);
+    runQuiet("/opt/homebrew/bin/brew", ["services", "stop", "ollama"]);
+  }
+
+  console.log("Stopped. Dayframe, Ollama/Gemma 4, and Valen are all shut down (0 MB RAM).");
+}
+
+async function printStatus() {
+  const bridgeUp = await fetch("http://127.0.0.1:43822/health")
+    .then((r) => r.ok)
+    .catch(() => false);
+  const uiUp = await fetch(`http://127.0.0.1:${uiPort}`)
+    .then((r) => r.ok)
+    .catch(() => false);
+  let ollamaInfo = "Stopped (0 MB RAM)";
+  try {
+    const ps = await fetch("http://127.0.0.1:11434/api/ps");
+    if (ps.ok) {
+      const data = await ps.json();
+      const names = (data.models || []).map((m) => m.name).join(", ");
+      ollamaInfo = names ? `Running — loaded: ${names}` : "Daemon running (0 models loaded)";
+    }
+  } catch {}
+
+  console.log(`Dayframe UI (127.0.0.1:${uiPort})   : ${uiUp ? "RUNNING" : "STOPPED"}`);
+  console.log(`Mac Daemon  (127.0.0.1:43822)   : ${bridgeUp ? "RUNNING" : "STOPPED"}`);
+  console.log(`Ollama / Gemma (127.0.0.1:11434): ${ollamaInfo}`);
 }
 
 function hasLocalGemma4Cached() {
@@ -61,20 +174,27 @@ async function waitForOllamaReady(timeoutMs = 8000) {
     try {
       const r = await fetch("http://127.0.0.1:11434/api/tags");
       if (r.ok) return true;
-    } catch {
-      // retry
-    }
+    } catch {}
     await new Promise((r) => setTimeout(r, 350));
   }
   return false;
 }
 
 async function main() {
+  if (subcommand === "stop" || subcommand === "--stop" || subcommand === "kill") {
+    await stopAllDayframeAndModels();
+    process.exit(0);
+  }
+  if (subcommand === "status" || subcommand === "--status") {
+    await printStatus();
+    process.exit(0);
+  }
+
   console.log("\n==============================================================");
   console.log("  Dayframe — All-In-One Offline MacBook Launcher");
+  console.log("  (Stop anytime with Ctrl+C or `./dayframe stop`)");
   console.log("==============================================================");
 
-  // 1. Auto-install npm dependencies if node_modules is missing
   if (!fs.existsSync(path.join(rootDir, "node_modules", "next"))) {
     console.log("[1/3] Installing local dependencies (first run only)...");
     execFileSync(
@@ -86,10 +206,9 @@ async function main() {
     console.log("[1/3] Local dependencies ready.");
   }
 
-  // 2. Verify local Gemma 4 weights on disk (then keep Ollama STOPPED at 0 MB RAM!)
   if (hasLocalGemma4Cached()) {
     console.log(
-      "[2/3] Offline Gemma 4 weights verified on disk (staying STOPPED at 0 MB RAM until batch run)."
+      "[2/3] Offline Gemma 4 weights verified on disk (staying STOPPED at 0 MB RAM until needed)."
     );
   } else {
     console.log(
@@ -126,7 +245,6 @@ async function main() {
     }
   }
 
-  // 3. Build production UI bundle whenever git HEAD changed (fast ~1.5s Turbopack build)
   const nextBin = path.join(
     rootDir,
     "node_modules",
@@ -178,12 +296,33 @@ async function main() {
       {
         cwd: rootDir,
         stdio: "inherit",
-        env: { ...cleanEnv, DAYFRAME_UI_PORT: uiPort },
+        env: {
+          ...cleanEnv,
+          DAYFRAME_UI_PORT: uiPort,
+          DAYFRAME_MANAGED: "1",
+        },
       }
     );
+
+    try {
+      fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+      fs.writeFileSync(
+        pidFile,
+        JSON.stringify({
+          launcherPid: process.pid,
+          nextPid: nextProc.pid,
+          bridgePid: bridgeProc.pid,
+        }),
+        { mode: 0o600 }
+      );
+    } catch {}
   }, 1400);
 
-  function shutdown() {
+  let exiting = false;
+  async function shutdown() {
+    if (exiting) return;
+    exiting = true;
+    await unloadAllOllamaModels();
     if (bridgeProc) {
       try {
         bridgeProc.kill("SIGTERM");
@@ -192,11 +331,15 @@ async function main() {
     try {
       nextProc.kill("SIGTERM");
     } catch {}
-    setTimeout(() => process.exit(0), 400);
+    try {
+      if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+    } catch {}
+    setTimeout(() => process.exit(0), 2200);
   }
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+  process.on("SIGHUP", () => void shutdown());
 }
 
 void main();
