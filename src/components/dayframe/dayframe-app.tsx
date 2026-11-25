@@ -7,6 +7,8 @@ import { CaptureStreamPanel } from "./capture-stream-panel";
 import { PendingConfirmationsDeck } from "./pending-confirmations-deck";
 import { CalendarTimeline } from "./calendar-timeline";
 import { EventWorkspaceDialog } from "./event-workspace-dialog";
+import { ModelActivityBanner } from "./model-activity-banner";
+import { ProjectsProgressPanel } from "./projects-progress-panel";
 import { OrganizerFeedbackPanel } from "./organizer-feedback-panel";
 import { NightlyAndroidSheet } from "./nightly-android-sheet";
 import { useScreenCapture } from "@/hooks/use-screen-capture";
@@ -83,6 +85,7 @@ import {
   parseNaturalTaskInput,
 } from "@/lib/nl-schedule-parser";
 import {
+  addManualProjectToGraph,
   DEFAULT_USER_MODEL_GRAPH,
   extractDistinctiveKeywords,
   findMatchingTaskModel,
@@ -115,6 +118,7 @@ import {
   fetchMacAndroidFolderQueue,
   fetchMacDiskCaptureQueue,
   fetchMacModelLifecycle,
+  fetchMacSystemIdleState,
   loadMacEventAugmentations,
   MacBridgeConnectionState,
   probeMacBridge,
@@ -222,6 +226,9 @@ export function DayframeApp() {
   const eventAugmentationsRef = useRef<Record<string, EventAugmentation>>({});
   const [isInducingModels, setIsInducingModels] = useState(false);
   const [isEnrichingEvent, setIsEnrichingEvent] = useState(false);
+  const [centerView, setCenterView] = useState<"calendar" | "projects">(
+    "calendar"
+  );
   const [scopeDialogOpen, setScopeDialogOpen] = useState(false);
   const [decomposingWithAi, setDecomposingWithAi] = useState(false);
   const [scarcityWarning, setScarcityWarning] = useState<string | null>(null);
@@ -896,6 +903,7 @@ export function DayframeApp() {
             windowTitle: win.windowTitle,
             todayDateKey: todayKey,
             existingBlocks: workingBlocks,
+            userGraph,
             rules,
             settings,
             device: "macbook",
@@ -960,11 +968,12 @@ export function DayframeApp() {
           }
         }
 
-        // 2B. Holistic Gemma 4 planner across eligible meetings + Slack observations + Apple Mail
+        // 2B. Holistic Gemma 4 planner across eligible meetings + Slack observations + Apple Mail + Prior Projects
         const holistic = await planHolisticCalendarWithGemma4({
           model: activeGemmaTag,
           todayDateKey: todayKey,
           allCalendarBlocks: workingBlocks,
+          userGraph,
           emails: candidateEmails,
           windowObservations,
           rules,
@@ -1106,12 +1115,17 @@ export function DayframeApp() {
     rules,
     settings,
     todayKey,
+    userGraph,
   ]);
 
-  // Core Scheduled/Manual Batch Sweep: Wake Valen -> Stop -> Wake Gemma 4 -> Unload to 0 MB
-  const runOfflineBatchSweep = useCallback(async () => {
-    if (isRunningBatchSweep) return;
-    setIsRunningBatchSweep(true);
+  // Core Batch Sweep: Wake Valen -> Stop -> Wake Gemma 4 -> Unload to 0 MB
+  // When backgroundIdleOnly === true, immediately pauses & unloads if the user touches keyboard/mouse!
+  const runOfflineBatchSweep = useCallback(
+    async (opts?: { backgroundIdleOnly?: boolean }) => {
+      if (isRunningBatchSweep) return;
+      setIsRunningBatchSweep(true);
+      const startedMs = Date.now();
+      const backgroundIdleOnly = Boolean(opts?.backgroundIdleOnly);
 
     try {
       // 1. Pull any disk-queued screenshots collected silently by the Mac daemon
@@ -1336,9 +1350,25 @@ export function DayframeApp() {
         setModelLifecycle((prev) => ({
           ...prev,
           activePhase: "reasoning-gemma",
+          startedAtMs: startedMs,
+          currentTaskDescription: `Triangulating ${survivorsForGemma.length} capture(s) against your ${userGraph.taskModels.length} Project(s)...`,
         }));
 
         for (const item of survivorsForGemma) {
+          // If running in idle-only background mode and user returned to keyboard/mouse, pause immediately!
+          if (backgroundIdleOnly && macBridgeState.paired && macPairingToken) {
+            const idleSnap = await fetchMacSystemIdleState(macPairingToken);
+            if (idleSnap.ok && idleSnap.idleSeconds < 15) {
+              appendLog({
+                stage: "lifecycle",
+                title: "Paused background sweep — user active on Mac",
+                detail:
+                  "Detected keyboard/mouse input; immediately unloading models to keep Mac responsive.",
+              });
+              break;
+            }
+          }
+
           const analysis = await analyzeScreenshotWithGemma4({
             imageDataUrl: item.croppedImage,
             model: activeGemmaTag,
@@ -1346,6 +1376,7 @@ export function DayframeApp() {
             windowTitle: item.cap.windowTitle,
             todayDateKey: todayKey,
             existingBlocks: workingBlocks,
+            userGraph,
             rules,
             settings,
             device: "macbook",
@@ -1371,10 +1402,44 @@ export function DayframeApp() {
             continue;
           }
 
+          // Triangulate with matched Project (record progress evidence even if no new block is needed!)
+          const matchedProj =
+            (analysis.signal.matchedTaskModelId
+              ? userGraph.taskModels.find(
+                  (m) => m.id === analysis.signal?.matchedTaskModelId
+                )
+              : undefined) ??
+            findMatchingTaskModel(analysis.signal.title, userGraph.taskModels);
+
+          if (matchedProj && analysis.signal.summary) {
+            setUserGraph((prev) => ({
+              ...prev,
+              taskModels: prev.taskModels.map((m) =>
+                m.id === matchedProj.id
+                  ? {
+                      ...m,
+                      evidence: [
+                        {
+                          id: `ev-cap-${item.cap.id}`,
+                          source: "screen" as const,
+                          title: `${item.cap.appName}: ${item.cap.windowTitle.slice(0, 50)}`,
+                          snippet: analysis.signal!.summary,
+                          timestampIso: item.cap.timestampIso,
+                        },
+                        ...m.evidence,
+                      ].slice(0, 20),
+                      updatedAtIso: new Date().toISOString(),
+                    }
+                  : m
+              ),
+            }));
+          }
+
           const placement = placeSignalOnCalendar({
             signal: analysis.signal,
             sourceLabel: `${item.cap.appName} screenshot`,
             sourceCaptureId: item.cap.id,
+            contextSources: analysis.signal.triangulationSources,
             defaultDateKey: todayKey,
             blocks: workingBlocks,
             captures: mergedCaptures,
@@ -1384,6 +1449,13 @@ export function DayframeApp() {
 
           workingBlocks = placement.updatedBlocks;
           let createdBlock = placement.createdBlock;
+
+          if (createdBlock && matchedProj) {
+            createdBlock = { ...createdBlock, taskModelId: matchedProj.id };
+            workingBlocks = workingBlocks.map((b) =>
+              b.id === createdBlock!.id ? createdBlock! : b
+            );
+          }
 
           if (createdBlock) {
             if (placement.askedUser) {
@@ -1520,28 +1592,77 @@ export function DayframeApp() {
     settings,
     showToast,
     todayKey,
+    userGraph,
   ]);
 
-  // Scheduled Daily Batch Clock (checks every 30s; wakes models ONLY at configured windows!)
+  // Idle-Aware & Optional Scheduled-Window Background Monitor (checks every 25s at 0 MB AI RAM)
   useEffect(() => {
     if (!hydrated || !settings.setupCompleted) return;
-    if (settings.batchExecutionMode !== "scheduled-batches") return;
+    if (settings.batchExecutionMode === "instant-per-capture") return;
 
-    const timer = setInterval(() => {
+    const timer = setInterval(async () => {
+      if (isRunningBatchSweep || isSyncingCalendar) return;
+
+      let latestDiskCount = 0;
+      let idleSeconds = 0;
+      let cpuLoad1m = 0;
+      let cpuCount = 8;
+
+      if (macBridgeState.paired && macPairingToken) {
+        const [q, idle] = await Promise.all([
+          fetchMacDiskCaptureQueue({
+            pairingToken: macPairingToken,
+            includeImages: false,
+          }),
+          fetchMacSystemIdleState(macPairingToken),
+        ]);
+        if (q.ok) {
+          latestDiskCount = q.totalQueued;
+          setDiskQueuedCount(q.totalQueued);
+        }
+        if (idle.ok) {
+          idleSeconds = idle.idleSeconds;
+          cpuLoad1m = idle.cpuLoad1m;
+          cpuCount = idle.cpuCount;
+          setModelLifecycle((prev) => ({
+            ...prev,
+            deviceIdleSeconds: idle.idleSeconds,
+          }));
+        }
+      }
+
+      const memQueued = captures.filter(
+        (c) =>
+          c.device === "macbook" &&
+          (c.syncState === "queued-for-batch" || c.syncState === "needs-gemma")
+      ).length;
+      const totalWaiting = memQueued + latestDiskCount;
+
+      if (settings.batchExecutionMode === "when-device-idle") {
+        const reqIdleSec = (settings.idleMinutesBeforeBatch || 5) * 60;
+        const minCooldownMs =
+          (settings.minMinutesBetweenIdleSweeps || 90) * 60 * 1000;
+        const lastRunMs = settings.lastBatchRunIso
+          ? new Date(settings.lastBatchRunIso).getTime()
+          : 0;
+        const cooldownOk = Date.now() - lastRunMs >= minCooldownMs;
+        const cpuQuiet = cpuLoad1m < cpuCount * 0.65;
+
+        if (
+          totalWaiting > 0 &&
+          idleSeconds >= reqIdleSec &&
+          cooldownOk &&
+          cpuQuiet
+        ) {
+          void runOfflineBatchSweep({ backgroundIdleOnly: true });
+        }
+        return;
+      }
+
+      // Optional fixed clock windows (still skips if CPU is heavily loaded!)
       const now = new Date();
       const dKey = toLocalDateKey(now);
       const minsNow = now.getHours() * 60 + now.getMinutes();
-
-      // Poll disk queue count silently (lightweight JSON stat, 0 AI RAM)
-      if (macBridgeState.paired && macPairingToken && !isRunningBatchSweep) {
-        void fetchMacDiskCaptureQueue({
-          pairingToken: macPairingToken,
-          includeImages: false,
-        }).then((q) => {
-          if (q.ok) setDiskQueuedCount(q.totalQueued);
-        });
-      }
-
       for (const winMin of settings.batchWindowMinutes) {
         const key = `${dKey}:${winMin}`;
         if (
@@ -1550,25 +1671,30 @@ export function DayframeApp() {
           !completedBatchWindowsRef.current.has(key)
         ) {
           completedBatchWindowsRef.current.add(key);
-          void runOfflineBatchSweep();
+          void runOfflineBatchSweep({ backgroundIdleOnly: false });
           break;
         }
       }
-    }, 30000);
+    }, 25000);
 
     return () => clearInterval(timer);
   }, [
+    captures,
     hydrated,
     isRunningBatchSweep,
+    isSyncingCalendar,
     macBridgeState.paired,
     macPairingToken,
     runOfflineBatchSweep,
     settings.batchExecutionMode,
     settings.batchWindowMinutes,
+    settings.idleMinutesBeforeBatch,
+    settings.lastBatchRunIso,
+    settings.minMinutesBetweenIdleSweeps,
     settings.setupCompleted,
   ]);
 
-  // Handle incoming frame: Queue at 0 MB RAM by default, or run instant if user chose instant mode
+  // Handle incoming frame: Queue at 0 MB RAM unless user explicitly chose instant-per-capture
   const handleIncomingFrame = useCallback(
     async (payload: {
       imageDataUrl: string;
@@ -1576,7 +1702,7 @@ export function DayframeApp() {
       windowTitle: string;
       device: "macbook" | "android";
     }) => {
-      if (settings.batchExecutionMode === "scheduled-batches") {
+      if (settings.batchExecutionMode !== "instant-per-capture") {
         const queuedCap: ScreenshotCapture = {
           id: `cap-q-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
           timestampIso: new Date().toISOString(),
@@ -3758,6 +3884,33 @@ export function DayframeApp() {
         pipelineLogs={pipelineLogs}
       />
 
+      <ModelActivityBanner
+        lifecycle={modelLifecycle}
+        isBusyAction={
+          decomposingWithAi ||
+          isEnrichingEvent ||
+          isInducingModels ||
+          isSyncingCalendar ||
+          isRunningBatchSweep
+        }
+        busyActionLabel={
+          decomposingWithAi
+            ? `Compiling schedule with ${settings.gemmaModel}...`
+            : isEnrichingEvent
+              ? `Checking event context with ${settings.gemmaModel}...`
+              : isInducingModels
+                ? `Synthesizing Projects & Strivings with ${settings.gemmaModel}...`
+                : isSyncingCalendar
+                  ? `Scanning Calendar, Slack & Mail with ${settings.gemmaModel}...`
+                  : undefined
+        }
+        settings={settings}
+        onUpdateSettings={(patch) =>
+          setSettings((prev) => ({ ...prev, ...patch }))
+        }
+        onStopModelsNow={() => void handleForceSleepModels()}
+      />
+
       <main className="mx-auto grid max-w-[1600px] grid-cols-1 gap-4 p-4 lg:grid-cols-12 lg:p-6">
         <div className="order-2 lg:order-1 lg:col-span-3">
           <CaptureStreamPanel
@@ -3821,31 +3974,105 @@ export function DayframeApp() {
             />
           )}
 
-          <CalendarTimeline
-            todayKey={todayKey}
-            anchorDateKey={anchorDateKey}
-            onChangeAnchorDateKey={setAnchorDateKey}
-            horizonDays={settings.timelineHorizonDays ?? 7}
-            onChangeHorizonDays={(days) =>
-              setSettings((prev) => ({ ...prev, timelineHorizonDays: days }))
-            }
-            blocks={blocks}
-            rules={rules}
-            settings={settings}
-            onSelectBlockId={setSelectedBlockId}
-            onConfirmAndSyncAllAutoBlocks={() =>
-              void handleConfirmAndSyncAllAutoBlocks()
-            }
-            onToggleBlockDone={(id, actual) =>
-              void handleToggleBlockDone(id, actual)
-            }
-            onRunCalendarScanNow={() => {
-              void runBaselineCalendarAndMailScan().then((r) => {
-                if (!r.ok && r.error) showToast(r.error);
-              });
-            }}
-            onOpenCalendarScope={() => setScopeDialogOpen(true)}
-          />
+          <div className="flex items-center justify-between rounded-xl border bg-card px-3 py-1.5 shadow-2xs">
+            <div className="flex items-center gap-1 rounded-lg bg-muted/50 p-0.5 text-xs">
+              <button
+                type="button"
+                onClick={() => setCenterView("calendar")}
+                className={`rounded-md px-3 py-1 font-medium transition-colors ${
+                  centerView === "calendar"
+                    ? "bg-background text-foreground shadow-2xs"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Calendar Space
+              </button>
+              <button
+                type="button"
+                onClick={() => setCenterView("projects")}
+                className={`rounded-md px-3 py-1 font-medium transition-colors ${
+                  centerView === "projects"
+                    ? "bg-background text-foreground shadow-2xs"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                Projects &amp; Progress ({userGraph.taskModels.length})
+              </button>
+            </div>
+            <span className="hidden text-[11px] text-muted-foreground sm:inline">
+              Click any block to chat, check context, or mark done
+            </span>
+          </div>
+
+          {centerView === "projects" ? (
+            <ProjectsProgressPanel
+              todayKey={todayKey}
+              userGraph={userGraph}
+              blocks={blocks}
+              onCreateProject={(title, targetMins) => {
+                setUserGraph((prev) =>
+                  addManualProjectToGraph({
+                    graph: prev,
+                    title,
+                    targetWeeklyMinutes: targetMins,
+                  })
+                );
+                showToast(`Added project "${title}"`);
+              }}
+              onUpdateProjectTargetMinutes={(projId, mins) => {
+                setUserGraph((prev) => ({
+                  ...prev,
+                  taskModels: prev.taskModels.map((m) =>
+                    m.id === projId
+                      ? {
+                          ...m,
+                          targetWeeklyMinutes: mins > 0 ? mins : undefined,
+                        }
+                      : m
+                  ),
+                }));
+              }}
+              onAssignBlockToProject={(blockId, projId) => {
+                setBlocks((prev) =>
+                  prev.map((b) =>
+                    b.id === blockId ? { ...b, taskModelId: projId } : b
+                  )
+                );
+                showToast("Assigned task block to project");
+              }}
+              onScheduleProjectSession={(projId) =>
+                void handleScheduleSessionForTaskModel(projId)
+              }
+              onSelectBlockId={setSelectedBlockId}
+              onToggleBlockDone={(id) => void handleToggleBlockDone(id)}
+            />
+          ) : (
+            <CalendarTimeline
+              todayKey={todayKey}
+              anchorDateKey={anchorDateKey}
+              onChangeAnchorDateKey={setAnchorDateKey}
+              horizonDays={settings.timelineHorizonDays ?? 7}
+              onChangeHorizonDays={(days) =>
+                setSettings((prev) => ({ ...prev, timelineHorizonDays: days }))
+              }
+              blocks={blocks}
+              rules={rules}
+              settings={settings}
+              onSelectBlockId={setSelectedBlockId}
+              onConfirmAndSyncAllAutoBlocks={() =>
+                void handleConfirmAndSyncAllAutoBlocks()
+              }
+              onToggleBlockDone={(id, actual) =>
+                void handleToggleBlockDone(id, actual)
+              }
+              onRunCalendarScanNow={() => {
+                void runBaselineCalendarAndMailScan().then((r) => {
+                  if (!r.ok && r.error) showToast(r.error);
+                });
+              }}
+              onOpenCalendarScope={() => setScopeDialogOpen(true)}
+            />
+          )}
         </div>
 
         <div className="order-3 lg:col-span-3">

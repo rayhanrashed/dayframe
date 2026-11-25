@@ -199,10 +199,12 @@ export function TopMenubar({
               </button>
             </div>
             <p className="hidden text-[11px] text-muted-foreground xl:block">
-              Next AI batch:{" "}
-              {settings.batchExecutionMode === "scheduled-batches"
-                ? getNextScheduledBatchLabel(settings.batchWindowMinutes)
-                : "Instant per shot"}{" "}
+              Auto-sweep:{" "}
+              {settings.batchExecutionMode === "when-device-idle"
+                ? `When Mac idle ≥${settings.idleMinutesBeforeBatch || 5}m`
+                : settings.batchExecutionMode === "scheduled-batches"
+                  ? getNextScheduledBatchLabel(settings.batchWindowMinutes)
+                  : "Instant per shot"}{" "}
               • Policy:{" "}
               {settings.confirmationPolicy === "always-ask"
                 ? "Always Ask"
@@ -411,12 +413,20 @@ export function TopMenubar({
               </label>
               <Select
                 value={
-                  settings.batchExecutionMode === "instant-per-capture"
-                    ? "instant"
-                    : activePreset
+                  settings.batchExecutionMode === "when-device-idle"
+                    ? "when-device-idle"
+                    : settings.batchExecutionMode === "instant-per-capture"
+                      ? "instant"
+                      : activePreset
                 }
                 onValueChange={(v) => {
                   if (!v) return;
+                  if (v === "when-device-idle") {
+                    onUpdateSettings({
+                      batchExecutionMode: "when-device-idle",
+                    });
+                    return;
+                  }
                   if (v === "instant") {
                     onUpdateSettings({
                       batchExecutionMode: "instant-per-capture",
@@ -436,6 +446,9 @@ export function TopMenubar({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="when-device-idle">
+                    Only when Mac is idle ≥{settings.idleMinutesBeforeBatch || 5} min (Recommended)
+                  </SelectItem>
                   {BATCH_SCHEDULE_PRESETS.map((p) => (
                     <SelectItem key={p.id} value={p.id}>
                       {p.label}

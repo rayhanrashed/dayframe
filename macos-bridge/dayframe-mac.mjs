@@ -444,23 +444,40 @@ async function runCalendarWaterfall(action, payload) {
     };
   }
 
-  // Tier 3: Calendar.app AppleEvents Automation fallback (works even if EventKit TCC is tied to another terminal app)
-  const appFallbackRes = await runStaticJxa("calendar-app-fallback.jxa", {
-    action,
-    ...payload,
-  });
-  if (appFallbackRes && appFallbackRes.ok) {
-    return appFallbackRes;
-  }
-
   const hostApp = detectHostTerminalApp();
   return {
     ok: false,
     hostTerminalApp: hostApp,
-    error: `macOS blocked Calendar access for "${hostApp}". Make sure "${hostApp}" (the exact app where you ran ./dayframe — e.g. Cursor vs Terminal.app) is enabled under System Settings → Privacy & Security → Calendars (and Automation → Calendar).`,
+    error: `macOS blocked Calendar access for "${hostApp}". Make sure "${hostApp}" (the exact app where you ran ./dayframe — e.g. Cursor vs Terminal.app) is enabled under System Settings → Privacy & Security → Calendars.`,
     calendars: [],
     events: [],
   };
+}
+
+function getMacIdleAndLoadState() {
+  return new Promise((resolve) => {
+    const cpuCount = Math.max(1, os.cpus().length);
+    const cpuLoad1m = Math.round(os.loadavg()[0] * 100) / 100;
+    if (process.platform !== "darwin") {
+      resolve({ ok: true, idleSeconds: 0, cpuLoad1m, cpuCount });
+      return;
+    }
+    execFile(
+      "/usr/sbin/ioreg",
+      ["-r", "-k", "HIDIdleTime", "-d", "4"],
+      { timeout: 2000 },
+      (err, stdout) => {
+        if (err || !stdout) {
+          resolve({ ok: true, idleSeconds: 0, cpuLoad1m, cpuCount });
+          return;
+        }
+        const m = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
+        const ns = m ? Number(m[1]) : 0;
+        const idleSeconds = Number.isFinite(ns) ? Math.floor(ns / 1_000_000_000) : 0;
+        resolve({ ok: true, idleSeconds, cpuLoad1m, cpuCount });
+      }
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,6 +1207,12 @@ const server = http.createServer(async (req, res) => {
         message: String(body.message || "").slice(0, 220),
       });
       sendJson(req, res, 200, out);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/system/idle") {
+      const idleState = await getMacIdleAndLoadState();
+      sendJson(req, res, 200, idleState);
       return;
     }
 

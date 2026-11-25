@@ -437,3 +437,177 @@ export function computeStrivingAllocatedMinutes(
   }
   return mins;
 }
+
+export interface ProjectProgressSummary {
+  project: TaskSpecificModel;
+  completedMinutes: number;
+  scheduledUpcomingMinutes: number;
+  totalAllocatedMinutes: number;
+  targetMinutes: number | null;
+  progressPercent: number;
+  doneBlocksCount: number;
+  upcomingBlocksCount: number;
+  doneTodosCount: number;
+  totalTodosCount: number;
+  linkedBlocks: CalendarBlock[];
+}
+
+export function blockMatchesProject(
+  block: CalendarBlock,
+  project: TaskSpecificModel
+): boolean {
+  if (block.occupiesTimeOnly) return false;
+  if (block.taskModelId) {
+    return block.taskModelId === project.id;
+  }
+  const lowerTitle = stripSegmentSuffix(block.title).toLowerCase();
+  if (lowerTitle === project.canonicalTitle.toLowerCase()) return true;
+  if (project.keywords.length === 0) return false;
+
+  const fullLower = block.title.toLowerCase();
+  let hits = 0;
+  for (const kw of project.keywords) {
+    if (kw.length >= 3 && fullLower.includes(kw.toLowerCase())) hits++;
+  }
+  return hits >= Math.min(2, project.keywords.length);
+}
+
+export function computeAllProjectProgress(params: {
+  graph: UserModelGraph;
+  blocks: CalendarBlock[];
+}): {
+  projects: ProjectProgressSummary[];
+  unassignedBlocks: CalendarBlock[];
+  totalCompletedMinutes: number;
+  totalScheduledMinutes: number;
+} {
+  const { graph, blocks } = params;
+  const matchedBlockIds = new Set<string>();
+
+  const projects: ProjectProgressSummary[] = graph.taskModels.map((project) => {
+    const linked = blocks
+      .filter((b) => blockMatchesProject(b, project))
+      .sort(
+        (a, b) =>
+          a.dateKey.localeCompare(b.dateKey) ||
+          a.startMinutes - b.startMinutes
+      );
+
+    let completedMinutes = 0;
+    let scheduledUpcomingMinutes = 0;
+    let doneBlocksCount = 0;
+    let upcomingBlocksCount = 0;
+
+    for (const b of linked) {
+      matchedBlockIds.add(b.id);
+      if (b.done) {
+        completedMinutes += b.actualMinutesTaken ?? b.durationMinutes;
+        doneBlocksCount++;
+      } else {
+        scheduledUpcomingMinutes += b.durationMinutes;
+        upcomingBlocksCount++;
+      }
+    }
+
+    const totalAllocatedMinutes = completedMinutes + scheduledUpcomingMinutes;
+    const targetMinutes =
+      project.targetWeeklyMinutes && project.targetWeeklyMinutes > 0
+        ? project.targetWeeklyMinutes
+        : null;
+
+    const denominator = targetMinutes ?? Math.max(1, totalAllocatedMinutes);
+    const progressPercent =
+      totalAllocatedMinutes === 0 && !targetMinutes
+        ? 0
+        : Math.min(100, Math.round((completedMinutes / denominator) * 100));
+
+    const allTodos = project.immediateTodos ?? [];
+    const doneTodosCount = allTodos.filter((t) => t.done).length;
+
+    return {
+      project,
+      completedMinutes,
+      scheduledUpcomingMinutes,
+      totalAllocatedMinutes,
+      targetMinutes,
+      progressPercent,
+      doneBlocksCount,
+      upcomingBlocksCount,
+      doneTodosCount,
+      totalTodosCount: allTodos.length,
+      linkedBlocks: linked,
+    };
+  });
+
+  const unassignedBlocks = blocks.filter(
+    (b) =>
+      b.isDayframeCreated &&
+      !b.occupiesTimeOnly &&
+      b.kind !== "meeting" &&
+      !matchedBlockIds.has(b.id)
+  );
+
+  const totalCompletedMinutes =
+    projects.reduce((s, p) => s + p.completedMinutes, 0) +
+    unassignedBlocks
+      .filter((b) => b.done)
+      .reduce((s, b) => s + (b.actualMinutesTaken ?? b.durationMinutes), 0);
+
+  const totalScheduledMinutes =
+    projects.reduce((s, p) => s + p.scheduledUpcomingMinutes, 0) +
+    unassignedBlocks
+      .filter((b) => !b.done)
+      .reduce((s, b) => s + b.durationMinutes, 0);
+
+  return {
+    projects,
+    unassignedBlocks,
+    totalCompletedMinutes,
+    totalScheduledMinutes,
+  };
+}
+
+export function addManualProjectToGraph(params: {
+  graph: UserModelGraph;
+  title: string;
+  targetWeeklyMinutes?: number;
+  parentStrivingId?: string;
+}): UserModelGraph {
+  const clean = canonicalizeTaskTitle(params.title);
+  if (!clean) return params.graph;
+  const existing = findMatchingTaskModel(clean, params.graph.taskModels);
+  if (existing) {
+    return {
+      ...params.graph,
+      taskModels: params.graph.taskModels.map((m) =>
+        m.id === existing.id
+          ? {
+              ...m,
+              targetWeeklyMinutes:
+                params.targetWeeklyMinutes ?? m.targetWeeklyMinutes,
+              parentStrivingId: params.parentStrivingId ?? m.parentStrivingId,
+            }
+          : m
+      ),
+    };
+  }
+  const created: TaskSpecificModel = {
+    id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+    canonicalTitle: clean,
+    keywords: extractDistinctiveKeywords(clean),
+    parentStrivingId: params.parentStrivingId,
+    summary: `Active project tracked across your calendar, Slack, and Mail.`,
+    targetWeeklyMinutes: params.targetWeeklyMinutes,
+    typicalSessionMinutes: 60,
+    immediateTodos: [],
+    relevantPapers: [],
+    evidence: [],
+    userEdited: true,
+    updatedAtIso: new Date().toISOString(),
+  };
+  return {
+    ...params.graph,
+    taskModels: [created, ...params.graph.taskModels],
+  };
+}
+

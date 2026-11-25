@@ -287,6 +287,49 @@ export function buildCompactCalendarContextText(
   return lines.join("\n");
 }
 
+export function buildPriorUnderstandingPromptBlock(
+  userGraph?: UserModelGraph,
+  blocks: CalendarBlock[] = []
+): string {
+  if (!userGraph) return "";
+  const projectsSummary = userGraph.taskModels.slice(0, 12).map((tm) => {
+    const upcomingMins = blocks
+      .filter((b) => !b.done && b.taskModelId === tm.id)
+      .reduce((s, b) => s + b.durationMinutes, 0);
+    const doneMins = blocks
+      .filter((b) => b.done && b.taskModelId === tm.id)
+      .reduce((s, b) => s + (b.actualMinutesTaken ?? b.durationMinutes), 0);
+    return {
+      projectId: tm.id,
+      projectTitle: tm.canonicalTitle,
+      summary: tm.summary,
+      doneMinutesSoFar: doneMins,
+      alreadyScheduledUpcomingMinutes: upcomingMins,
+      openTodos: tm.immediateTodos.filter((t) => !t.done).map((t) => t.text),
+    };
+  });
+
+  const constraints = userGraph.constraints
+    .slice(0, 15)
+    .map((c) => `- ${c.instruction}`)
+    .join("\n");
+
+  return `\nPRIOR USER & PROJECT UNDERSTANDING (TRIANGULATE AGAINST THIS!):
+- User Profile: ${userGraph.profile.roleAndAffiliation} | Domains: ${
+    userGraph.profile.activeDomains || "Not set"
+  } | Priorities: ${userGraph.profile.currentPriorities || "Not set"}
+- Active Strivings: ${
+    userGraph.strivings.map((s) => s.title).join("; ") || "(None yet)"
+  }
+- Active Projects (Task Models & Current Calendar Allocation):
+${
+  projectsSummary.length > 0
+    ? JSON.stringify(projectsSummary, null, 2)
+    : "(No projects tracked yet)"
+}
+${constraints ? `- Hard User Edit Constraints:\n${constraints}` : ""}`;
+}
+
 export async function analyzeScreenshotWithGemma4(params: {
   imageDataUrl: string;
   model: string;
@@ -294,6 +337,7 @@ export async function analyzeScreenshotWithGemma4(params: {
   windowTitle: string;
   todayDateKey: string;
   existingBlocks?: CalendarBlock[];
+  userGraph?: UserModelGraph;
   rules: StandingRule[];
   settings?: OrganizerSettings;
   device: "macbook" | "android";
@@ -318,6 +362,7 @@ export async function analyzeScreenshotWithGemma4(params: {
     windowTitle,
     todayDateKey,
     existingBlocks = [],
+    userGraph,
     rules,
     settings,
     device,
@@ -360,18 +405,22 @@ export async function analyzeScreenshotWithGemma4(params: {
       )}/3.`
     : "";
 
+  const priorUnderstanding = buildPriorUnderstandingPromptBlock(
+    userGraph,
+    existingBlocks
+  );
+
   const prompt = `You are Dayframe's Gemma 4 multimodal executive assistant running offline on the user's MacBook.
 Today's local date is ${todayDateKey}.
-Source window: "${appName}" — "${windowTitle}" (${device}).${stage1Context}${calContext}
+Source window: "${appName}" — "${windowTitle}" (${device}).${stage1Context}${calContext}${priorUnderstanding}
 
-Read the visible text in this screenshot carefully (especially Slack DMs/channels, email threads in Gmail/Mail/Outlook, or project trackers).
-Cross-reference what you see on screen with the user's Upcoming Calendar above!
+Read the visible text in this screenshot carefully and TRIANGULATE it against both the user's Upcoming Calendar AND their Active Projects / Prior Understanding above!
 
-STRICT INTELLIGENCE RULES:
-1. NEVER propose blocks for personal chores, household tasks, workouts, meals, casual banter, general reading, coding with no external commitment, or events ALREADY on the user's calendar above! If there is no real work/scheduling action for the user, set "hasActionableItem": false.
-2. If a Slack message or email asks the user to do a concrete deliverable, review, deck, code change, or reply (especially tied to an upcoming meeting in the calendar above — set "linkedMeetingId" if it prepares for that meeting!), set "hasActionableItem": true, estimate a realistic duration (15, 30, 45, 60, 90, 120), and cite the exact Slack channel/sender or email subject in "contextEvidence".
-3. If a Slack message or email informally proposes a meeting time not yet on the calendar (e.g. "free tomorrow at 3pm?"), set detectedKind="meeting", isSoloInvite=true, proposedDateKey, and proposedStartMinutes.
-4. Set "needsUserConfirmation": true whenever ownership, exact timing, or duration benefits from a quick Yes/No check, and make "clarifyingQuestion" cite the specific Slack/email context (NEVER generic!).
+STRICT TRIANGULATION & ANTI-NOISE RULES:
+1. DO NOT generate random one-off tasks from fleeting browsing, reading docs/code, casual chat, or chores!
+2. Check if what's on screen belongs to one of the user's Active Projects above ("matchedTaskModelId"). If that Project ALREADY has sufficient "alreadyScheduledUpcomingMinutes" on the calendar and no brand-new deadline or separate deliverable is requested, set "hasActionableItem": false (just summarize what progress/evidence was observed in "summary" so the project log updates without duplicating calendar blocks!).
+3. Set "hasActionableItem": true ONLY when there is a concrete unscheduled deliverable, review, reply, deadline, or informal meeting mention corroborated by Slack/email/project context. Populate "matchedTaskModelId" (if matching an Active Project) and list the connected signals in "triangulationSources" (e.g. ["Project: AIIM Fellowship", "Slack #funding"]).
+4. Set "needsUserConfirmation": true whenever timing, duration, or whether to add a new block benefits from confirmation.
 
 Standing Rules:
 ${rulesList}
@@ -382,6 +431,8 @@ Return ONLY valid JSON:
   "title": string,
   "summary": string,
   "contextEvidence": string,
+  "matchedTaskModelId": string | null,
+  "triangulationSources": string[],
   "detectedKind": "meeting" | "deep-work" | "follow-up",
   "estimatedMinutes": number,
   "proposedDateKey": string | null,
@@ -483,6 +534,14 @@ Return ONLY valid JSON:
           typeof parsed.linkedMeetingId === "string" && parsed.linkedMeetingId
             ? parsed.linkedMeetingId
             : undefined,
+        matchedTaskModelId:
+          typeof parsed.matchedTaskModelId === "string" &&
+          parsed.matchedTaskModelId
+            ? parsed.matchedTaskModelId
+            : undefined,
+        triangulationSources: Array.isArray(parsed.triangulationSources)
+          ? parsed.triangulationSources.map((s) => String(s)).slice(0, 4)
+          : undefined,
         isRecurringMention: Boolean(parsed.isRecurringMention),
         isSoloInvite: Boolean(parsed.isSoloInvite),
         locationOrUrl: parsed.locationOrUrl
@@ -546,6 +605,7 @@ export async function planHolisticCalendarWithGemma4(params: {
   model: string;
   todayDateKey: string;
   allCalendarBlocks: CalendarBlock[];
+  userGraph?: UserModelGraph;
   emails: ScannedEmailItem[];
   windowObservations: Array<{
     source: string;
@@ -564,6 +624,7 @@ export async function planHolisticCalendarWithGemma4(params: {
     model,
     todayDateKey,
     allCalendarBlocks,
+    userGraph,
     emails,
     windowObservations,
     rules,
@@ -644,8 +705,9 @@ ${compactEmails.length > 0 ? JSON.stringify(compactEmails, null, 2) : "(None)"}
 
 5. User's Standing Rules & Past Preferences:
 ${rulesSummary}
+${buildPriorUnderstandingPromptBlock(userGraph, allCalendarBlocks)}
 
-YOUR JOB — APPLY HIGH INTELLIGENCE & COMMON SENSE (ZERO BABYSITTING / ZERO SPAM):
+YOUR JOB — TRIANGULATE ACROSS PRIOR PROJECTS, CALENDAR, SLACK & MAIL (ZERO RANDOM SPAM):
 A. "prepProposals": Inspect each meeting in (1) alongside Slack (3) and Mail (4).
    - ONLY propose prep for meetings where a thoughtful professional/researcher ACTUALLY needs advance preparation (e.g., presenting, interviewing, board/advisor/committee/client review, 1:1 with agenda/deliverables, design/architecture critique, or a meeting referenced in Slack/Mail).
    - DO NOT propose prep for casual coffee chats, daily standups, social events, passive all-hands, workouts, chores, errands, or any event where prep would be silly or unnecessary! When in doubt whether prep is genuinely useful, SKIP IT rather than spamming dumb prep blocks.

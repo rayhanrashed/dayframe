@@ -11,7 +11,70 @@ const uiPort = process.env.PORT || "43820";
 const args = process.argv.slice(2);
 const subcommand = args[0] || "";
 const useDevMode = args.includes("--dev");
+const useNativeMacApp = args.includes("--app") || subcommand === "app";
 const pidFile = path.join(os.homedir(), ".dayframe", "pids.json");
+
+function ensureNativeMacAppBundle() {
+  if (process.platform !== "darwin" || !fs.existsSync("/usr/bin/swiftc")) {
+    return null;
+  }
+  const swiftSrc = path.join(__dirname, "swift", "DayframeMacApp.swift");
+  if (!fs.existsSync(swiftSrc)) return null;
+
+  const appDir = path.join(rootDir, "build", "Dayframe.app", "Contents");
+  const macosDir = path.join(appDir, "MacOS");
+  const binPath = path.join(macosDir, "Dayframe");
+  const plistPath = path.join(appDir, "Info.plist");
+
+  fs.mkdirSync(macosDir, { recursive: true });
+  if (!fs.existsSync(plistPath)) {
+    fs.writeFileSync(
+      plistPath,
+      `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>Dayframe</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.dayframe.macapp</string>
+  <key>CFBundleName</key>
+  <string>Dayframe</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>\n`,
+      "utf8"
+    );
+  }
+
+  const needBuild =
+    !fs.existsSync(binPath) ||
+    fs.statSync(swiftSrc).mtimeMs > fs.statSync(binPath).mtimeMs;
+  if (needBuild) {
+    console.log("Building native macOS Dayframe.app window & menu-bar shell...");
+    execFileSync(
+      "/usr/bin/swiftc",
+      [
+        swiftSrc,
+        "-framework",
+        "AppKit",
+        "-framework",
+        "WebKit",
+        "-framework",
+        "Foundation",
+        "-o",
+        binPath,
+      ],
+      { stdio: "inherit" }
+    );
+  }
+  return binPath;
+}
 
 const cleanEnv = {
   ...process.env,
@@ -288,21 +351,42 @@ async function main() {
   });
 
   let bridgeProc = null;
+  let nativeAppProc = null;
+  const nativeAppBin = useNativeMacApp ? ensureNativeMacAppBundle() : null;
 
   setTimeout(() => {
-    bridgeProc = spawn(
-      process.execPath,
-      [path.join(__dirname, "dayframe-mac.mjs"), "--open"],
-      {
-        cwd: rootDir,
-        stdio: "inherit",
-        env: {
-          ...cleanEnv,
-          DAYFRAME_UI_PORT: uiPort,
-          DAYFRAME_MANAGED: "1",
-        },
-      }
-    );
+    const bridgeArgs = [path.join(__dirname, "dayframe-mac.mjs")];
+    if (!nativeAppBin) {
+      bridgeArgs.push("--open");
+    }
+    bridgeProc = spawn(process.execPath, bridgeArgs, {
+      cwd: rootDir,
+      stdio: "inherit",
+      env: {
+        ...cleanEnv,
+        DAYFRAME_UI_PORT: uiPort,
+        DAYFRAME_MANAGED: "1",
+      },
+    });
+
+    if (nativeAppBin) {
+      setTimeout(() => {
+        const tokenPath = path.join(os.homedir(), ".dayframe-bridge-token");
+        const tok = fs.existsSync(tokenPath)
+          ? fs.readFileSync(tokenPath, "utf8").trim()
+          : "";
+        const targetUrl = tok
+          ? `http://127.0.0.1:${uiPort}/#pair=${tok}`
+          : `http://127.0.0.1:${uiPort}`;
+        nativeAppProc = spawn(nativeAppBin, [targetUrl], {
+          cwd: rootDir,
+          stdio: "ignore",
+        });
+        nativeAppProc.on("exit", () => {
+          void shutdown();
+        });
+      }, 600);
+    }
 
     try {
       fs.mkdirSync(path.dirname(pidFile), { recursive: true });
@@ -323,6 +407,11 @@ async function main() {
     if (exiting) return;
     exiting = true;
     await unloadAllOllamaModels();
+    if (nativeAppProc) {
+      try {
+        nativeAppProc.kill("SIGTERM");
+      } catch {}
+    }
     if (bridgeProc) {
       try {
         bridgeProc.kill("SIGTERM");

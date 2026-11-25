@@ -9,6 +9,7 @@
     "lint": "eslint",
     "mac-bridge": "node macos-bridge/dayframe-mac.mjs",
     "mac": "node macos-bridge/launch-mac.mjs",
+    "app": "node macos-bridge/launch-mac.mjs --app",
     "stop": "node macos-bridge/launch-mac.mjs stop",
     "status": "node macos-bridge/launch-mac.mjs status"
   },

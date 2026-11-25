@@ -2,7 +2,10 @@ export type CalendarSourceMode = "none" | "macos-bridge";
 
 export type CaptureEngineMode = "macos-native" | "browser-screen";
 
-export type BatchExecutionMode = "scheduled-batches" | "instant-per-capture";
+export type BatchExecutionMode =
+  | "when-device-idle"
+  | "scheduled-batches"
+  | "instant-per-capture";
 
 export type ConfirmationPolicy =
   | "ask-often"
@@ -182,6 +185,7 @@ export interface TaskSpecificModel {
   summary: string;
   cadenceNote?: string;
   deadlineDateKey?: string;
+  targetWeeklyMinutes?: number;
   typicalSessionMinutes: number;
   immediateTodos: EventSubtask[];
   relevantPapers: RelevantPaperRef[];
@@ -268,6 +272,8 @@ export interface ExtractedCaptureSignal {
   proposedDateKey?: string;
   proposedStartMinutes?: number;
   linkedMeetingId?: string;
+  matchedTaskModelId?: string;
+  triangulationSources?: string[];
   isRecurringMention?: boolean;
   isSoloInvite?: boolean;
   locationOrUrl?: string;
@@ -329,6 +335,9 @@ export interface ModelLifecycleState {
     | "waking-gemma"
     | "reasoning-gemma"
     | "unloading";
+  currentTaskDescription?: string;
+  startedAtMs?: number;
+  deviceIdleSeconds?: number;
   lastBatchCompletedIso?: string;
 }
 
@@ -396,6 +405,10 @@ export interface OrganizerSettings {
   valenSignalThreshold: number;
   batchExecutionMode: BatchExecutionMode;
   batchWindowMinutes: number[];
+  /** Minimum minutes of keyboard/mouse inactivity required before running background ML sweeps */
+  idleMinutesBeforeBatch: number;
+  /** Minimum cooldown in minutes between automatic idle batch runs */
+  minMinutesBetweenIdleSweeps: number;
   unloadModelsAfterBatch: boolean;
   confirmationPolicy: ConfirmationPolicy;
   calendarSource: CalendarSourceMode;

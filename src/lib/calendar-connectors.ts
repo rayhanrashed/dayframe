@@ -689,6 +689,41 @@ export function formatRichCalendarNotes(block: CalendarBlock): string {
   return sections.join("\n\n").slice(0, 3200);
 }
 
+export async function fetchMacSystemIdleState(
+  pairingToken: string
+): Promise<{
+  ok: boolean;
+  idleSeconds: number;
+  cpuLoad1m: number;
+  cpuCount: number;
+}> {
+  if (!pairingToken.trim()) {
+    return { ok: false, idleSeconds: 0, cpuLoad1m: 0, cpuCount: 8 };
+  }
+  try {
+    const res = await fetch(`${MAC_BRIDGE_BASE}/api/system/idle`, {
+      headers: { Authorization: `Bearer ${pairingToken.trim()}` },
+    });
+    if (!res.ok) {
+      return { ok: false, idleSeconds: 0, cpuLoad1m: 0, cpuCount: 8 };
+    }
+    const data = (await res.json()) as {
+      ok?: boolean;
+      idleSeconds?: number;
+      cpuLoad1m?: number;
+      cpuCount?: number;
+    };
+    return {
+      ok: Boolean(data.ok),
+      idleSeconds: data.idleSeconds ?? 0,
+      cpuLoad1m: data.cpuLoad1m ?? 0,
+      cpuCount: data.cpuCount ?? 8,
+    };
+  } catch {
+    return { ok: false, idleSeconds: 0, cpuLoad1m: 0, cpuCount: 8 };
+  }
+}
+
 export async function loadMacEventAugmentations(
   pairingToken: string
 ): Promise<Record<string, EventAugmentation>> {

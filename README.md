@@ -23,7 +23,12 @@ All inference and system access run locally over `127.0.0.1` without external AP
 - **Two-Model Division of Labor + Deterministic Slot Solver**:
   - `Valen-Decision-1.5` (optional local GGUF server on `127.0.0.1:43823`): single-pass `predicate`/`choice`/`score`/`bbox` router for screenshot triage, utterance intent routing, calendar event role classification, Task-Model entity matching, and Mail/PDF relevance filtering.
   - `Gemma 4` (local Ollama on `127.0.0.1:11434`): compiles open-ended natural-language scheduling requests, multi-action per-event chat instructions, and preference updates into structured session specs; deterministic heuristics provide live input previews and offline fallback, and a constraint solver places sessions into conflict-free slots.
-  - Screen and window captures queue to `~/.dayframe/capture-queue/` without keeping models in memory; models wake on demand or during scheduled batch sweeps, then unload (`keep_alive: 0`).
+- **Projects & Time Progress + Triangulation**:
+  - Switch between `Calendar Space` and `Projects & Progress` to see how completed (`✓`) and scheduled blocks map to each project, alongside hours invested vs. target hours.
+  - Screenshot and Slack/Mail evaluations are conditioned on your existing Projects, Strivings, user edit constraints, and already-allocated calendar hours so captures update project evidence rather than creating duplicate standalone tasks.
+- **Idle-Only Background Execution & Live Activity Bar**:
+  - By default, background batch sweeps run only when macOS `IOHIDSystem` `HIDIdleTime` shows the keyboard/trackpad has been untouched for at least 5 minutes and CPU load is low; if you resume input mid-sweep, the batch pauses and unloads models (`keep_alive: 0`) immediately.
+  - A persistent status bar beneath the header displays the active model, current operation, elapsed time, and a direct `Stop Model Now` button without opening a modal.
 
 ## Requirements
 
@@ -40,7 +45,11 @@ cd dayframe
 ./dayframe
 ```
 
-You can also double-click `Dayframe.command` in Finder or run `npm run mac`.
+You can also double-click `Dayframe.command` in Finder, run `npm run mac`, or launch inside a standalone native macOS window + menu-bar app (`◷ Dayframe`, where closing the window hides to the menu bar instead of exiting):
+
+```bash
+./dayframe --app
+```
 
 On first launch, `./dayframe`:
 1. Installs npm packages if `node_modules` is missing.
